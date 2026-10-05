@@ -1,7 +1,7 @@
 import { render } from "preact";
 import type { NodeId, NodeScore, PrState, Task, Tree, TreeNode } from "../../src/types.ts";
 import { focusView, layoutTree, siblingOrder, type SortKey } from "../../src/web/layout.ts";
-import { attentionNodes, ramp, scoreValue, sqrtScale, tileLooks, tileSize } from "../../src/web/visual.ts";
+import { attentionNodes, ramp, scoreValue, sqrtScale, subtreeValues, tileLooks, tileSize } from "../../src/web/visual.ts";
 import { TreeView } from "../../src/web/TreeView.tsx";
 import { FakeDocument, type FakeNode } from "./fake-dom.ts";
 
@@ -143,6 +143,7 @@ export function bench(count = 1000, runs = 7): Timings {
         fitRequest={0}
         onSelect={() => {}}
         onToggle={() => {}}
+        onStub={() => {}}
       />,
       root as unknown as Element,
     );
@@ -201,9 +202,10 @@ export function focusBench(count = 600, runs = 9): FocusTimings {
   const look = tileLooks({ scores, scoreKey: "quality", statKeys: STAT_KEYS, findingCounts });
   const composite = ramp(ids.map((id) => scores[id].quality));
   const order = siblingOrder("name", () => null, weightOf);
+  const values = subtreeValues({ tree, scores, tasks, prs, findingCounts });
   let maxVisible = 0;
   const draw = (focus: NodeId) => {
-    const shown = focusView({ tree, focus, order, overrides: new Map(), attention });
+    const shown = focusView({ tree, focus, order, overrides: new Map(), attention, values });
     const layout = layoutTree({ tree, shown, radius: (id) => side(weightOf(id)) / 2 });
     maxVisible = Math.max(maxVisible, layout.nodes.length);
     render(
@@ -221,6 +223,7 @@ export function focusBench(count = 600, runs = 9): FocusTimings {
         fitRequest={0}
         onSelect={() => {}}
         onToggle={() => {}}
+        onStub={() => {}}
       />,
       root as unknown as Element,
     );

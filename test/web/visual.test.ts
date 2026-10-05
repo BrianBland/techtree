@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { COMPOSITE, NO_SCORE, attentionNodes, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, tileLooks, tileSize } from "../../src/web/visual.ts";
+import { COMPOSITE, NO_SCORE, attentionNodes, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "../../src/web/visual.ts";
 import { fitView, zoomAt } from "../../src/web/view.ts";
-import type { MetricDef, NodeScore, PrState, Task } from "../../src/types.ts";
+import type { MetricDef, NodeScore, PrState, Task, Tree } from "../../src/types.ts";
 
 const hsl = (color: string) => {
   const [h, s, l] = /^hsl\((\d+) (\d+)% (\d+)%\)$/.exec(color)!.slice(1).map(Number);
@@ -143,4 +143,24 @@ test("tile looks tolerate unscored nodes and nodes missing from the scores", () 
   for (const id of ["a", "missing"]) {
     assert.deepEqual(look(id), { fill: NO_SCORE, pips: [null], xp: null, findings: 0 });
   }
+});
+
+test("subtree value: the largest node value below, from attention, running work, then badness × √own loc and own findings", () => {
+  const node = (id: string, parent: string | null, children: string[]) => ({ id, name: id || "repo", kind: "dir", parent, children, files: [] });
+  const tree: Tree = { repoRoot: "/r", nodes: { "": node("", null, ["a", "c"]), a: node("a", "", ["a/b"]), "a/b": node("a/b", "a", []), c: node("c", "", []) } };
+  const scored = (id: string, quality: number | null, loc: number): NodeScore => ({ node: id, quality, metrics: { loc: { raw: loc, value: loc, pct: null } } });
+  const scores = { "": scored("", null, 1000), a: scored("a", 80, 600), "a/b": scored("a/b", 40, 400), c: scored("c", 70, 400) };
+  const values = (tasks: Task[] = [], prs: PrState[] = []) => subtreeValues({ tree, scores, tasks, prs, findingCounts: { c: 3 } });
+
+  const calm = values();
+  assert.equal(calm.get("a/b"), 60 * 20);
+  assert.equal(calm.get("a"), 60 * 20, "a's own 200 lines at quality 80 are worth less than a/b's");
+  assert.equal(calm.get("c"), 30 * 20 + 3 * 10);
+  assert.equal(calm.get(""), 60 * 20);
+
+  const running = values([{ node: "c", state: "running" } as Task]);
+  assert.ok(running.get("c")! > running.get("a")!, "running work beats badness");
+  const stuck = values([{ node: "c", state: "running" } as Task], [{ node: "a/b", ci: "pass", stuck: true, stale: false } as PrState]);
+  assert.ok(stuck.get("a")! > stuck.get("c")!, "attention beats running work");
+  assert.equal(stuck.get(""), stuck.get("a/b"));
 });

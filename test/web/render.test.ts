@@ -61,13 +61,13 @@ test("decorated sibling tiles never paint over each other", { timeout: 30_000 },
   const boxes = decoratedSiblingBoxes(3).filter((b) => b.node !== "repo");
   const extent = (node: string) => {
     const own = boxes.filter((b) => b.node === node);
-    return { top: Math.min(...own.map((b) => b.top)), bottom: Math.max(...own.map((b) => b.bottom)) };
+    return { left: Math.min(...own.map((b) => b.left)), right: Math.max(...own.map((b) => b.right)) };
   };
   assert.ok(boxes.some((b) => b.cls === "glow") && boxes.some((b) => b.cls === "ring"), "decorations rendered");
   const [a, b, c] = ["n0", "n1", "n2"].map(extent);
   // Rings and glows are stroked 2 units wide, half of it outside their box.
-  assert.ok(a.bottom + 1 < b.top - 1, `n0 ${JSON.stringify(a)} overlaps n1 ${JSON.stringify(b)}`);
-  assert.ok(b.bottom + 1 < c.top - 1, `n1 ${JSON.stringify(b)} overlaps n2 ${JSON.stringify(c)}`);
+  assert.ok(a.right + 1 < b.left - 1, `n0 ${JSON.stringify(a)} overlaps n1 ${JSON.stringify(b)}`);
+  assert.ok(b.right + 1 < c.left - 1, `n1 ${JSON.stringify(b)} overlaps n2 ${JSON.stringify(c)}`);
 });
 
 test("only nodes that need you glow; worst scores stand out by colour alone", { timeout: 30_000 }, async () => {
