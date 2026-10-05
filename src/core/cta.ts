@@ -23,6 +23,13 @@ export function diversify<T>(items: T[], sourceOf: (item: T) => string | undefin
   return out;
 }
 
+/** Round-robin merge: the first item of each list in list order, then the second of each, and so on. */
+export function interleave<T>(lists: T[][]): T[] {
+  const out: T[] = [];
+  for (let i = 0; lists.some((list) => i < list.length); i++) for (const list of lists) if (i < list.length) out.push(list[i]);
+  return out;
+}
+
 /** Suggestions by priority, highest first, diversified by source (DESIGN "Suggestions"). */
 export function rankSuggestions(suggestions: Suggestion[]): Suggestion[] {
   return diversify([...suggestions].sort((a, b) => b.priority - a.priority), (s) => s.source);

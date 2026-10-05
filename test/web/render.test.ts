@@ -119,9 +119,13 @@ function pr(number: number, node: string, title: string): PrState {
 /** Every `Backend` method of `real`, so a test can override a few. */
 function delegate(real: Backend): Backend {
   return {
-    getState: () => real.getState(),
-    getNode: (id) => real.getNode(id),
-    getOverview: () => real.getOverview(),
+    listProjects: () => real.listProjects(),
+    createProject: (input) => real.createProject(input),
+    updateProject: (id, input) => real.updateProject(id, input),
+    deleteProject: (id) => real.deleteProject(id),
+    getState: (project) => real.getState(project),
+    getNode: (id, project) => real.getNode(id, project),
+    getOverview: (project) => real.getOverview(project),
     taskLog: (id, tail) => real.taskLog(id, tail),
     taskDiff: (id) => real.taskDiff(id),
     models: () => real.models(),
@@ -136,8 +140,8 @@ function delegate(real: Backend): Backend {
     source: (path, line) => real.source(path, line),
     report: (id, report) => real.report(id, report),
     setBabysit: (n, on) => real.setBabysit(n, on),
-    rescore: () => real.rescore(),
-    scan: (node) => real.scan(node),
+    rescore: (project) => real.rescore(project),
+    scan: (node, project) => real.scan(node, project),
     subscribe: (listener) => real.subscribe(listener),
   };
 }
@@ -484,4 +488,161 @@ test("chat events that arrive while the transcript loads stay in the pane", UI_T
   release();
   await ui.app.waitFor(() => pane().textContent.includes("scenario:hang"), "snapshot merged");
   assert.ok(pane().textContent.includes("sent while loading"), "the live message survives the snapshot");
+});
+
+/** Record the URLs the app writes with `history.replaceState`, for the rest of the test. */
+function recordUrls(t: TestContext): string[] {
+  const urls: string[] = [];
+  Object.assign(globalThis, { location: { search: "", pathname: "/" }, history: { replaceState: (_s: unknown, _t: string, url: string) => urls.push(url) } });
+  t.after(() => {
+    delete (globalThis as { location?: unknown }).location;
+    delete (globalThis as { history?: unknown }).history;
+  });
+  return urls;
+}
+
+test("the project switcher creates a project, switches the view and keeps it in the URL", UI_TIMEOUT, async (t) => {
+  const urls = recordUrls(t);
+  const { app, backend } = await bootUi(t);
+  await app.waitFor(() => app.text().includes("Scan coverage"), "Quality overview");
+  const switcher = () => app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as SmokeDriver["root"] & { value: string };
+  const choose = (value: string) => {
+    switcher().value = value;
+    switcher().dispatch("change");
+  };
+  const type = (tag: string, value: string) => {
+    const field = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0].querySelectorAll((n) => n.localName === tag)[0] as unknown as { value: string; dispatch(t: string): void };
+    field.value = value;
+    field.dispatch("input");
+  };
+
+  choose("__new");
+  await app.waitFor(() => app.text().includes("New project"), "new project dialog");
+  type("input", "Faster startup");
+  type("textarea", "cold start below 1 s");
+  await new Promise((r) => setTimeout(r, 0));
+  app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0].dispatch("submit");
+  await app.waitFor(() => app.text().includes("No scorer yet") && app.text().includes("cold start below 1 s"), "the new project's overview");
+  assert.deepEqual((await backend.listProjects()).map((p) => p.id), ["quality", "faster-startup"]);
+  assert.equal(urls.at(-1), "?project=faster-startup");
+  assert.ok(!app.text().includes("Scan coverage"), "no scorer, no scan coverage");
+
+  const heading = () => app.find((n) => n.localName === "h2")[0]?.textContent;
+  choose("all");
+  await app.waitFor(() => heading() === "All projects" && app.text().includes("Top suggestions"), "cross-project overview");
+  assert.equal(urls.at(-1), "?project=all");
+  assert.ok(app.find((n) => n.getAttribute("class") === "project-tag").some((n) => n.textContent === "Quality"), "items are labelled with their project");
+
+  choose("quality");
+  await app.waitFor(() => heading() === "Quality" && app.text().includes("Scan coverage"), "back to Quality");
+  assert.equal(urls.at(-1), "/");
+});
+
+test("New task here starts a free-form task in the selected project", UI_TIMEOUT, async (t) => {
+  const { app, backend, byClass } = await bootUi(t);
+  const perf = await backend.createProject({ name: "Perf" });
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const switcher = app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as { value: string; dispatch(t: string): void };
+  switcher.value = perf.id;
+  switcher.dispatch("change");
+  await app.waitFor(() => app.text().includes("No scorer yet"), "Perf overview");
+  const state = await backend.getState();
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
+  const newTask = () => app.find((n) => n.localName === "button" && n.textContent === "New task here");
+  await app.waitFor(() => newTask().length === 1, "node panel");
+  assert.ok(!app.text().includes("Scan subtree"), "no scorer, nothing to scan");
+  newTask()[0].dispatch("click");
+  await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
+  const dialog = byClass("dialog")[0];
+  const start = dialog.querySelectorAll((n) => n.localName === "button" && n.textContent === "Start")[0];
+  await new Promise((r) => setTimeout(r, 50));
+  assert.notEqual(start.getAttribute("disabled"), null, "an empty prompt cannot start");
+  const prompt = dialog.querySelectorAll((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  prompt.value = "Profile the startup path. scenario:hang";
+  prompt.dispatch("input");
+  await app.waitFor(() => start.getAttribute("disabled") === null, "Start enabled");
+  dialog.dispatch("submit");
+  const task = await until(async () => (await backend.getState(perf.id)).tasks[0], "the Perf task");
+  assert.equal(task.node, "");
+  assert.match(task.prompt, /^Profile the startup path/);
+});
+
+test("dragging the panel's left edge resizes it within bounds, remembers the width and double-click resets it", UI_TIMEOUT, async (t) => {
+  const stored = new Map([["techtree.panelWidth", "500"]]);
+  const localStorage = { getItem: (k: string) => stored.get(k) ?? null, setItem: (k: string, v: string) => stored.set(k, v), removeItem: (k: string) => stored.delete(k) };
+  Object.assign(globalThis, { localStorage, innerWidth: 1600 });
+  t.after(() => {
+    delete (globalThis as { localStorage?: unknown }).localStorage;
+    delete (globalThis as { innerWidth?: unknown }).innerWidth;
+  });
+  const { app, byClass } = await bootUi(t);
+  const handle = () => byClass("panel-resizer")[0];
+  const width = () => handle().getAttribute("aria-valuenow");
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  await app.waitFor(() => byClass("panel-resizer").length === 1, "resize handle");
+  assert.equal(width(), "500", "the saved width is restored");
+
+  const drag = async (from: number, to: number) => {
+    handle().dispatch("pointerdown", { clientX: from, pointerId: 1 });
+    await tick();
+    handle().dispatch("pointermove", { clientX: to, pointerId: 1 });
+    await tick();
+    handle().dispatch("pointerup", { pointerId: 1 });
+    await tick();
+  };
+  await drag(1000, 800);
+  assert.deepEqual([width(), stored.get("techtree.panelWidth")], ["700", "700"]);
+  await drag(1000, 0);
+  assert.equal(width(), "1200", "at most 75% of the window");
+  await drag(500, 1500);
+  assert.equal(width(), "320", "at least 320 px");
+
+  handle().dispatch("dblclick");
+  await tick();
+  assert.equal(width(), "440");
+  assert.equal(stored.has("techtree.panelWidth"), false);
+});
+
+test("switching projects with a node open drops the old project's actions; All projects shows the overview", UI_TIMEOUT, async (t) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const ui = await bootUi(t, (real) => ({ ...delegate(real), getNode: (id, project) => (project === "perf" ? gate : Promise.resolve()).then(() => real.getNode(id, project)) }));
+  const { app, backend } = ui;
+  await backend.createProject({ name: "Perf" });
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const switcher = () => app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as SmokeDriver["root"] & { value: string };
+  const choose = (value: string) => {
+    switcher().value = value;
+    switcher().dispatch("change");
+  };
+  const node = TODO_FILE.slice(0, TODO_FILE.lastIndexOf("/"));
+  const name = (await backend.getState()).tree.nodes[node].name;
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === name)[0].dispatch("click");
+  const starts = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
+  await app.waitFor(() => starts().length > 0, "Quality's suggestion in the node panel");
+
+  app.reconnect(); // refetch the project list, which now includes Perf
+  await app.waitFor(() => switcher().querySelectorAll((n) => n.localName === "option").some((o) => o.textContent === "Perf"), "Perf in the switcher");
+  choose("perf");
+  await app.waitFor(() => app.text().includes("New task here") && !app.text().includes("Scan subtree"), "Perf's node panel");
+  assert.equal(starts().length, 0, "no Start for Quality's suggestion while Perf's details load");
+  release();
+
+  choose("all");
+  await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === "All projects", "the cross-project overview");
+});
+
+test("saving a project's goal shows the new goal", UI_TIMEOUT, async (t) => {
+  const { app, backend } = await bootUi(t);
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  app.find((n) => n.localName === "button" && n.getAttribute("title") === "Project settings")[0].dispatch("click");
+  await app.waitFor(() => app.text().includes("Project settings"), "settings dialog");
+  const dialog = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0];
+  const goal = dialog.querySelectorAll((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  goal.value = "fewer unwraps";
+  goal.dispatch("input");
+  await new Promise((r) => setTimeout(r, 0));
+  dialog.dispatch("submit");
+  await app.waitFor(() => app.text().includes("fewer unwraps") && !app.text().includes("Project settings"), "the new goal in the overview");
+  assert.equal((await backend.listProjects())[0].goal, "fewer unwraps");
 });

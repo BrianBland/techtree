@@ -1,6 +1,7 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
 import type { ApiModels, ApiNode, ApiSource, ApiState, ChatEntry, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task, TerminalMode } from "../types.ts";
+import { hasScorer } from "../core/projects.ts";
 import { get, onServerEvent, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { hasLiveWorker, messageBlocked } from "./task-actions.ts";
@@ -20,21 +21,23 @@ export interface NodePanelProps {
 }
 
 export function NodePanel({ id, state, version, onStart, onSelect, onError, onClose }: NodePanelProps) {
-  const [fetched, setFetched] = useState<{ id: NodeId; detail: ApiNode } | null>(null);
-  const detail = fetched?.id === id ? fetched.detail : null;
+  const [fetched, setFetched] = useState<{ id: NodeId; project: string; detail: ApiNode } | null>(null);
+  const project = state.project.id;
+  const detail = fetched?.id === id && fetched.project === project ? fetched.detail : null;
   const node = state.tree.nodes[id];
   const tasks = state.tasks.filter((t) => t.node === id);
   const prs = state.prs.filter((p) => p.node === id);
+  const projectQuery = `project=${encodeURIComponent(project)}`;
 
   useEffect(() => {
     let live = true;
-    get<ApiNode>(`/api/node?id=${encodeURIComponent(id)}`).then((d) => live && setFetched({ id, detail: d }), (e: Error) => onError(e.message));
+    get<ApiNode>(`/api/node?id=${encodeURIComponent(id)}&${projectQuery}`).then((d) => live && setFetched({ id, project, detail: d }), (e: Error) => onError(e.message));
     return () => {
       live = false;
     };
-  }, [id, version, attentionKey(state)]);
+  }, [id, projectQuery, version, attentionKey(state)]);
 
-  const scan = () => post("/api/scan", { node: id }).catch((e: Error) => onError(e.message));
+  const scan = () => post(`/api/scan?${projectQuery}`, { node: id }).catch((e: Error) => onError(e.message));
 
   return (
     <aside class="panel">
@@ -51,7 +54,8 @@ export function NodePanel({ id, state, version, onStart, onSelect, onError, onCl
         </button>
       </header>
       <div class="actions">
-        <button onClick={scan}>Scan subtree</button>
+        <button onClick={() => onStart(freeTask(id), [])}>New task here</button>
+        {hasScorer(state.project) && <button onClick={scan}>Scan subtree</button>}
       </div>
       {detail ? <Detail id={id} detail={detail} state={state} version={version} onStart={onStart} onSelect={onSelect} onError={onError} /> : <p class="muted">Loading…</p>}
       <Section title="Pull requests" items={prs}>
@@ -222,12 +226,13 @@ export function SuggestionRow({ suggestion: s, onStart }: { suggestion: Suggesti
   );
 }
 
-export function PrRow({ pr, reason, onError }: { pr: PrState; reason?: string; onError(message: string): void }) {
+export function PrRow({ pr, reason, tag, onError }: { pr: PrState; reason?: string; tag?: ComponentChildren; onError(message: string): void }) {
   const toggle = (e: Event) =>
     post(`/api/prs/${pr.number}/babysit`, { on: (e.currentTarget as HTMLInputElement).checked }).catch((err: Error) => onError(err.message));
   return (
     <li class="row">
       <div>
+        {tag}
         {reason && (
           <>
             <Reason cta={{ kind: "pr", reason }} />{" "}
@@ -497,14 +502,21 @@ function FindingPreview({ finding, open }: { finding: Finding; open: boolean }) 
   );
 }
 
+/** A suggestion-shaped start for a free-form task at `node`: no findings, no title, an empty prompt. */
+function freeTask(node: NodeId): Suggestion {
+  return { node, title: "", findingIds: [], impact: { node: 0, root: 0 }, effort: "small", conflict: 0, priority: 0, manualReview: true };
+}
+
 export function StartDialog({
   suggestion,
   findings,
+  project,
   onClose,
   onError,
 }: {
   suggestion: Suggestion;
   findings: Finding[];
+  project: string;
   onClose(): void;
   onError(message: string): void;
 }) {
@@ -524,17 +536,26 @@ export function StartDialog({
       () => setModelsLoad("failed"),
     );
   }, []);
+  const canStart = modelsLoad !== "loading" && prompt.trim() !== "";
   const submit = (e: Event) => {
     e.preventDefault();
-    if (modelsLoad === "loading") return;
-    const request: StartTaskRequest = { node: suggestion.node, findingIds: suggestion.findingIds, title, prompt, manualReview, ...(model && { model }) };
+    if (!canStart) return;
+    const request: StartTaskRequest = {
+      node: suggestion.node,
+      findingIds: suggestion.findingIds,
+      ...(title.trim() && { title }),
+      prompt,
+      manualReview,
+      project,
+      ...(model && { model }),
+    };
     onClose(); // the task appears in the list via its event; errors surface as a notice
     post<Task>("/api/tasks", request).catch((err: Error) => onError(err.message));
   };
   return (
     <div class="overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <form class="dialog" onSubmit={submit}>
-        <h3>Start task</h3>
+        <h3>{suggestion.findingIds.length ? "Start task" : `New task in ${suggestion.node || "the repo root"}`}</h3>
         {findings.length > 0 && (
           <div class="previews">
             {findings.map((f, i) => (
@@ -572,7 +593,7 @@ export function StartDialog({
           <button type="button" class="link" onClick={onClose}>
             Cancel
           </button>
-          <button type="submit" class="primary" disabled={modelsLoad === "loading"}>
+          <button type="submit" class="primary" disabled={!canStart}>
             Start
           </button>
         </div>
@@ -582,6 +603,7 @@ export function StartDialog({
 }
 
 function defaultPrompt(s: Suggestion, findings: Finding[]): string {
+  if (!s.findingIds.length) return "";
   const lines = findings.length
     ? findings.map((f) => `- ${f.title}${f.file ? ` (${f.file}${f.line ? `:${f.line}` : ""})` : ""}: ${f.detail}`)
     : s.findingIds.map((id) => `- finding ${id}`);

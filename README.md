@@ -24,7 +24,7 @@ The server is shared by every pi session in the repository and outlives them, so
 From a shell:
 
 ```sh
-node dist/cli.js score [repo]   # score headlessly and print a summary
+node dist/cli.js score [repo] [--project id]   # score headlessly and print a summary
 node dist/cli.js serve [repo] [--port N]   # run the server in the foreground
 node dist/cli.js stop [repo]    # stop it
 ```

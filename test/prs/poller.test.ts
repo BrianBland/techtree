@@ -38,7 +38,7 @@ function setup(t: TestContext, opts: Partial<PrPollerOptions> = {}): Harness {
 }
 
 const task = (over: Partial<Task>): Task => ({
-  id: "t1", node: "", title: "t", prompt: "", findingIds: [], state: "pr_open", manualReview: false, plannedFrom: 0,
+  id: "t1", project: "quality", node: "", title: "t", prompt: "", findingIds: [], state: "pr_open", manualReview: false, plannedFrom: 0,
   plannedTo: 0, checklist: [], phase: "pr", createdAt: "2025-01-01T00:00:00Z", updatedAt: "2025-01-01T00:00:00Z", ...over,
 });
 

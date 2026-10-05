@@ -72,6 +72,7 @@ test("score deltas list nodes whose selected score moved by at least 0.5", () =>
 function task(partial: Partial<Task>): Task {
   return {
     id: "t",
+    project: "quality",
     node: "",
     title: "",
     prompt: "",

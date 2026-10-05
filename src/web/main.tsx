@@ -1,34 +1,65 @@
 import { render } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
-import type { ApiState, Finding, NodeId, Suggestion } from "../types.ts";
+import { ALL_PROJECTS, QUALITY } from "../core/projects.ts";
+import type { ApiState, Finding, NodeId, Project, Suggestion } from "../types.ts";
 import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { focusView, layoutTree, siblingOrder, stubId, toggleOverride, type Overrides, type SortKey } from "./layout.ts";
 import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
 import { NodePanel, StartDialog } from "./Panel.tsx";
 import { Overview } from "./Overview.tsx";
+import { PanelResizer, usePanelWidth } from "./PanelResizer.tsx";
+import { ProjectSwitcher } from "./Projects.tsx";
 
 function App() {
+  const [view, setView] = useState(initialView);
+  const [treeProject, setTreeProject] = useState(view === ALL_PROJECTS ? QUALITY : view);
+  const [projects, setProjects] = useState<Project[]>([]);
   const [state, setState] = useState<ApiState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
   const [version, setVersion] = useState(0);
+  const [eventTick, setEventTick] = useState(0);
+  const shownProject = useRef(treeProject);
+  shownProject.current = treeProject;
 
-  const load = () => get<ApiState>("/api/state").then(setState, (e: Error) => setError(e.message));
+  const load = () => {
+    const project = shownProject.current;
+    return get<ApiState>(`/api/state?project=${encodeURIComponent(project)}`).then(
+      (s) => project === shownProject.current && setState(s),
+      (e: Error) => setError(e.message),
+    );
+  };
+  const loadProjects = () => get<Project[]>("/api/projects").then(setProjects, (e: Error) => setError(e.message));
 
   const resync = () => void load().then(() => setVersion((v) => v + 1));
 
+  const switchView = (next: string) => {
+    setView(next);
+    if (next !== ALL_PROJECTS) setTreeProject(next);
+  };
+
+  useEffect(() => void load(), [treeProject]);
+
   useEffect(() => {
-    void load();
-    const stopReconnect = onReconnect(resync);
+    void loadProjects();
+    const stopReconnect = onReconnect(() => {
+      void loadProjects();
+      resync();
+    });
     const stopEvents = onServerEvent((event) => {
       if (event.type === "task") {
-        setState((s) => s && { ...s, tasks: upsert(s.tasks, event.task, (t) => t.id) });
+        setEventTick((n) => n + 1);
+        if (event.task.project === shownProject.current) setState((s) => s && { ...s, tasks: upsert(s.tasks, event.task, (t) => t.id) });
       } else if (event.type === "pr") {
-        setState((s) => s && { ...s, prs: upsert(s.prs, event.pr, (p) => p.number) });
+        setEventTick((n) => n + 1);
+        const ours = (event.pr.project ?? QUALITY) === shownProject.current;
+        setState((s) => s && { ...s, prs: ours ? upsert(s.prs, event.pr, (p) => p.number) : s.prs.filter((p) => p.number !== event.pr.number) });
       } else if (event.type === "task_removed") {
+        setEventTick((n) => n + 1);
         setState((s) => s && { ...s, tasks: s.tasks.filter((t) => t.id !== event.taskId) });
       } else if (event.type === "pr_removed") {
+        setEventTick((n) => n + 1);
         setState((s) => s && { ...s, prs: s.prs.filter((p) => p.number !== event.number) });
       } else if (event.type === "scores") {
         resync();
@@ -43,18 +74,43 @@ function App() {
   }, []);
 
   if (!state) return <div class="loading">{error ?? "Loading…"}</div>;
-  return <Main state={state} version={version} error={error} notice={notice} setError={setError} />;
+  const onProjectsChanged = (next: string) =>
+    void loadProjects().then(() => {
+      switchView(next);
+      if (next === shownProject.current) void load();
+    });
+  return (
+    <Main
+      state={state}
+      view={view}
+      projects={projects}
+      version={version}
+      eventTick={eventTick}
+      error={error}
+      notice={notice}
+      setError={setError}
+      onSwitch={switchView}
+      onProjectsChanged={onProjectsChanged}
+    />
+  );
 }
 
 interface MainProps {
   state: ApiState;
+  /** The selected project id, or "all" (the tree then shows `state.project`). */
+  view: string;
+  projects: Project[];
   version: number;
+  /** Bumped on every task or PR event of any project, for the cross-project overview. */
+  eventTick: number;
   error: string | null;
   notice: string | null;
   setError(message: string | null): void;
+  onSwitch(view: string): void;
+  onProjectsChanged(view: string): void;
 }
 
-function Main({ state, version, error, notice, setError }: MainProps) {
+function Main({ state, view, projects, version, eventTick, error, notice, setError, onSwitch, onProjectsChanged }: MainProps) {
   const [scoreKey, setScoreKey] = useState(COMPOSITE);
   const [weightKey, setWeightKey] = useState("loc");
   const [sortKey, setSortKey] = useState<SortKey>("name");
@@ -62,7 +118,8 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const [selected, setSelected] = useState<NodeId | null>(focus || null);
   const [overrides, setOverrides] = useState<Overrides>(new Map());
   const [fitRequest, setFitRequest] = useState(0);
-  const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[] } | null>(null);
+  const [panelWidth, setPanelWidth] = usePanelWidth();
+  const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[]; project: string } | null>(null);
   const { tree, scores, metricDefs } = state;
 
   const scoreOf = useCallback((id: NodeId) => scoreValue(scores[id], scoreKey), [scores, scoreKey]);
@@ -89,8 +146,9 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const layout = useMemo(() => layoutTree({ tree, shown, radius }), [tree, shown, radius]);
 
   useEffect(() => {
-    globalThis.history?.replaceState(null, "", liveFocus ? `?focus=${encodeURIComponent(liveFocus)}` : location.pathname);
-  }, [liveFocus]);
+    const params = new URLSearchParams({ ...(view !== QUALITY && { project: view }), ...(liveFocus && { focus: liveFocus }) });
+    globalThis.history?.replaceState(null, "", params.size ? `?${params}` : location.pathname);
+  }, [liveFocus, view]);
 
   const statKeys = useMemo(() => statMetrics(metricDefs, state.weights), [metricDefs, state.weights]);
   const look = useMemo(
@@ -108,12 +166,17 @@ function Main({ state, version, error, notice, setError }: MainProps) {
     return (score: number) => color(score);
   }, [scores]);
 
-  const select = (id: NodeId | null) => {
+  const select = (id: NodeId | null, project?: string) => {
+    if (project !== undefined && project !== view) onSwitch(project);
     setSelected(id);
     if (id === null || !Object.hasOwn(tree.nodes, id)) return;
     setFocus(id);
     setOverrides(new Map());
     setFitRequest((n) => n + 1);
+  };
+  const switchTo = (next: string) => {
+    if (next === ALL_PROJECTS) setSelected(null);
+    onSwitch(next);
   };
   const onToggle = (id: NodeId) => {
     const hiding = (layout.byId.get(id)?.hiddenChildren ?? 0) > 0 || layout.byId.has(stubId(id));
@@ -131,6 +194,7 @@ function Main({ state, version, error, notice, setError }: MainProps) {
       <header class="toolbar">
         <strong>techtree</strong>
         <span class="muted">{state.repo.name}</span>
+        <ProjectSwitcher projects={projects} view={view} onSwitch={switchTo} onChanged={onProjectsChanged} onError={setError} />
         <label>
           Score
           <select value={scoreKey} onChange={(e) => setScoreKey((e.currentTarget as HTMLSelectElement).value)}>
@@ -164,14 +228,14 @@ function Main({ state, version, error, notice, setError }: MainProps) {
         <span class="muted small">{layout.nodes.length} shown</span>
         <span class="spacer" />
         {notice && <span class="muted small">{notice}</span>}
-        <button onClick={() => post("/api/score").catch((e: Error) => setError(e.message))}>Rescore</button>
+        <button onClick={() => post(`/api/score?project=${encodeURIComponent(state.project.id)}`).catch((e: Error) => setError(e.message))}>Rescore</button>
       </header>
       {error && (
         <div class="error-bar" onClick={() => setError(null)}>
           {error}
         </div>
       )}
-      <main>
+      <main style={{ "--panel-width": `${panelWidth}px` }}>
         <TreeView
           tree={tree}
           layout={layout}
@@ -188,14 +252,24 @@ function Main({ state, version, error, notice, setError }: MainProps) {
           onToggle={onToggle}
           onStub={onStub}
         />
+        <PanelResizer width={panelWidth} onResize={setPanelWidth} onResizeEnd={() => setFitRequest((n) => n + 1)} />
         {selected === null ? (
-          <Overview state={state} version={version} onSelect={select} onStart={(s) => setStarting({ suggestion: s, findings: [] })} onError={setError} />
+          <Overview
+            state={state}
+            view={view}
+            projects={projects}
+            version={version}
+            eventTick={eventTick}
+            onSelect={select}
+            onStart={(s) => setStarting({ suggestion: s, findings: [], project: s.project ?? state.project.id })}
+            onError={setError}
+          />
         ) : (
           <NodePanel
             id={selected}
             state={state}
             version={version}
-            onStart={(suggestion, findings) => setStarting({ suggestion, findings })}
+            onStart={(suggestion, findings) => setStarting({ suggestion, findings, project: state.project.id })}
             onSelect={select}
             onError={setError}
             onClose={() => setSelected(null)}
@@ -205,6 +279,11 @@ function Main({ state, version, error, notice, setError }: MainProps) {
       {starting && <StartDialog {...starting} onClose={() => setStarting(null)} onError={setError} />}
     </div>
   );
+}
+
+/** The project named by the page's `?project=` parameter ("all" for every project), or Quality. */
+function initialView(): string {
+  return new URLSearchParams(globalThis.location?.search).get("project") || QUALITY;
 }
 
 /** The node named by the page's `?focus=` parameter, or the root. */

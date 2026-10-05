@@ -4,7 +4,7 @@ import { messageBlocked } from "../../src/web/task-actions.ts";
 import type { Task } from "../../src/types.ts";
 
 const task = (state: Task["state"], extra: Partial<Task> = {}): Task => ({
-  id: "t", node: "", title: "t", prompt: "", findingIds: [], state, manualReview: true, plannedFrom: 0, plannedTo: 0,
+  id: "t", project: "quality", node: "", title: "t", prompt: "", findingIds: [], state, manualReview: true, plannedFrom: 0, plannedTo: 0,
   checklist: [], phase: "edit", worktree: "/w", createdAt: "", updatedAt: "", ...extra,
 });
 

@@ -4,7 +4,8 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { StartTaskRequest, TaskPhase } from "../types.ts";
-import { HttpError, type Backend, type WorkerReport } from "./backend.ts";
+import { QUALITY } from "../core/projects.ts";
+import { HttpError, type Backend, type ProjectInput, type WorkerReport } from "./backend.ts";
 
 export interface ServerOptions {
   backend: Backend;
@@ -45,7 +46,7 @@ const CONTENT_TYPES: Record<string, string> = {
 
 type Handler = (req: IncomingMessage, url: URL, params: string[]) => Promise<unknown>;
 interface Route {
-  method: "GET" | "POST";
+  method: "GET" | "POST" | "PATCH" | "DELETE";
   pattern: RegExp;
   handle: Handler;
 }
@@ -87,7 +88,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
     for (const route of routes) {
       const match = route.pattern.exec(url.pathname);
       if (!match || route.method !== req.method) continue;
-      if (route.method === "POST") checkMutation(req, port);
+      if (route.method !== "GET") checkMutation(req, port);
       const result = await route.handle(req, url, match.slice(1).map(decodeURIComponent));
       if (typeof result === "string") {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" }).end(result);
@@ -123,13 +124,24 @@ function apiRoutes(backend: Backend): Route[] {
   const get = (pattern: RegExp, handle: Handler): Route => ({ method: "GET", pattern, handle });
   const post = (pattern: RegExp, handle: Handler): Route => ({ method: "POST", pattern, handle });
   return [
-    get(/^\/api\/state$/, () => backend.getState()),
+    get(/^\/api\/projects$/, () => backend.listProjects()),
+    post(/^\/api\/projects$/, async (req) => backend.createProject(projectInput(await readJson(req)))),
+    { method: "PATCH", pattern: /^\/api\/projects\/([^/]+)$/, handle: async (req, _url, [id]) => backend.updateProject(id, projectInput(await readJson(req))) },
+    {
+      method: "DELETE",
+      pattern: /^\/api\/projects\/([^/]+)$/,
+      handle: async (_req, _url, [id]) => {
+        await backend.deleteProject(id);
+        return OK;
+      },
+    },
+    get(/^\/api\/state$/, (_req, url) => backend.getState(projectParam(url))),
     get(/^\/api\/node$/, (_req, url) => {
       const id = url.searchParams.get("id");
       if (id === null) throw new HttpError(400, "missing id");
-      return backend.getNode(id);
+      return backend.getNode(id, projectParam(url));
     }),
-    get(/^\/api\/overview$/, () => backend.getOverview()),
+    get(/^\/api\/overview$/, (_req, url) => backend.getOverview(projectParam(url))),
     get(/^\/api\/tasks\/([^/]+)\/log$/, (_req, url, [id]) => backend.taskLog(id, tailParam(url))),
     get(/^\/api\/tasks\/([^/]+)\/diff$/, (_req, _url, [id]) => backend.taskDiff(id)),
     get(/^\/api\/source$/, (_req, url) => backend.source(url.searchParams.get("path") ?? "", Number(url.searchParams.get("line")) || undefined)),
@@ -166,14 +178,14 @@ function apiRoutes(backend: Backend): Route[] {
       if (typeof on !== "boolean") throw new HttpError(400, "on must be a boolean");
       return backend.setBabysit(Number(number), on);
     }),
-    post(/^\/api\/score$/, async () => {
-      await backend.rescore();
+    post(/^\/api\/score$/, async (_req, url) => {
+      await backend.rescore(projectParam(url));
       return OK;
     }),
-    post(/^\/api\/scan$/, async (req) => {
+    post(/^\/api\/scan$/, async (req, url) => {
       const { node } = await readJson(req);
       if (typeof node !== "string") throw new HttpError(400, "node must be a string");
-      await backend.scan(node);
+      await backend.scan(node, projectParam(url));
       return OK;
     }),
   ];
@@ -205,6 +217,18 @@ function checkMutation(req: IncomingMessage, port: number) {
   }
 }
 
+function projectParam(url: URL): string {
+  return url.searchParams.get("project") || QUALITY;
+}
+
+function projectInput(body: Record<string, unknown>): ProjectInput {
+  const { name, goal } = body;
+  if ((name !== undefined && typeof name !== "string") || (goal !== undefined && typeof goal !== "string")) {
+    throw new HttpError(400, "name and goal must be strings");
+  }
+  return { ...(name !== undefined && { name }), ...(goal !== undefined && { goal }) };
+}
+
 function tailParam(url: URL): number {
   const raw = url.searchParams.get("tail");
   if (raw === null) return DEFAULT_TAIL;
@@ -234,7 +258,7 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
-  const { node, findingIds, title, prompt, manualReview, model } = body;
+  const { node, findingIds, title, prompt, manualReview, model, project } = body;
   const valid =
     typeof node === "string" &&
     Array.isArray(findingIds) &&
@@ -242,7 +266,8 @@ function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
     typeof manualReview === "boolean" &&
     (title === undefined || typeof title === "string") &&
     (prompt === undefined || typeof prompt === "string") &&
-    (model === undefined || typeof model === "string");
+    (model === undefined || typeof model === "string") &&
+    (project === undefined || typeof project === "string");
   if (!valid) throw new HttpError(400, "body must be a StartTaskRequest");
   return {
     node,
@@ -251,6 +276,7 @@ function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
     ...(title === undefined ? {} : { title }),
     ...(prompt === undefined ? {} : { prompt }),
     ...(model ? { model } : {}),
+    ...(project ? { project } : {}),
   };
 }
 

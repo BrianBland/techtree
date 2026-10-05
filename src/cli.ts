@@ -3,6 +3,7 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.ts";
 import { score } from "./core/pipeline.ts";
+import { getProject, hasScorer, QUALITY } from "./core/projects.ts";
 import { formatReport } from "./core/report.ts";
 import { recordFindings, saveSnapshot } from "./core/store.ts";
 import { dbCache, openDb, suppressSqliteWarning } from "./db.ts";
@@ -16,15 +17,25 @@ suppressSqliteWarning();
 const USAGE = `usage: techtree <command> [repo]
 
 commands:
-  score [repo]   score a repository headlessly, save a snapshot and print a summary
+  score [repo] [--project id]
+                 score a repository's project (default quality) headlessly, save a snapshot and print a summary
   serve [repo] [--port N]
                  run the repository's techtree server in the foreground and print its URL;
                  the UI is read from dist/web on every request, so rebuild and reload
   stop [repo]    stop the repository's techtree server`;
 
-async function scoreCommand(path: string): Promise<number> {
+async function scoreCommand(path: string, projectId: string): Promise<number> {
   const repoRoot = repoRootOf(resolve(path));
   const db = openDb(cacheDir(repoId(repoRoot)));
+  const project = getProject(db, projectId);
+  if (!project) {
+    console.error(`no project ${JSON.stringify(projectId)}`);
+    return 1;
+  }
+  if (!hasScorer(project)) {
+    console.log(`${project.name} has no scorer yet; nothing to score`);
+    return 0;
+  }
   const started = performance.now();
   const result = await score({
     repoRoot,
@@ -33,8 +44,8 @@ async function scoreCommand(path: string): Promise<number> {
     cache: dbCache(db),
     log: (msg) => console.error(msg),
   });
-  saveSnapshot(db, result);
-  recordFindings(db, result.findings, result.createdAt, true);
+  saveSnapshot(db, result, project.id);
+  recordFindings(db, result.findings, result.createdAt, true, project.id);
   console.log(formatReport(result));
   const nodes = Object.keys(result.tree.nodes).length;
   console.error(`scored ${nodes} nodes, ${result.findings.length} findings in ${((performance.now() - started) / 1000).toFixed(1)}s`);
@@ -44,8 +55,10 @@ async function scoreCommand(path: string): Promise<number> {
 async function main(argv: string[]): Promise<number> {
   const [command, arg] = argv;
   switch (command) {
-    case "score":
-      return scoreCommand(arg ?? ".");
+    case "score": {
+      const { values, positionals } = parseArgs({ args: argv.slice(1), options: { project: { type: "string" } }, allowPositionals: true });
+      return scoreCommand(positionals[0] ?? ".", values.project ?? QUALITY);
+    }
     case "serve": {
       const { values, positionals } = parseArgs({ args: argv.slice(1), options: { port: { type: "string" } }, allowPositionals: true });
       const port = values.port === undefined ? 0 : Number(values.port);

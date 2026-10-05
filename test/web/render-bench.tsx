@@ -74,6 +74,7 @@ function withData(nodes: Record<NodeId, TreeNode>, ids: NodeId[], rand: () => nu
   const tree: Tree = { repoRoot: "/r", nodes };
   const tasks: Task[] = ids.slice(1, 40).map((node, i) => ({
     id: `t${i}`,
+    project: "quality",
     node,
     title: "t",
     prompt: "",

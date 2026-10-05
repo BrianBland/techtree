@@ -63,11 +63,35 @@ It is `index.ts` so that both `-e <package>/extensions` (a directory loads its `
 - **In worker children** (`TECHTREE_TASK` set) it registers only `techtree_report` and never starts a server.
 - **`/techtree`** launches or reuses the server and shows the URL: a `warning` notify (delivered by every UI host, including RPC hosts that drop background `info` notifies), and on stdout in print mode, where notifies have no channel. It then starts the status widget.
 - **Status widget** (`setWidget` key `techtree`): one line, `techtree: <n> running · <m> need attention · <url>`, fed by one `GET /api/state` and then the `/api/events` stream (refetching state on reconnect). It stops on `session_shutdown`.
-- **Tools:** `techtree_status` (root quality, running tasks, attention tasks and flagged PRs, URL) and `techtree_findings` (`{ path?, limit? }`: top findings by impact for the deepest node containing `path`, a repo-relative or absolute file or directory defaulting to the working directory; limit 10). Both launch the server when needed.
+- **Tools:** `techtree_status` (`{ project? }`: root quality, running tasks, attention tasks and flagged PRs, URL) and `techtree_findings` (`{ path?, limit?, project? }`: top findings by impact for the deepest node containing `path`, a repo-relative or absolute file or directory defaulting to the working directory; limit 10). `project` defaults to `quality`. Both launch the server when needed.
+
+## Projects
+
+A *project* is one use of the tech tree on a repo: quality, performance, a feature. Every repo has the built-in **Quality** project (id `quality`), which scores and scans the repo as described under "Scoring"; users add custom projects (e.g. "Faster startup", goal: "cut cold start below 1 s") and switch between them.
+
+```ts
+interface ScorerSpec {
+  plugins?: string[];   // metric plugin ids; Quality lists the backend's plugins
+  rubric?: string;      // lane 2: LLM-judged rubric (declared, ignored by scoring)
+  command?: string[];   // lane 2: external scoring command (declared, ignored)
+  plan?: boolean;       // lane 2: human-driven plan (declared, ignored)
+}
+interface Project { id: string; name: string; goal?: string; scorer: ScorerSpec; createdAt: string; builtin?: boolean }
+```
+
+- **Shared vs per project.** The tree (paths, `loc`, kinds, structure) is shared. Scores, findings, suggestions, calls to action, snapshots and tasks belong to one project (`Task.project`, a `project` column on `snapshots`, `findings` and `tasks`).
+- **Scorers.** A project *has a scorer* when its `scorer.plugins` is non-empty. Only Quality has one for now: it is scored with the backend's plugin set (default plugins plus `llm-scan`) and its `scorer.plugins` lists their ids. Custom projects are created with an empty scorer; `rubric`, `command` and `plan` arrive in lane 2. A project without a scorer has no scores and no findings: its state carries the shared tree with only neutral metrics (`loc`, …) so tiles keep their size and render neutral, while tasks, PRs and attention CTAs work as usual. Rescoring refreshes the shared tree and every scorer; scanning needs a scorer (400 otherwise).
+- **Storage.** The per-repo SQLite db has a `projects` table (`id`, `data` JSON `Project`). Opening the db creates Quality if missing and adds the `project` column (default `quality`) to old databases, so existing snapshots, findings and tasks become Quality's; task JSON without `project` loads as `quality`.
+- **Ids.** A new project's id is its name lowercased, with runs of other characters than `a-z0-9` turned into `-` and trimmed (`project` when empty), suffixed `-2`, `-3`, … when taken; `all` is reserved for the cross-project overview.
+- **PRs** belong to the project of their task (`taskId`), else to Quality; `pr` events and listed PRs carry that as `project`.
+- **Worker prompts** of a project with a goal start with `Project: <name>` and `Goal: <goal>` lines before the task prompt.
+- **Delete** removes a custom project with its tasks (discarded like "Discard": worktree, branch, log, session), findings and snapshots. Built-in projects cannot be deleted (409), nor a project with a task that is `queued`, `running`, `needs_input`, or `pr_open` with a PR not yet seen merged or closed (409: cancel it or close its PR first); `pr_open` tasks whose PR is retired (see "PRs") are discarded with the rest.
+- **CLI.** `techtree score [repo] [--project <id>]` scores the project (default `quality`) and saves its snapshot; for a project without a scorer it says so and saves nothing; an unknown project is an error.
+- **Cross-project overview** (`GET /api/overview?project=all`): `attentionTasks` and `flaggedPrs` of every project first (each labelled by its `project`), then `suggestions` interleaved round-robin by project (the first of each project in project order, then the second of each, …), each with its `project`, cut to 8; `coverage` is Quality's.
 
 ## Data model (contract for all subtasks)
 
-`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`, and the optional poller fields `mergeable`, `branch`, `head`, `reviewCount`, `babysitStatus` (see "PRs"); the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config` (including the optional `terminal` template); `ChatEntry` (a chat transcript turn); and the HTTP API payloads below.
+`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.project` (see "Projects"), `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`, and the optional poller fields `mergeable`, `branch`, `head`, `reviewCount`, `babysitStatus` (see "PRs"); the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config` (including the optional `terminal` template); `ChatEntry` (a chat transcript turn); and the HTTP API payloads below.
 
 ```ts
 type NodeId = string;              // repo-relative dir path, "" = root
@@ -264,6 +288,9 @@ The precise rules the scorer implements:
   - Siblings are sorted by a selectable key (default: alphabetical).
 - **Overlays:** running tasks appear as a research bar under the node. The bar is solid up to `plannedFrom`, then shows a loading stripe up to `plannedTo` filled to checklist completion, then empty. Its color follows the score ramp. Open PRs appear as a count bubble on the top-right corner of their anchor node. The anchor is the deepest node that contains at least 60% of the PR's changed lines.
 - **Node panel** (on click): first "This node": the node's own calls to action with their actions (answer a question, review the diff and Open PR, babysit toggle, Start a suggested task); then "From children": the top calls to action from its descendants, each labelled with its path relative to the node and selecting that node on click; then composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, and tasks with their checklist and action bar (see "Task actions"). Suggested tasks appear only as calls to action. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic), lets you edit the prompt, and lets you pick the model from the models pi reports (`GET /api/models`), prepopulated with `config.defaultModel` or, when unset, the last model used in this repo, else pi's own default. Start stays disabled until that list has loaded, so a task never silently skips the default; if loading fails, the dialog says so and starts with pi's default.
+- **Projects.** The header has a project switcher: every project, "All projects" and "New project…" (a dialog asking for a name and a goal). A gear next to it opens the selected project's settings: rename, edit the goal, delete (not for Quality). The selection is kept in the URL as `?project=<id>` (`all` for all projects; absent = Quality). "All projects" closes the node panel and shows the cross-project overview, each item labelled with its project; selecting an item switches to its project and node. Meanwhile the tree shows the last selected project (Quality at first). A project without a scorer shows its goal and a "No scorer yet" placeholder instead of suggestions and scan coverage. Node details are refetched when the project changes and the previous project's are never shown meanwhile; saving project settings refetches the state, and a reconnect refetches the project list too. The UI ignores `task` and `pr` events of other projects, except that the cross-project overview refetches on every task event.
+- **Panel width.** The right panel (node panel or overview) is 440 px wide by default. Dragging the handle on its left edge resizes it between 320 px and 75% of the window; the tree takes the remaining width and re-fits when the drag ends. The width is kept in `localStorage` (`techtree.panelWidth`); double-clicking the handle resets it to the default.
+- **New task here** in the node panel opens the start dialog without findings, for a free-form prompt (Start stays disabled while the prompt is empty); it works in every project.
 - **Overview** (no selection): calls to action:
   1. tasks in `needs_input` or `review`
   2. PRs that are failing, stuck (no progress in 24h), or stale (no update in 3 days)
@@ -409,15 +436,19 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | Route | Result |
 |---|---|
 | `GET /api/health` | `{ version }`; the only route that needs no token |
-| `GET /api/state` | `ApiState`: repo, latest snapshot, tree, metric defs, weights, scores, tasks, PRs, finding counts |
-| `GET /api/node?id=<node>` | `ApiNode`: score, history, findings with impact, PRs, tasks, suggestions |
-| `GET /api/overview` | `ApiOverview`: attention tasks, flagged PRs, suggestions, scan coverage |
+| `GET /api/projects` | `Project[]`, Quality first, then by creation |
+| `POST /api/projects` | body `{ name, goal? }` → the new custom `Project` (empty scorer); 400 for an empty name |
+| `PATCH /api/projects/:id` | body `{ name?, goal? }` → `Project` (an empty goal removes it) |
+| `DELETE /api/projects/:id` | delete a custom project and its rows → `{ ok: true }`; 409 built-in or with live/PR tasks (see "Projects") |
+| `GET /api/state?project=<id>` | `ApiState`: repo, the project, latest snapshot, tree, metric defs, weights, scores, the project's tasks and PRs, finding counts |
+| `GET /api/node?id=<node>&project=<id>` | `ApiNode`: score, history, findings with impact, PRs, tasks, suggestions |
+| `GET /api/overview?project=<id>` | `ApiOverview`: attention tasks, flagged PRs, suggestions, scan coverage; `project=all` gives the cross-project overview |
 | `GET /api/events` | SSE stream of `ServerEvent` (including `pr_removed` for merged or closed PRs) |
 | `GET /api/tasks/:id/log?tail=N` | last N log lines (text) |
 | `GET /api/tasks/:id/diff` | worktree diff against the base (text) |
 | `GET /api/models` | `ApiModels`: `{ default, models }`, used by the start dialog. `models` comes from `<piCommand> --list-models` (a table whose header row starts with `provider` and `model`; its rows' first two columns are provider and model) as `provider/model`, cached in memory for 10 minutes. Output without that header (e.g. pi's "No models available" help), a nonzero exit, or a run past 30 s (SIGTERM, then SIGKILL after 1 s) yields `[]`, which is not cached. `default` = `config.defaultModel`, else the model of the newest task that has one, else null |
 | `GET /api/source?path=P&line=N` | `ApiSource`: lines of repo file `P` at the scored commit (`git show <sha>:P`), 10 lines before to 20 after `N` (first 30 lines without `N`); 404 for paths not in that commit. The start dialog previews each finding with it. |
-| `POST /api/tasks` | body `StartTaskRequest` → `Task` (optional `model`, passed to the child as `--model`) |
+| `POST /api/tasks` | body `StartTaskRequest` → `Task` (optional `model`, passed to the child as `--model`; optional `project`, default `quality`) |
 | `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question → `Task` |
 | `POST /api/tasks/:id/open-pr` | `review` → `pr_open` → `Task` |
 | `POST /api/tasks/:id/cancel` | stop the child, mark `failed` → `Task` |
@@ -426,9 +457,11 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | `POST /api/tasks/:id/open-terminal` | body `{ mode: "shell" \| "agent" }`: open a terminal window in the worktree → `{ ok: true }`; 409 agent mode while a worker is live or without a worktree, 501 no terminal for this platform |
 | `POST /api/tasks/:id/discard` | stop the child, delete worktree, local branch and task (not for `pr_open`) → `{ ok: true }` |
 | `POST /api/prs/:number/babysit` | body `{ on: boolean }` → `PrState` |
-| `POST /api/score` | rescore the repo → `{ ok: true }`; completion arrives as a `scores` event |
-| `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree → `{ ok: true }`; progress arrives as `scan` events |
+| `POST /api/score?project=<id>` | rescore the repo → `{ ok: true }`; completion arrives as a `scores` event |
+| `POST /api/scan?project=<id>` | body `{ node }`: run the LLM scan on a subtree → `{ ok: true }`; progress arrives as `scan` events; 400 for a project without a scorer |
 | `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`WorkerReport`: at least one of `plan: string[]`, `phase: TaskPhase`, `done: index`, `needs_input: string`) → `Task` |
+
+Every project-scoped route takes `?project=<id>`, default `quality`; an unknown project is a 404.
 
 Errors are JSON `{ error: string }`: 400 malformed body or parameters, 401 missing or wrong token, 403 foreign `Host`/`Origin` or a non-JSON mutating request, 404 unknown route, node, task or PR, 409 the task is in the wrong state, 413 body over 1 MB, 500 anything else, 501 a platform feature that is unavailable (no terminal program). Backends signal 404/409 by throwing `HttpError`.
 
@@ -436,7 +469,7 @@ The SSE stream sends one `data: <ServerEvent JSON>` message per event and a `: p
 
 ## Security
 
-The server binds 127.0.0.1 only and requires a random token on every request, including the static UI; only `GET /api/health`, which returns the package version and nothing else, is open so launchers can probe a server. The token is accepted as `?token=` (the server then sets it as an `HttpOnly; SameSite=Strict` cookie `techtree_token_<port>` (named per port because cookies are not port-scoped and each repo has its own server) and redirects page loads to the bare URL), as that cookie, or as `Authorization: Bearer <token>` (used by workers). Requests whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` are rejected (DNS rebinding). Mutating endpoints are `POST` only, must send `Content-Type: application/json`, and are rejected when an `Origin` header names another origin, so cross-site forms cannot reach them. Workers inherit the user's pi configuration and sandbox, and techtree adds no privileges.
+The server binds 127.0.0.1 only and requires a random token on every request, including the static UI; only `GET /api/health`, which returns the package version and nothing else, is open so launchers can probe a server. The token is accepted as `?token=` (the server then sets it as an `HttpOnly; SameSite=Strict` cookie `techtree_token_<port>` (named per port because cookies are not port-scoped and each repo has its own server) and redirects page loads to the bare URL), as that cookie, or as `Authorization: Bearer <token>` (used by workers). Requests whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` are rejected (DNS rebinding). Mutating endpoints are `POST`, `PATCH` or `DELETE`, must send `Content-Type: application/json`, and are rejected when an `Origin` header names another origin, so cross-site forms cannot reach them. Workers inherit the user's pi configuration and sandbox, and techtree adds no privileges.
 
 ## Out of scope for v1
 
