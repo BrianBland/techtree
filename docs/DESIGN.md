@@ -37,6 +37,8 @@ There is one server per repo, shared by every pi session in that repo through a 
 
 ## Data model (contract for all subtasks)
 
+`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`; the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config`; and the HTTP API payloads below.
+
 ```ts
 type NodeId = string;              // repo-relative dir path, "" = root
 interface TreeNode { id: NodeId; name: string; kind: string /* "dir" | "crate" | ... */; children: NodeId[]; files: string[] }
@@ -120,6 +122,40 @@ The v1 plugins are listed below.
 - **Finish:** with `manualReview`, the worker commits and stops in `review`; the UI shows the diff with an "Open PR" button. Otherwise the worker opens the PR itself, following the repo's PR template and pushing to the upstream remote.
 - **Babysit:** on PR events (CI failure, new review thread, conflict), the poller resumes the task's pi session or starts a `techtree-babysit` child with that context. It stops at ready-to-merge, merged, closed, or after 3 failed fix attempts. It never merges.
 - **Recovery:** task state lives in SQLite, so a server restart reattaches to live child processes by pid, or marks those tasks failed with a link to their log.
+
+## Configuration
+
+`.techtree.yaml` at the repo root, merged over defaults. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
+
+```yaml
+weights: { }          # metric key → composite weight (defaults in src/config.ts)
+minLoc: 200           # smaller nodes inherit their parent's percentile
+workers: 3
+worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}"
+ignore: [target, node_modules, .git]
+plugins:              # per-plugin options, e.g.
+  rust: { }
+```
+
+## HTTP API
+
+All routes are under `/api`, require the token, and return JSON. Payload types are in `src/types.ts`.
+
+| Route | Result |
+|---|---|
+| `GET /api/state` | `ApiState`: repo, latest snapshot, tree, metric defs, weights, scores, tasks, PRs, finding counts |
+| `GET /api/node?id=<node>` | `ApiNode`: score, history, findings with impact, PRs, tasks, suggestions |
+| `GET /api/overview` | `ApiOverview`: attention tasks, flagged PRs, suggestions, scan coverage |
+| `GET /api/events` | SSE stream of `ServerEvent` |
+| `GET /api/tasks/:id/log?tail=N` | last N log lines (text) |
+| `GET /api/tasks/:id/diff` | worktree diff against the base (text) |
+| `POST /api/tasks` | body `StartTaskRequest` → `Task` |
+| `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question |
+| `POST /api/tasks/:id/open-pr` | `review` → `pr_open` |
+| `POST /api/tasks/:id/cancel` | stop the child, mark `failed` |
+| `POST /api/prs/:number/babysit` | body `{ on: boolean }` |
+| `POST /api/score` | rescore the repo |
+| `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree |
 
 ## Security
 

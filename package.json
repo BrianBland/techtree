@@ -1,0 +1,41 @@
+{
+  "name": "techtree",
+  "version": "0.1.0",
+  "description": "Show a repository as a tech tree: scored directories, live agent tasks and PRs.",
+  "scripts": {
+    "build": "node build.mjs",
+    "test": "node --test --disable-warning=ExperimentalWarning \"test/**/*.test.ts\"",
+    "typecheck": "tsc -p ."
+  },
+  "keywords": [
+    "pi-package"
+  ],
+  "license": "MIT",
+  "devDependencies": {
+    "@earendil-works/pi-coding-agent": "^1.0.3",
+    "@types/node": "^22.20.5",
+    "esbuild": "^0.28.2",
+    "preact": "^11.0.0",
+    "typebox": "^1.3.35",
+    "typescript": "^7.0.2"
+  },
+  "type": "module",
+  "bin": {
+    "techtree": "dist/cli.js"
+  },
+  "pi": {
+    "extensions": [
+      "./extensions"
+    ],
+    "skills": [
+      "./skills"
+    ]
+  },
+  "peerDependencies": {
+    "@earendil-works/pi-coding-agent": "*",
+    "typebox": "*"
+  },
+  "engines": {
+    "node": ">=22.18"
+  }
+}
