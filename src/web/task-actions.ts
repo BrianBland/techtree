@@ -11,6 +11,6 @@ export function hasLiveWorker(task: Task): boolean {
 export function messageBlocked(task: Task): string | undefined {
   if (task.state === "queued") return "waiting for a worker slot";
   if (task.state === "running" && task.pid === undefined) return "starting";
-  if (task.state === "done") return "the task is done";
+  if (task.state === "done" && task.outcome !== "no_change") return "the task is done";
   return undefined;
 }

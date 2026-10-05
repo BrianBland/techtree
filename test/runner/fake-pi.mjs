@@ -125,6 +125,32 @@ const scenarios = {
     await report({ plan: ["boom"] });
     process.exit(3);
   },
+  // Commits and reverts, so the branch has commits but no net diff; a resumed run makes a real change.
+  async revert(_message, settle) {
+    if (resumed) {
+      commit();
+      return settle();
+    }
+    await report({ plan: ["try"] });
+    commit();
+    execFileSync("git", ["revert", "--no-edit", "HEAD"]);
+    await report({ done: 0 });
+    say("The finding is a false positive; nothing to change.");
+    settle();
+  },
+  async explain(_message, settle) {
+    await report({ plan: ["look"] });
+    await report({ outcome: "no_change", summary: "Already correct.", dismiss: ["f1"], reason: "false positive" });
+    settle();
+  },
+  // Overwrites README.md with the prompt, so two such tasks conflict.
+  async readme(message, settle) {
+    await report({ plan: ["rewrite"] });
+    writeFileSync("README.md", `${message}\n`);
+    execFileSync("git", ["commit", "-qam", "rewrite readme"]);
+    await report({ done: 0 });
+    settle();
+  },
   async resume(message, settle) {
     if (!resumed) return report({ plan: ["survive a restart"] });
     say(`resumed: ${message}`);

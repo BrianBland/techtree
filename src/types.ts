@@ -72,7 +72,7 @@ export interface Finding {
   confidence?: number; // 0..1, default 1: how likely the finding is a real problem (scales priority)
 }
 
-export type TaskState = "queued" | "running" | "needs_input" | "review" | "pr_open" | "done" | "failed";
+export type TaskState = "queued" | "running" | "needs_input" | "review" | "staged" | "pr_open" | "done" | "failed";
 export type TaskPhase = "plan" | "explore" | "edit" | "test" | "pr";
 
 export interface ChecklistItem {
@@ -101,6 +101,11 @@ export interface Task {
   error?: string;
   pid?: number;
   logPath?: string;
+  stagedAt?: string; // set while state === "staged" (DESIGN "Staging and combined PRs")
+  bundle?: string; // Bundle.id once opened in a combined PR
+  outcome?: "no_change"; // with state "done": the agent finished without a net diff
+  summary?: string; // the agent's explanation for a no_change outcome
+  proposedDismiss?: { findingIds: string[]; reason?: string }; // agent-proposed dismissal, awaiting the user
   createdAt: string;
   updatedAt: string;
 }
@@ -127,6 +132,19 @@ export interface PrState {
   reviewCount?: number; // submitted reviews by others that are not approvals
   babysitStatus?: string; // last babysit outcome, e.g. "observe-only: CI failing"
   project?: string; // its task's project, else "quality"; set on listed PRs and `pr` events
+}
+
+/** A combined PR opened from staged tasks (DESIGN "Staging and combined PRs"). */
+export interface Bundle {
+  id: string;
+  project: string;
+  title: string;
+  branch: string;
+  worktree: string;
+  taskIds: string[]; // in staging order
+  pr: number;
+  url: string;
+  createdAt: string;
 }
 
 // ---- Projects (DESIGN "Projects") ----
@@ -243,6 +261,7 @@ export interface ApiNode {
   prs: PrState[];
   tasks: Task[];
   suggestions: Suggestion[];
+  dismissed: (Finding & { reason?: string })[]; // the node's dismissed findings (DESIGN "Dismissed findings")
   ownCtas: Cta[]; // calls to action anchored at this node, ranked
   childCtas: Cta[]; // top calls to action from descendants (not this node), ranked, at most 10
 }
@@ -260,6 +279,7 @@ export interface Cta {
 
 export interface ApiOverview {
   attentionTasks: Task[]; // needs_input or review
+  stagedTasks: Task[]; // staged, in staging order
   flaggedPrs: PrState[]; // failing, stuck or stale
   suggestions: Suggestion[];
   coverage: { scannedNodes: number; totalNodes: number; scannedLoc: number; totalLoc: number };

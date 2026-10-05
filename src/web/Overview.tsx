@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ALL_PROJECTS, hasScorer } from "../core/projects.ts";
-import type { ApiOverview, ApiState, NodeId, Project, Suggestion } from "../types.ts";
-import { get } from "./api.ts";
+import type { ApiOverview, ApiState, Bundle, NodeId, Project, Suggestion, Task } from "../types.ts";
+import { get, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { PrRow, Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
 
@@ -70,6 +70,9 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
           </li>
         )}
       </Section>
+      {stagedByProject(overview.stagedTasks).map(([project, tasks]) => (
+        <StagedSection key={project} title={all ? `Staged · ${projectName(project)}` : "Staged"} project={project} tasks={tasks} nodeName={nodeName} onError={onError} />
+      ))}
       <Section title="Pull requests needing attention" items={overview.flaggedPrs}>
         {(pr) => <PrRow key={pr.number} pr={pr} tag={tag(pr.project)} onError={onError} />}
       </Section>
@@ -105,6 +108,51 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
       </section>
       )}
     </aside>
+  );
+}
+
+function stagedByProject(tasks: Task[]): [string, Task[]][] {
+  const groups = new Map<string, Task[]>();
+  for (const task of tasks) groups.set(task.project, [...(groups.get(task.project) ?? []), task]);
+  return [...groups];
+}
+
+/** A project's staged tasks with checkboxes and "Open combined PR" (DESIGN "Staging and combined PRs"). */
+function StagedSection({ title, project, tasks, nodeName, onError }: { title: string; project: string; tasks: Task[]; nodeName(id: NodeId): string; onError(message: string): void }) {
+  const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
+  const [prTitle, setPrTitle] = useState("");
+  const [opening, setOpening] = useState(false);
+  const taskIds = tasks.filter((t) => !unchecked.has(t.id)).map((t) => t.id);
+  const toggle = (id: string) =>
+    setUnchecked((ids) => {
+      const next = new Set(ids);
+      if (!next.delete(id)) next.add(id);
+      return next;
+    });
+  const open = () => {
+    setOpening(true);
+    post<Bundle>("/api/bundles", { project, taskIds, title: prTitle })
+      .then(() => setPrTitle(""), (e: Error) => onError(e.message))
+      .finally(() => setOpening(false));
+  };
+  return (
+    <section class="staged-bundle">
+      <h3>{title}</h3>
+      <ul class="list">
+        {tasks.map((task) => (
+          <li key={task.id}>
+            <label>
+              <input type="checkbox" checked={!unchecked.has(task.id)} onChange={() => toggle(task.id)} /> {task.title}
+              <span class="muted small"> · {nodeName(task.node)}</span>
+            </label>
+          </li>
+        ))}
+      </ul>
+      <input type="text" placeholder="PR title (default: from the tasks)" value={prTitle} onInput={(e) => setPrTitle((e.currentTarget as HTMLInputElement).value)} />
+      <button class="primary" disabled={!taskIds.length || opening} onClick={open}>
+        {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
+      </button>
+    </section>
   );
 }
 

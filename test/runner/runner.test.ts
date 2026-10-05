@@ -539,3 +539,25 @@ test("the chat transcript of an unknown task is an error, not an empty list", as
   const h = await setup(t);
   assert.throws(() => h.runner.chat("nope"), /unknown task/);
 });
+
+test("a task whose commits cancel out ends done as no_change with the agent's last message; a message resumes it", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("revert"));
+  const done = await h.waitFor(task.id, (x) => x.state === "done");
+  assert.equal(done.outcome, "no_change");
+  assert.equal(done.summary, "The finding is a false positive; nothing to change.");
+
+  h.runner.message(task.id, "Please make the change anyway.");
+  const reviewed = await h.waitFor(task.id, (x) => x.state === "review");
+  assert.equal(reviewed.outcome, undefined);
+  assert.equal(reviewed.summary, undefined);
+});
+
+test("the agent can report no_change explicitly and propose dismissing findings", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("explain", false));
+  const done = await h.waitFor(task.id, (x) => x.state === "done");
+  assert.equal(done.outcome, "no_change");
+  assert.equal(done.summary, "Already correct.");
+  assert.deepEqual(done.proposedDismiss, { findingIds: ["f1"], reason: "false positive" });
+});

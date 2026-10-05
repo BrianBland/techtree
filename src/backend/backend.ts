@@ -17,14 +17,16 @@ import { listModels } from "./models.ts";
 import { launchDetached, shellQuote, terminalArgv } from "./terminal.ts";
 import { Babysitter } from "../prs/babysit.ts";
 import { PrPoller, prRetired } from "../prs/poller.ts";
+import { BundleConflict, listBundles, openBundle, saveBundle } from "../runner/bundle.ts";
 import { TaskRunner } from "../runner/runner.ts";
-import { HttpError, type Backend, type ProjectInput, type WorkerReport } from "../server/backend.ts";
+import { HttpError, type Backend, type BundleInput, type ProjectInput, type WorkerReport } from "../server/backend.ts";
 import type {
   ApiModels,
   ApiNode,
   ApiOverview,
   ApiSource,
   ApiState,
+  Bundle,
   Cache,
   ChatEntry,
   CollectCtx,
@@ -93,6 +95,7 @@ export class RepoBackend implements Backend {
   private derived?: { result: ScoreResult; busyKey: string; suggestions: Suggestion[] };
   private scanned?: { result: ScoreResult; coverage: ApiOverview["coverage"] };
   private unscoredView?: { from: ScoreResult; result: ScoreResult };
+  private visibleView?: { from: ScoreResult; dismissedKey: string; result: ScoreResult };
   private scoring?: Promise<void>;
   private rescoreQueued = false;
   private scoreError?: string;
@@ -154,12 +157,34 @@ export class RepoBackend implements Backend {
       tasks: () => runner.list(),
       onEvent: (event) => this.emit(event),
       onUpdate: (prev, next) => babysitter.onUpdate(prev, next),
-      onRemove: (pr) => babysitter.onRemove(pr),
+      onRemove: (pr) => {
+        babysitter.onRemove(pr);
+        void this.followBundle(runner, pr.number);
+      },
     });
     const babysitter = new Babysitter({ poller, runner });
     this.opts.prs = { list: () => poller.list(), setBabysit: (n, on) => babysitter.setBabysit(n, on), onEvent: () => () => {} };
     this.stopPrPolling = () => poller.stop();
     poller.start();
+  }
+
+  /** A bundle's PR left the open list: its tasks follow it (DESIGN "Staging and combined PRs"). */
+  private async followBundle(runner: TaskRunner, number: number): Promise<void> {
+    const bundle = listBundles(this.opts.db).find((b) => b.pr === number);
+    if (!bundle) return;
+    let state: string;
+    try {
+      ({ stdout: state } = await promisify(execFile)("gh", ["pr", "view", String(number), "--json", "state", "--jq", ".state"], { cwd: this.opts.repoRoot }));
+    } catch (err) {
+      return this.opts.log(`bundle PR #${number}: ${errorText(err)}`);
+    }
+    const merged = state.trim() === "MERGED";
+    if (merged) {
+      const findingIds = bundle.taskIds.flatMap((id) => runner.get(id)?.findingIds ?? []);
+      const resolve = this.opts.db.prepare("UPDATE findings SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL");
+      for (const id of findingIds) resolve.run(new Date().toISOString(), id);
+    }
+    runner.bundleClosed(bundle.taskIds, merged);
   }
 
   /** Whether anything should keep the server alive: SSE clients, live or queued tasks, scoring or scans. */
@@ -186,6 +211,66 @@ export class RepoBackend implements Backend {
     await Promise.all(this.scanning.values());
   }
 
+  async stage(taskId: string): Promise<Task> {
+    return this.runnerCall(() => this.runner().stage(taskId));
+  }
+
+  async unstage(taskId: string): Promise<Task> {
+    return this.runnerCall(() => this.runner().unstage(taskId));
+  }
+
+  async listBundles(projectId?: string): Promise<Bundle[]> {
+    return listBundles(this.opts.db, this.project(projectId).id);
+  }
+
+  async createBundle({ project: projectId, taskIds, title }: BundleInput): Promise<Bundle> {
+    const project = this.project(projectId);
+    if (!taskIds.length) throw new HttpError(400, "taskIds must not be empty");
+    const tasks = taskIds.map((id) => this.task(id));
+    const wrong = tasks.find((t) => t.state !== "staged" || t.project !== project.id);
+    if (wrong) throw new HttpError(409, `task ${wrong.id} is ${wrong.state} in ${wrong.project}, not staged in ${project.id}`);
+    tasks.sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? ""));
+    const findings = new Map((this.result?.findings ?? []).map((f) => [f.id, f.title]));
+    const { repoRoot, config, db } = this.opts;
+    let bundle: Bundle;
+    try {
+      bundle = await openBundle({
+        repoRoot,
+        config,
+        project: project.id,
+        tasks,
+        ...(title && { title }),
+        findingTitles: (task) => task.findingIds.map((id) => findings.get(id) ?? id),
+      });
+    } catch (err) {
+      throw new HttpError(err instanceof BundleConflict ? 409 : 502, errorText(err));
+    }
+    saveBundle(db, bundle);
+    this.runner().bundled(bundle.taskIds, bundle.id, bundle.pr);
+    return bundle;
+  }
+
+  async dismiss(findingIds: string[], reason?: string, projectId?: string): Promise<void> {
+    const project = this.project(projectId).id;
+    const insert = this.opts.db.prepare(
+      "INSERT INTO dismissals (finding_id, project, reason, created_at) VALUES (?, ?, ?, ?) " +
+        "ON CONFLICT (finding_id) DO UPDATE SET reason = excluded.reason",
+    );
+    for (const id of findingIds) insert.run(id, project, reason ?? null, new Date().toISOString());
+    this.announceFindingsChanged();
+  }
+
+  async undismiss(findingIds: string[]): Promise<void> {
+    const remove = this.opts.db.prepare("DELETE FROM dismissals WHERE finding_id = ?");
+    for (const id of findingIds) remove.run(id);
+    this.announceFindingsChanged();
+  }
+
+  /** Clients refetch state and details on `scores`, which is what a (un)dismissal needs. */
+  private announceFindingsChanged(): void {
+    if (this.result) this.emit({ type: "scores", snapshot: { sha: this.result.sha, createdAt: this.result.createdAt } });
+  }
+
   async getState(projectId?: string): Promise<ApiState> {
     const { project, result } = await this.view(projectId);
     const findingCounts = dict<number>();
@@ -206,7 +291,7 @@ export class RepoBackend implements Backend {
   }
 
   async getNode(id: NodeId, projectId?: string): Promise<ApiNode> {
-    const { project, result } = await this.view(projectId);
+    const { project, result, dismissed } = await this.view(projectId);
     if (!hasNode(result, id)) throw new HttpError(404, `no node ${JSON.stringify(id)}`);
     const tasks = this.tasks(project.id);
     const prs = this.prs(project.id);
@@ -221,6 +306,7 @@ export class RepoBackend implements Backend {
       prs: prs.filter((p) => p.node === id),
       tasks: tasks.filter((t) => t.node === id),
       suggestions: suggestions.filter((s) => s.node === id),
+      dismissed: dismissed.filter((f) => f.node === id),
       ...nodeCtas(id, rankCtas(tasks, prs, suggestions)),
     };
   }
@@ -234,6 +320,9 @@ export class RepoBackend implements Backend {
       : this.suggestions(project, result);
     return {
       attentionTasks: this.tasks(scope).filter((t) => t.state === "needs_input" || t.state === "review"),
+      stagedTasks: this.tasks(scope)
+        .filter((t) => t.state === "staged")
+        .sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? "")),
       flaggedPrs: this.prs(scope).filter((p) => p.ci === "fail" || p.stuck || p.stale),
       suggestions: suggestions.slice(0, OVERVIEW_SUGGESTIONS),
       coverage: hasScorer(project) ? this.coverage(result) : NO_COVERAGE,
@@ -421,13 +510,30 @@ export class RepoBackend implements Backend {
     return project;
   }
 
-  /** The project and its scores: the latest result, or for a project without a scorer the shared tree with neutral metrics only. */
-  private async view(projectId?: string): Promise<{ project: Project; result: ScoreResult }> {
+  /**
+   * The project and its scores: the latest result without dismissed findings (listed apart), or for
+   * a project without a scorer the shared tree with neutral metrics only.
+   */
+  private async view(projectId?: string): Promise<{ project: Project; result: ScoreResult; dismissed: (Finding & { reason?: string })[] }> {
     const project = this.project(projectId);
     const result = await this.latest();
-    if (hasScorer(project)) return { project, result };
-    if (this.unscoredView?.from !== result) this.unscoredView = { from: result, result: unscored(result) };
-    return { project, result: this.unscoredView.result };
+    if (!hasScorer(project)) {
+      if (this.unscoredView?.from !== result) this.unscoredView = { from: result, result: unscored(result) };
+      return { project, result: this.unscoredView.result, dismissed: [] };
+    }
+    const reasons = this.dismissals();
+    const dismissedKey = [...reasons.keys()].join("\0");
+    if (this.visibleView?.from !== result || this.visibleView.dismissedKey !== dismissedKey) {
+      this.visibleView = { from: result, dismissedKey, result: { ...result, findings: result.findings.filter((f) => !reasons.has(f.id)) } };
+    }
+    const dismissed = result.findings.filter((f) => reasons.has(f.id)).map((f) => ({ ...f, ...(reasons.get(f.id) && { reason: reasons.get(f.id)! }) }));
+    return { project, result: this.visibleView.result, dismissed };
+  }
+
+  /** Dismissed finding ids and their reasons (DESIGN "Dismissed findings"). */
+  private dismissals(): Map<string, string | null> {
+    const rows = this.opts.db.prepare("SELECT finding_id, reason FROM dismissals ORDER BY finding_id").all() as { finding_id: string; reason: string | null }[];
+    return new Map(rows.map((r) => [r.finding_id, r.reason]));
   }
 
   /** Tasks of `project`, or of every project. */

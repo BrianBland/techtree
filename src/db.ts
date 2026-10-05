@@ -49,6 +49,17 @@ CREATE TABLE IF NOT EXISTS prs (
   fix_attempts INTEGER NOT NULL DEFAULT 0,
   last_progress_at TEXT NOT NULL
 );
+CREATE TABLE IF NOT EXISTS bundles (
+  id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  data TEXT NOT NULL -- JSON Bundle
+);
+CREATE TABLE IF NOT EXISTS dismissals (
+  finding_id TEXT PRIMARY KEY,
+  project TEXT NOT NULL,
+  reason TEXT,
+  created_at TEXT NOT NULL
+);
 CREATE TABLE IF NOT EXISTS cache (
   kind TEXT NOT NULL,
   key TEXT NOT NULL,

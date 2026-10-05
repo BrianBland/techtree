@@ -154,6 +154,30 @@ function apiRoutes(backend: Backend): Route[] {
     }),
     post(/^\/api\/tasks\/([^/]+)\/open-pr$/, (_req, _url, [id]) => backend.openPr(id)),
     post(/^\/api\/tasks\/([^/]+)\/cancel$/, (_req, _url, [id]) => backend.cancel(id)),
+    post(/^\/api\/tasks\/([^/]+)\/stage$/, (_req, _url, [id]) => backend.stage(id)),
+    post(/^\/api\/tasks\/([^/]+)\/unstage$/, (_req, _url, [id]) => backend.unstage(id)),
+    get(/^\/api\/bundles$/, (_req, url) => backend.listBundles(projectParam(url))),
+    post(/^\/api\/bundles$/, async (req) => {
+      const { project, taskIds, title } = await readJson(req);
+      if (!stringList(taskIds) || !taskIds.length) throw new HttpError(400, "taskIds must be a non-empty list of strings");
+      if ((project !== undefined && typeof project !== "string") || (title !== undefined && typeof title !== "string"))
+        throw new HttpError(400, "project and title must be strings");
+      return backend.createBundle({ taskIds, ...(project && { project }), ...(title?.trim() && { title: title.trim() }) });
+    }),
+    post(/^\/api\/findings\/dismiss$/, async (req) => {
+      const { findingIds, reason, project } = await readJson(req);
+      if (!stringList(findingIds)) throw new HttpError(400, "findingIds must be a list of strings");
+      if ((reason !== undefined && typeof reason !== "string") || (project !== undefined && typeof project !== "string"))
+        throw new HttpError(400, "reason and project must be strings");
+      await backend.dismiss(findingIds, reason || undefined, project || undefined);
+      return OK;
+    }),
+    post(/^\/api\/findings\/undismiss$/, async (req) => {
+      const { findingIds } = await readJson(req);
+      if (!stringList(findingIds)) throw new HttpError(400, "findingIds must be a list of strings");
+      await backend.undismiss(findingIds);
+      return OK;
+    }),
     post(/^\/api\/tasks\/([^/]+)\/message$/, async (req, _url, [id]) => {
       const { text } = await readJson(req);
       if (typeof text !== "string") throw new HttpError(400, "text must be a string");
@@ -280,14 +304,22 @@ function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
   };
 }
 
+function stringList(value: unknown): value is string[] {
+  return Array.isArray(value) && value.every((item) => typeof item === "string");
+}
+
 function workerReport(body: Record<string, unknown>): WorkerReport {
-  const { plan, phase, done, needs_input } = body;
+  const { plan, phase, done, needs_input, outcome, summary, dismiss, reason } = body;
   const valid =
-    (plan === undefined || (Array.isArray(plan) && plan.every((item) => typeof item === "string"))) &&
+    (plan === undefined || stringList(plan)) &&
     (phase === undefined || (typeof phase === "string" && PHASES.includes(phase))) &&
     (done === undefined || (Number.isInteger(done) && (done as number) >= 0)) &&
     (needs_input === undefined || typeof needs_input === "string") &&
-    [plan, phase, done, needs_input].some((field) => field !== undefined);
+    (outcome === undefined || outcome === "no_change") &&
+    (summary === undefined || typeof summary === "string") &&
+    (dismiss === undefined || stringList(dismiss)) &&
+    (reason === undefined || typeof reason === "string") &&
+    [plan, phase, done, needs_input, outcome, dismiss].some((field) => field !== undefined);
   if (!valid) throw new HttpError(400, "body must be a WorkerReport");
   return body as WorkerReport;
 }

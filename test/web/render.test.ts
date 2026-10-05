@@ -133,6 +133,12 @@ function delegate(real: Backend): Backend {
     answer: (id, text) => real.answer(id, text),
     openPr: (id) => real.openPr(id),
     cancel: (id) => real.cancel(id),
+    stage: (id) => real.stage(id),
+    unstage: (id) => real.unstage(id),
+    createBundle: (input) => real.createBundle(input),
+    listBundles: (project) => real.listBundles(project),
+    dismiss: (ids, reason, project) => real.dismiss(ids, reason, project),
+    undismiss: (ids) => real.undismiss(ids),
     message: (id, text) => real.message(id, text),
     chat: (id) => real.chat(id),
     openTerminal: (id, mode) => real.openTerminal(id, mode),
@@ -439,7 +445,7 @@ test("the task action bar shows each action only in the states it applies to", U
 
   const reviewing = () => ui.app.find((n) => n.getAttribute("class") === "task" && n.textContent.includes("Reviewable"))[0];
   await ui.app.waitFor(() => reviewing() !== undefined, "review task row");
-  assert.deepEqual(buttons(reviewing()), ["Open PR", "Cancel", "Discard", "Log", "Diff", "Chat", "Open shell", "Open agent"]);
+  assert.deepEqual(buttons(reviewing()), ["Open PR", "Stage", "Cancel", "Discard", "Log", "Diff", "Chat", "Open shell", "Open agent"]);
   await ui.app.waitFor(() => reviewing().querySelectorAll((n) => n.getAttribute("class") === "diff").length === 1, "diff open in review");
 
   await ui.backend.cancel(ui.running.id);

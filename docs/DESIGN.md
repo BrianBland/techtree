@@ -91,7 +91,7 @@ interface Project { id: string; name: string; goal?: string; scorer: ScorerSpec;
 
 ## Data model (contract for all subtasks)
 
-`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.project` (see "Projects"), `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`, and the optional poller fields `mergeable`, `branch`, `head`, `reviewCount`, `babysitStatus` (see "PRs"); the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config` (including the optional `terminal` template); `ChatEntry` (a chat transcript turn); and the HTTP API payloads below.
+`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.project` (see "Projects"), `Task.stagedAt`, `bundle`, `outcome`, `summary`, `proposedDismiss` (see "Staging and combined PRs" and "Dismissed findings"), `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`, and the optional poller fields `mergeable`, `branch`, `head`, `reviewCount`, `babysitStatus` (see "PRs"); the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config` (including the optional `terminal` template); `ChatEntry` (a chat transcript turn); and the HTTP API payloads below.
 
 ```ts
 type NodeId = string;              // repo-relative dir path, "" = root
@@ -124,7 +124,7 @@ interface Finding {
 }
 interface Task {
   id: string; node: NodeId; title: string; findingIds: string[];
-  state: "queued" | "running" | "needs_input" | "review" | "pr_open" | "done" | "failed";
+  state: "queued" | "running" | "needs_input" | "review" | "staged" | "pr_open" | "done" | "failed";
   manualReview: boolean; worktree?: string; branch?: string; pr?: number;
   plannedFrom: number; plannedTo: number;   // composite scores
   checklist: { text: string; done: boolean }[]; phase: "plan" | "explore" | "edit" | "test" | "pr";
@@ -296,12 +296,16 @@ The precise rules the scorer implements:
   2. PRs that are failing, stuck (no progress in 24h), or stale (no update in 3 days)
   3. the top suggested tasks by priority, favouring low conflict and diversified by source
   4. a scan-coverage summary
+  5. the **Staged** section (`ApiOverview.stagedTasks`, scoped like `attentionTasks`; see "Staging and combined PRs")
 
 **Task actions.** Every task row (in "This node" and under "Tasks") has one action bar; each action shows only in the states listed:
 
 | Action | Shown when | Does |
 |---|---|---|
 | Open PR | `review` | `POST /api/tasks/:id/open-pr` |
+| Stage | `review` | `POST /api/tasks/:id/stage` (see "Staging and combined PRs") |
+| Unstage | `staged` | `POST /api/tasks/:id/unstage` |
+| Dismiss findings | the task has findings | `POST /api/findings/dismiss` with the task's findings (see "Dismissed findings"); when the agent proposed a dismissal, the row shows its reason and the button confirms that proposal |
 | Cancel | `queued`, `running`, `needs_input`, `review` | `POST /api/tasks/:id/cancel` (a babysit or fix run returns to `pr_open`, see "Agents") |
 | Discard | every state except `pr_open` | asks for confirmation, then `POST /api/tasks/:id/discard` |
 | Log | always | toggles the log pane: the last 200 lines of `GET /api/tasks/:id/log`, followed live through `log` events |
@@ -311,7 +315,7 @@ The precise rules the scorer implements:
 
 The task's PR shows as a `PR #N` link to the PR's URL when the poller knows the PR, else as plain text.
 
-**Chat pane.** The task's transcript (`GET /api/tasks/:id/chat`, then live `chat` events): user messages, assistant messages and one-line tool calls, each with its time, in order. Below it a textarea and Send post `POST /api/tasks/:id/message`. Send is disabled with the reason shown when the server would refuse the message: the task is `queued` ("waiting for a worker slot"), `running` without a worker yet ("starting"), or `done`. Assistant markdown is shown as plain text.
+**Chat pane.** The task's transcript (`GET /api/tasks/:id/chat`, then live `chat` events): user messages, assistant messages and one-line tool calls, each with its time, in order. Below it a textarea and Send post `POST /api/tasks/:id/message`. Send is disabled with the reason shown when the server would refuse the message: the task is `queued` ("waiting for a worker slot"), `running` without a worker yet ("starting"), or `done` without the `no_change` outcome ("the task is done"). Assistant markdown is shown as plain text.
 
 **Links.** URLs (`http://`, `https://`) in task questions and errors, log and chat lines, finding titles and details, call-to-action reasons and suggestion titles are clickable links opening in a new tab (`rel="noreferrer"`). Trailing punctuation (`.,;:!?'"`, and a closing `)`/`]` without its opener in the URL) stays outside the link; trimming is linear in the URL's length. Text is rendered as text nodes, never as HTML.
 
@@ -340,6 +344,7 @@ A node's `ownCtas` are those anchored at the node; `childCtas` are the top 10 an
   - Records from a child that is no longer the task's current worker (after cancel, replacement or shutdown) are ignored.
   - If the child exits while the task is `queued`, `running` or `needs_input`, the task becomes `failed` with the exit code and log path.
 - **Finish:** a task is finished when its checklist is non-empty and fully ticked and, in the PR stage, `gh pr view <branch> --json number` finds the PR (run asynchronously, with a 60 s timeout); when that lookup fails (e.g. GitHub rate limits), the last `…/pull/<n>` URL in the worker's final message is used instead. The PR stage is every task without `manualReview`, a `manualReview` task after "Open PR", and every task that already has a PR. A PR lookup still in flight is ignored when another prompt has been sent to the worker meanwhile (a chat message, an answer) or the checklist is no longer complete; the next settle decides.
+  - **No net change.** When the checklist is done and the task has no PR (`pr` unset), the runner checks `git diff --name-only <baseRef>...HEAD` in the worktree first. When it is empty (no commits, or commits that cancel out such as a commit and its revert), the task ends as `done` with `outcome: "no_change"` and `summary` = the worker's last assistant message, and the child is ended, whatever `manualReview` says. The worker can also end that way explicitly with `techtree_report({ outcome: "no_change", summary })` (summary defaults to its last message), e.g. when the right answer is that nothing should change. The task card shows the summary prominently. A new finish clears `outcome` and `summary`.
   - With `manualReview`, the worker commits and stops; the runner moves the task to `review` and ends the child. The diff is `git diff <baseRef>...HEAD` in the worktree, where `baseRef` is resolved in the main checkout. The UI shows it with an "Open PR" button.
   - "Open PR" (`review` → `queued` → `running`, phase `pr`) resumes the same pi session with an instruction to push to the upstream remote and open the PR with `gh`, following the repo's PR template.
   - Otherwise the worker opens the PR itself in one go. Once the PR number is found the task records it, moves to `pr_open` and the child is ended. Nothing ever merges.
@@ -349,7 +354,8 @@ A node's `ownCtas` are those anchored at the node; `childCtas` are the top 10 an
   - `running` with a live worker: sent as a `prompt` with `streamingBehavior: "steer"`, delivered to pi after the current tool calls (or starting a run when pi is idle); it re-arms the nudge.
   - `needs_input`: an answer (see above).
   - `review`, `failed` or `pr_open` with a worktree and a pi session: resumed through the queue on its session with the message as the prompt (like "Open PR"); a `failed` task's error is cleared. The finish rules apply as usual, so a `review` task returns to `review` and a `pr_open` task to `pr_open` (its PR number is kept) once its checklist is done again.
-  - anything else (`queued`, `running` before its worker has spawned, `done`, no worktree or no session): rejected with 409.
+  - `done` with `outcome: "no_change"` and a worktree and session: resumed the same way; its `outcome` and `summary` are cleared, and the finish rules decide again (`review` once it has a net diff, `no_change` again otherwise).
+  - anything else (`queued`, `running` before its worker has spawned, other `done` tasks, `staged`, no worktree or no session): rejected with 409.
 - **Chat transcript:** besides the log, the runner appends one JSON line `{ role, text, at }` (`ChatEntry`) per conversation turn to `<cache>/tasks/<task>.chat.jsonl` and emits it as a `chat` event (`{ type: "chat", taskId, entry }`): `user` for every prompt it sends (the initial prompt, answers, messages, nudges and resume prompts, as sent) and every dialog answer, `assistant` for each assistant message with text, `tool` for each tool call (`<tool> <args>`, args truncated to 200 characters). `GET /api/tasks/:id/chat` returns the file's entries in order (empty for tasks started before this existed; 404 for unknown tasks). The chat pane merges the snapshot with `chat` events that arrived while it loaded, so none is lost. Discard deletes the file.
 - **Open in terminal** (`POST /api/tasks/:id/open-terminal`, body `{ mode: "shell" | "agent" }`): opens a real terminal window in the task's worktree, detached from the server. `shell` opens a shell there; `agent` runs interactive pi on the task's session: `piCommand --session-dir <cache>/sessions/<task> --session-id <task>` plus `--model <model>` when the task has one, refused with 409 while the task is `queued`, `running` or `needs_input` (cancel first, because two pi processes would write the same session). Both need an existing worktree (409 otherwise). The window comes from `config.terminal`, an argv template in which `{cwd}` is replaced by the worktree path and `{command}` by the command as one shell-quoted string (literally, in one pass, so `$` sequences and placeholder text inside the values stay as they are) (empty in shell mode; argv elements left empty are dropped). Without `terminal`: on macOS `osascript` tells Terminal.app to `do script "cd '<cwd>' && <command>"` and activates it; on Linux `x-terminal-emulator -e sh -c "cd '<cwd>' && <command>; exec \"${SHELL:-/bin/sh}\""`; elsewhere 501. Every path and argv word is single-quoted for the shell (and the macOS script escaped for AppleScript), so no text reaches a shell unquoted. A terminal program that cannot be started is a 501 naming it.
 - **Discard:** for junk work that should never become a PR. Allowed in every state except `pr_open` (close the PR on GitHub first). Stops the child (if any), force-removes the worktree, deletes the local `techtree/<task>` branch (never a remote branch), deletes the task row, its log and its session, and emits `task_removed`. Its findings become suggestions again.
@@ -410,6 +416,38 @@ flowchart TD
 - Every outcome is written to `babysitStatus` (`ready to merge`, `observe-only: <triggers>`, `gave up after 3 fix attempts`, `fix in progress: <triggers>`, `fix attempt <k>/3: <triggers>`). A merged or closed PR leaves the poll results, which ends its babysitting.
 - The babysit prompt is `/skill:techtree-babysit` with the PR number, URL, title, head branch and triggers. Babysit tasks are titled `Babysit PR #<n>`, anchored at the PR's node, without manual review.
 
+## Staging and combined PRs
+
+To avoid many small PRs, reviewed tasks can be *staged* and several opened as one combined PR.
+
+```mermaid
+stateDiagram-v2
+    review --> staged: Stage
+    staged --> review: Unstage
+    staged --> pr_open: Open combined PR (bundle)
+    pr_open --> done: bundle PR merged
+    pr_open --> review: bundle PR closed
+```
+
+- **Stage** (`review` → `staged`, new `TaskState`) records `stagedAt`; **Unstage** returns the task to `review` and clears it. Staged tasks keep their worktree and branch, are not attention items, and can still be discarded.
+- **UI.** The overview has a **Staged** section listing the project's staged tasks in staging order (in "All projects", one section per project), each with a checkbox (all checked by default), a title field (empty = the default title) and "Open combined PR", which posts `POST /api/bundles` with the checked tasks.
+- **Open combined PR** (`POST /api/bundles`), with the selected tasks taken in staging order:
+  1. The base: `<b>` = `git rev-parse --abbrev-ref <baseRef>` in the main checkout. When that names a branch and the repo has a remote (`origin`, else the first one), `git fetch <remote> <b>` and start from `<remote>/<b>`; otherwise start from the local `baseRef`.
+  2. A fresh worktree (`worktreeTemplate` with `{task}` = `bundle-<id>`) on a new branch `techtree/bundle-<id>` from that start.
+  3. For each task, every non-merge commit in `$(git merge-base <baseRef> <branch>)..<branch>`, oldest first, is cherry-picked; commits that change nothing are skipped (and commits that become empty are dropped, `--empty=drop`).
+  4. On any cherry-pick failure: `git cherry-pick --abort`, the bundle worktree and branch are removed, nothing is recorded, every task stays `staged`, and the request fails with 409 `cherry-pick conflict in task <id> (<title>)`. There is no automatic resolution; the user unchecks that task and retries.
+  5. `git push -u <remote> <bundle branch>`, then `gh pr create --head <bundle branch> --title <title> --body <body>` (plus `--base <b>` when the base is a branch), in the bundle worktree. The default title is the task's title for one task, else `<first title> (+N more)`. The body lists each task (`- **<title>** (<node or root>): <findings' titles or "no findings"> — <subject of the task branch's last commit>`), followed by the repo's PR template when one exists (`.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, `docs/pull_request_template.md`, `PULL_REQUEST_TEMPLATE.md`, `pull_request_template.md`, any case), so the template's sections and trailing metadata come last. The PR number is read from the `…/pull/<n>` URL gh prints.
+  6. The bundle is recorded in the `bundles` table: `Bundle { id, project, title, branch, worktree, taskIds, pr, url, createdAt }`. Every included task moves to `pr_open` with `pr` = the bundle's PR number and `bundle` = its id. Task worktrees and branches are kept.
+- **Follow-up.** The bundle PR is polled like task PRs (its tasks are `pr_open` with its number). When it leaves the open list, `gh pr view <n> --json state` decides: `MERGED` → its tasks become `done` and their findings get `resolved_at`; otherwise (closed) → its tasks return to `review` (`pr` and `bundle` cleared). Single-task "Open PR" is unchanged.
+
+## Dismissed findings
+
+Findings that are false positives or won't be fixed can be dismissed, per finding id, in the `dismissals` table (`finding_id`, `project`, `reason`, `created_at`), which rescans never touch, so a dismissal survives rescans.
+
+- Dismissed findings are left out of `findingCounts`, the node's `findings`, suggestions and calls to action; the node panel lists them under "N dismissed" (`ApiNode.dismissed`, each with its `reason`), each with an Undo (`POST /api/findings/undismiss`). Dismissing and undoing emit a `scores` event (with the current snapshot) so clients refetch.
+- The agent may propose a dismissal with `techtree_report({ dismiss: [findingId…], reason })`. This only records `Task.proposedDismiss = { findingIds, reason }`; the task card shows it, and one click on "Dismiss findings" confirms it (`POST /api/findings/dismiss`).
+- The worker skill says: when the right answer is that nothing should change, explain why with `{outcome: "no_change", summary}` (proposing `dismiss` for false positives) and stop, instead of making cosmetic edits to satisfy a finding.
+
 ## Configuration
 
 Layers, later winning: defaults, the user config (`$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`), then `.techtree.yaml` at the repo root. `weights` and `plugins` merge per key. `piCommand`, `piLoadsExtension`, `terminal` and `worktreeTemplate` choose what techtree executes and where it writes, so they are read from the user config only; a repo file setting them is ignored with a warning. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
@@ -451,6 +489,12 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | `POST /api/tasks` | body `StartTaskRequest` → `Task` (optional `model`, passed to the child as `--model`; optional `project`, default `quality`) |
 | `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question → `Task` |
 | `POST /api/tasks/:id/open-pr` | `review` → `pr_open` → `Task` |
+| `POST /api/tasks/:id/stage` | `review` → `staged` → `Task`; 409 in any other state |
+| `POST /api/tasks/:id/unstage` | `staged` → `review` → `Task`; 409 in any other state |
+| `GET /api/bundles?project=<id>` | `Bundle[]` of the project, oldest first |
+| `POST /api/bundles` | body `{ project?, taskIds: string[], title? }`: open one combined PR from staged tasks → `Bundle`; 400 empty or malformed, 404 unknown task, 409 a task that is not `staged` or not in the project, or a cherry-pick conflict (the message names the task); 502 when git or gh fails otherwise (fetch, push, `gh pr create`), with its message |
+| `POST /api/findings/dismiss` | body `{ findingIds: string[], reason?, project? }` → `{ ok: true }` |
+| `POST /api/findings/undismiss` | body `{ findingIds: string[] }` → `{ ok: true }` |
 | `POST /api/tasks/:id/cancel` | stop the child, mark `failed` → `Task` |
 | `POST /api/tasks/:id/message` | body `{ text }`: message the task's agent, routed by state (see "Agents") → `Task` |
 | `GET /api/tasks/:id/chat` | `ChatEntry[]`: the task's transcript |
@@ -459,11 +503,11 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | `POST /api/prs/:number/babysit` | body `{ on: boolean }` → `PrState` |
 | `POST /api/score?project=<id>` | rescore the repo → `{ ok: true }`; completion arrives as a `scores` event |
 | `POST /api/scan?project=<id>` | body `{ node }`: run the LLM scan on a subtree → `{ ok: true }`; progress arrives as `scan` events; 400 for a project without a scorer |
-| `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`WorkerReport`: at least one of `plan: string[]`, `phase: TaskPhase`, `done: index`, `needs_input: string`) → `Task` |
+| `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`WorkerReport`: at least one of `plan: string[]`, `phase: TaskPhase`, `done: index`, `needs_input: string`, `outcome: "no_change"` with optional `summary`, `dismiss: findingId[]` with optional `reason`) → `Task` |
 
 Every project-scoped route takes `?project=<id>`, default `quality`; an unknown project is a 404.
 
-Errors are JSON `{ error: string }`: 400 malformed body or parameters, 401 missing or wrong token, 403 foreign `Host`/`Origin` or a non-JSON mutating request, 404 unknown route, node, task or PR, 409 the task is in the wrong state, 413 body over 1 MB, 500 anything else, 501 a platform feature that is unavailable (no terminal program). Backends signal 404/409 by throwing `HttpError`.
+Errors are JSON `{ error: string }`: 400 malformed body or parameters, 401 missing or wrong token, 403 foreign `Host`/`Origin` or a non-JSON mutating request, 404 unknown route, node, task or PR, 409 the task is in the wrong state, 413 body over 1 MB, 500 anything else, 502 an external git or gh command failed (combined PRs), 501 a platform feature that is unavailable (no terminal program). Backends signal 404/409 by throwing `HttpError`.
 
 The SSE stream sends one `data: <ServerEvent JSON>` message per event and a `: ping` comment every 15 s. It has no replay, so clients refetch `/api/state` (and any open details) whenever the stream reconnects.
 

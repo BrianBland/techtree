@@ -128,7 +128,7 @@ export class TaskRunner {
     if (task.state !== "running" && task.state !== "needs_input") throw new Error(`task ${taskId} is ${task.state}`);
     const worker = this.workers.get(taskId);
     if (!worker) throw new Error(`task ${taskId} has no live worker`);
-    const { plan, phase, done, needs_input } = payload;
+    const { plan, phase, done, needs_input, outcome, summary, dismiss, reason } = payload;
     if (phase !== undefined && !PHASES.includes(phase)) throw new Error(`unknown phase ${phase}`);
     if (plan !== undefined && !Array.isArray(plan)) throw new Error("plan must be a list of steps");
     const checklist = plan ? plan.map((text) => ({ text: String(text), done: false })) : task.checklist;
@@ -137,12 +137,17 @@ export class TaskRunner {
     task.checklist = checklist;
     if (phase) task.phase = phase;
     if (done !== undefined) checklist[done].done = true;
+    if (dismiss?.length) task.proposedDismiss = { findingIds: dismiss, ...(reason && { reason }) };
     if (needs_input) {
       task.state = "needs_input";
       task.question = needs_input;
     }
     worker.nudged = false;
     this.log(task, `report: ${JSON.stringify(payload)}`);
+    if (outcome === "no_change") {
+      this.stop(task, worker, "done", summary || worker.lastText);
+      return task;
+    }
     this.save(task);
     return task;
   }
@@ -180,6 +185,45 @@ export class TaskRunner {
     return task;
   }
 
+  /** Put a `review` task aside for a combined PR (DESIGN "Staging and combined PRs"). */
+  stage(taskId: string): Task {
+    const task = this.require(taskId);
+    if (task.state !== "review") throw new Error(`task ${taskId} is ${task.state}, not review`);
+    task.state = "staged";
+    task.stagedAt = new Date().toISOString();
+    this.save(task);
+    return task;
+  }
+
+  unstage(taskId: string): Task {
+    const task = this.require(taskId);
+    if (task.state !== "staged") throw new Error(`task ${taskId} is ${task.state}, not staged`);
+    task.state = "review";
+    task.stagedAt = undefined;
+    this.save(task);
+    return task;
+  }
+
+  /** Staged tasks now in bundle `bundleId`'s combined PR `pr`. */
+  bundled(taskIds: string[], bundleId: string, pr: number): void {
+    for (const id of taskIds) {
+      const task = this.require(id);
+      Object.assign(task, { state: "pr_open", pr, bundle: bundleId, stagedAt: undefined });
+      this.save(task);
+    }
+  }
+
+  /** A bundle's PR left the open list: merged → `done`, closed → back to `review`. */
+  bundleClosed(taskIds: string[], merged: boolean): void {
+    for (const id of taskIds) {
+      const task = this.tasks.get(id);
+      if (!task || task.state !== "pr_open") continue;
+      if (merged) task.state = "done";
+      else Object.assign(task, { state: "review", pr: undefined, bundle: undefined });
+      this.save(task);
+    }
+  }
+
   /** Respawn a `pr_open` task on its session with `prompt` (babysit), through the queue. */
   resumeTask(taskId: string, prompt: string): Task {
     const task = this.require(taskId);
@@ -201,11 +245,11 @@ export class TaskRunner {
       this.prompt(task, worker, text, "steer");
       return task;
     }
-    if (!RESUMABLE_BY_MESSAGE.includes(task.state))
+    if (!RESUMABLE_BY_MESSAGE.includes(task.state) && task.outcome !== "no_change")
       throw new Error(`task ${taskId} is ${task.state}${task.state === "running" ? " and its worker has not started yet" : ""}`);
     if (!task.worktree) throw new Error(`task ${taskId} has no worktree`);
     if (!this.hasSession(task)) throw new Error(`task ${taskId} has no pi session`);
-    task.error = undefined;
+    Object.assign(task, { error: undefined, outcome: undefined, summary: undefined });
     this.resume(task, text);
     return task;
   }
@@ -492,6 +536,7 @@ export class TaskRunner {
 
   private async onSettled(task: Task, worker: Worker): Promise<void> {
     if (checklistDone(task)) {
+      if (task.pr === undefined && !this.hasNetDiff(task)) return this.stop(task, worker, "done", worker.lastText);
       const prStage = !task.manualReview || task.phase === "pr" || task.pr !== undefined;
       if (!prStage) return this.stop(task, worker, "review");
       const promptsSent = worker.promptsSent;
@@ -513,9 +558,12 @@ export class TaskRunner {
     this.save(task);
   }
 
-  private stop(task: Task, worker: Worker, state: "review" | "pr_open"): void {
+  /** Finish the task in `state`; a `summary` marks it `done` with the `no_change` outcome. */
+  private stop(task: Task, worker: Worker, state: "review" | "pr_open" | "done", summary?: string): void {
     task.state = state;
-    this.log(task, `state: ${state}`);
+    task.outcome = state === "done" ? "no_change" : undefined;
+    task.summary = state === "done" ? summary : undefined;
+    this.log(task, `state: ${state}${task.outcome ? ` (${task.outcome})` : ""}`);
     this.workers.delete(task.id);
     task.pid = undefined;
     this.save(task);
@@ -557,6 +605,10 @@ export class TaskRunner {
       if (this.exiting.get(taskId) === child) this.exiting.delete(taskId);
       this.pump();
     });
+  }
+
+  private hasNetDiff(task: Task): boolean {
+    return git(task.worktree!, "diff", "--name-only", `${this.baseSha()}...HEAD`).trim() !== "";
   }
 
   private baseSha(): string {
