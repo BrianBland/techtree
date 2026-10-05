@@ -26,6 +26,7 @@ function record(name: string, ...fixed: unknown[]) {
 const backend = {
   listProjects: record("listProjects"),
   createProject: record("createProject"),
+  refine: record("refine"),
   updateProject: record("updateProject"),
   deleteProject: record("deleteProject", undefined),
   getState: record("getState"),

@@ -54,6 +54,8 @@ export interface ProjectInput {
 export interface Backend {
   listProjects(): Promise<Project[]>;
   createProject(input: ProjectInput): Promise<Project>;
+  /** Rewrite a goal or rubric with an agent (DESIGN "Refining text"). */
+  refine(input: { kind: "goal" | "rubric"; text: string; name?: string; goal?: string }): Promise<{ text: string }>;
   updateProject(id: string, input: ProjectInput): Promise<Project>;
   /** Delete a custom project, discarding its tasks and deleting its rows. */
   deleteProject(id: string): Promise<void>;

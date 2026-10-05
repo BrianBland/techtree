@@ -121,6 +121,7 @@ function delegate(real: Backend): Backend {
   return {
     listProjects: () => real.listProjects(),
     createProject: (input) => real.createProject(input),
+    refine: (input) => real.refine(input),
     updateProject: (id, input) => real.updateProject(id, input),
     deleteProject: (id) => real.deleteProject(id),
     getState: (project) => real.getState(project),

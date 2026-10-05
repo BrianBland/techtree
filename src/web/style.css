@@ -269,3 +269,4 @@ main { flex: 1; display: flex; min-height: 0; }
 button.link.danger { color: var(--bad); margin-right: auto; }
 .panel-resizer { flex: none; width: 6px; margin-right: -3px; cursor: col-resize; touch-action: none; background: var(--ink); z-index: 1; }
 .panel-resizer:hover, .panel-resizer:active { background: var(--accent); }
+.refine { display: flex; gap: 8px; align-items: center; margin: -4px 0 8px; }

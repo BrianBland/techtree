@@ -106,7 +106,7 @@ export async function scanNode(node: NodeId, ctx: CollectCtx, opts: ScanOptions 
     if (items) progress.cached++;
     else {
       try {
-        items = parseFindings(await runPi(ctx, skillDir, prompt(batch, rubric), o.timeoutMs, signal), batch);
+        items = parseFindings(await runPiPrint(ctx.config.piCommand, ctx.repoRoot, ["--tools", "read,grep,find,ls", "--skill", skillDir, prompt(batch, rubric)], o.timeoutMs, signal), batch);
         ctx.cache.set(kind, key, items);
       } catch (err) {
         if (signal?.aborted) throw signal.reason;
@@ -193,11 +193,11 @@ function prompt(batch: SourceFile[], rubric?: string): string {
   return `/skill:techtree-scan ${rubric ? `${rubricPreamble(rubric)}\n\n` : ""}Review these files:\n\n${batch.map((f) => `=== ${f.path} ===\n${numbered(f.text)}`).join("\n\n")}`;
 }
 
-function runPi(ctx: CollectCtx, skillDir: string, message: string, timeout: number, signal?: AbortSignal): Promise<string> {
-  const [cmd, ...prefix] = ctx.config.piCommand;
-  const args = [...prefix, "-p", "--no-session", "--tools", "read,grep,find,ls", "--skill", skillDir, message];
+/** Run `<piCommand> -p --no-session <args>` in `cwd` and resolve its stdout; a nonzero exit, timeout or abort rejects. */
+export function runPiPrint(piCommand: string[], cwd: string, args: string[], timeout: number, signal?: AbortSignal): Promise<string> {
+  const [cmd, ...prefix] = piCommand;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: ctx.repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, [...prefix, "-p", "--no-session", ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (d: string) => (stdout += d));

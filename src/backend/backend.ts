@@ -24,6 +24,7 @@ import { dbCache, type Db } from "../db.ts";
 import { repoId } from "../paths.ts";
 import { defaultPlugins } from "../plugins/index.ts";
 import { commandPlugin } from "../plugins/command.ts";
+import { refineText, type RefineKind } from "./refine.ts";
 import { QUALITY_SCAN, llmScanPlugin, rubricScan, scanCoverage, scanNode, scanPlugin, type ScanKind } from "../plugins/llm-scan.ts";
 import { addPlanItems, parsePlanItems, planPlugin, type PlanItem } from "../plugins/plan.ts";
 import { listModels } from "./models.ts";
@@ -149,6 +150,14 @@ export class RepoBackend implements Backend {
 
   async listProjects(): Promise<Project[]> {
     return listProjects(this.opts.db);
+  }
+
+  async refine(input: { kind: RefineKind; text: string; name?: string; goal?: string }): Promise<{ text: string }> {
+    try {
+      return { text: await refineText(input, this.opts.config, this.opts.repoRoot) };
+    } catch (err) {
+      throw new HttpError(502, `refine failed: ${errorText(err)}`);
+    }
   }
 
   async createProject({ name, goal }: ProjectInput): Promise<Project> {

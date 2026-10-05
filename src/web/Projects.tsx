@@ -110,6 +110,7 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
             onInput={(e) => setGoal((e.currentTarget as HTMLTextAreaElement).value)}
           />
         </label>
+        <RefineButton kind="goal" text={goal} name={name} onText={setGoal} onError={onError} />
         {editsScorer && (
           <>
             <label>
@@ -121,6 +122,7 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
                 onInput={(e) => setRubric((e.currentTarget as HTMLTextAreaElement).value)}
               />
             </label>
+            <RefineButton kind="rubric" text={rubric} name={name} goal={goal} onText={setRubric} onError={onError} />
             <label>
               Command (one argument per line)
               <textarea
@@ -150,6 +152,33 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
           </button>
         </div>
       </form>
+    </div>
+  );
+}
+
+/** "Refine with agent" for a goal or rubric field, with Undo (DESIGN "Refining text"). */
+function RefineButton({ kind, text, name, goal, onText, onError }: { kind: "goal" | "rubric"; text: string; name: string; goal?: string; onText(text: string): void; onError(message: string): void }) {
+  const [busy, setBusy] = useState(false);
+  const [previous, setPrevious] = useState<string | null>(null);
+  const refine = () => {
+    setBusy(true);
+    send<{ text: string }>("POST", "/api/refine", { kind, text, name, ...(goal && { goal }) })
+      .then((r) => {
+        setPrevious(text);
+        onText(r.text);
+      }, (e: Error) => onError(e.message))
+      .finally(() => setBusy(false));
+  };
+  return (
+    <div class="refine">
+      <button type="button" disabled={busy || !text.trim()} onClick={refine} title="Rewrite this text with an agent (uses refineModel)">
+        {busy ? "Refining…" : "Refine with agent"}
+      </button>
+      {previous !== null && !busy && (
+        <button type="button" class="link" onClick={() => (onText(previous), setPrevious(null))}>
+          Undo
+        </button>
+      )}
     </div>
   );
 }

@@ -128,6 +128,12 @@ function apiRoutes(backend: Backend): Route[] {
   return [
     get(/^\/api\/projects$/, () => backend.listProjects()),
     post(/^\/api\/projects$/, async (req) => backend.createProject(projectInput(await readJson(req)))),
+    post(/^\/api\/refine$/, async (req) => {
+      const { kind, text, name, goal } = await readJson(req);
+      if ((kind !== "goal" && kind !== "rubric") || typeof text !== "string" || !text.trim()) throw new HttpError(400, 'kind must be "goal" or "rubric" and text must not be empty');
+      if ((name !== undefined && typeof name !== "string") || (goal !== undefined && typeof goal !== "string")) throw new HttpError(400, "name and goal must be strings");
+      return backend.refine({ kind, text, ...(name && { name }), ...(goal && { goal }) });
+    }),
     { method: "PATCH", pattern: /^\/api\/projects\/([^/]+)$/, handle: async (req, _url, [id]) => backend.updateProject(id, projectInput(await readJson(req))) },
     {
       method: "DELETE",
