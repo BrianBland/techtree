@@ -118,6 +118,11 @@ export interface PrState {
   stale: boolean; // no update in 3 days
   stuck: boolean; // no progress in 24h
   taskId?: string;
+  mergeable?: "MERGEABLE" | "CONFLICTING" | "UNKNOWN";
+  branch?: string; // head ref
+  head?: string; // head commit sha
+  reviewCount?: number; // submitted reviews by others that are not approvals
+  babysitStatus?: string; // last babysit outcome, e.g. "observe-only: CI failing"
 }
 
 // ---- Scoring output ----
