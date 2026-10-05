@@ -8,13 +8,16 @@ import { dbCache, openDb, suppressSqliteWarning } from "./db.ts";
 import { cacheDir, repoId, repoRootOf } from "./paths.ts";
 import { defaultPlugins } from "./plugins/index.ts";
 import { llmScanPlugin } from "./plugins/llm-scan.ts";
+import { serve, stopServer } from "./backend/serve.ts";
 
 suppressSqliteWarning();
 
 const USAGE = `usage: techtree <command> [repo]
 
 commands:
-  score [repo]   score a repository headlessly, save a snapshot and print a summary`;
+  score [repo]   score a repository headlessly, save a snapshot and print a summary
+  serve [repo]   run the repository's techtree server in the foreground and print its URL
+  stop [repo]    stop the repository's techtree server`;
 
 async function scoreCommand(path: string): Promise<number> {
   const repoRoot = repoRootOf(resolve(path));
@@ -40,6 +43,12 @@ async function main(argv: string[]): Promise<number> {
   switch (command) {
     case "score":
       return scoreCommand(arg ?? ".");
+    case "serve":
+      await serve(repoRootOf(resolve(arg ?? ".")));
+      return 0;
+    case "stop":
+      console.log(await stopServer(repoRootOf(resolve(arg ?? "."))));
+      return 0;
     default:
       console.error(USAGE);
       return command ? 1 : 0;

@@ -15,6 +15,10 @@ export interface ServerOptions {
   /** Defaults to 32 random bytes, hex encoded. */
   token?: string;
   heartbeatMs?: number;
+  /** Reported unauthenticated by `GET /api/health`. */
+  version?: string;
+  /** Called for every authorized request (idle tracking). */
+  onRequest?: () => void;
 }
 
 export interface RunningServer {
@@ -64,8 +68,10 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
   async function handle(req: IncomingMessage, res: ServerResponse) {
     if (!isLocalHost(req.headers.host, port)) throw new HttpError(403, "unexpected Host header");
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
+    if (url.pathname === "/api/health" && req.method === "GET") return sendJson(res, 200, { version: options.version ?? "" });
     const queryToken = url.searchParams.get("token");
     if (!authorized(req, queryToken, token, cookieName(port))) throw new HttpError(401, "missing or invalid token");
+    options.onRequest?.();
     if (queryToken !== null) res.setHeader("Set-Cookie", `${cookieName(port)}=${token}; HttpOnly; SameSite=Strict; Path=/`);
 
     if (!url.pathname.startsWith("/api/")) {
