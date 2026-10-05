@@ -11,6 +11,9 @@ export const DEFAULT_WEIGHTS: Record<string, number> = {
   todo_density: 1,
   max_file_loc: 1,
   review_debt: 3,
+  dup_lines: 2,
+  comment_noise: 1,
+  test_smells: 2,
 };
 
 export const DEFAULT_CONFIG: Config = {
