@@ -100,6 +100,8 @@ test("discard removes the task and emits task_removed", { timeout: 30_000 }, asy
   const { backend, events } = await boot(t, repo, cache, tmp);
   assert.equal(status(await backend.discard("nope").catch((e) => e)), 404);
   const task = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true });
+  // Let the async worktree checkout finish, so it doesn't race the fixture's cleanup.
+  await until(async () => (await backend.getState()).tasks.find((x) => x.id === task.id)?.worktree, "task worktree");
   await backend.discard(task.id);
   assert.ok(events.some((e) => e.type === "task_removed" && e.taskId === task.id));
   assert.equal((await backend.getState()).tasks.some((x) => x.id === task.id), false);
