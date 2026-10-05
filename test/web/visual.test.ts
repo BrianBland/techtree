@@ -139,3 +139,12 @@ test("tile looks colour pips by absolute percentile and leave missing metrics em
   assert.deepEqual([look("a").hot, look("b").hot], [false, true]);
   assert.deepEqual([look("a").findings, look("b").findings, look("a").xp], [3, 0, 90]);
 });
+
+test("tile looks tolerate unscored nodes and nodes missing from the scores", () => {
+  const scores: Record<string, NodeScore> = { a: { node: "a", quality: null, metrics: {} }, b: { node: "b", quality: 70, metrics: {} } };
+  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x"], hot: new Set(), findingCounts: {} });
+  for (const id of ["a", "missing"]) {
+    assert.deepEqual(look(id), { fill: NO_SCORE, worst: false, hot: false, pips: [null], xp: null, findings: 0 });
+  }
+  assert.equal(look("b").worst, true);
+});
