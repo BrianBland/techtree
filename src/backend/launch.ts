@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -19,6 +19,7 @@ const HEALTH_TIMEOUT_MS = 2000;
 const LAUNCH_TIMEOUT_MS = 30_000;
 const STOP_TIMEOUT_MS = 15_000;
 const BUILD_POLL_MS = 5000;
+const HANDOVER_TTL_MS = 60_000;
 
 /** Root of this package (holds `package.json`, `dist/`, `extensions/`, `skills/`). */
 export const PACKAGE_ROOT = findPackageRoot(fileURLToPath(new URL(".", import.meta.url)));
@@ -30,6 +31,25 @@ function findPackageRoot(dir: string): string {
 }
 
 export const lockPath = (cacheDir: string) => join(cacheDir, "server.json");
+
+const handoverPath = (cacheDir: string) => join(cacheDir, "handover.json");
+
+/** Record the port and token the next server must take over (DESIGN "Server lifecycle", handover file). */
+export function writeHandover(cacheDir: string, info: Pick<ServerInfo, "port" | "token">): void {
+  writeFileSync(handoverPath(cacheDir), JSON.stringify({ port: info.port, token: info.token }) + "\n", { mode: 0o600 });
+}
+
+/** The pending handover, if one was written in the last 60 s. */
+export function readHandover(cacheDir: string): Pick<ServerInfo, "port" | "token"> | undefined {
+  try {
+    if (Date.now() - statSync(handoverPath(cacheDir)).mtimeMs > HANDOVER_TTL_MS) return undefined;
+    return JSON.parse(readFileSync(handoverPath(cacheDir), "utf8")) as Pick<ServerInfo, "port" | "token">;
+  } catch {
+    return undefined;
+  }
+}
+
+export const removeHandover = (cacheDir: string) => rmSync(handoverPath(cacheDir), { force: true });
 
 /** The built package: `dist/` (`TECHTREE_DIST` overrides it, for tests). */
 export const distDir = () => process.env.TECHTREE_DIST || join(PACKAGE_ROOT, "dist");
@@ -131,8 +151,11 @@ export async function ensureServer(repoRoot: string, cacheDir: string, opts: Lau
 /** Stop the repo's live server and start a new one on the same port and token (or a fresh one when none is live). */
 export async function restartServer(repoRoot: string, cacheDir: string, opts: LaunchOptions = {}): Promise<ServerInfo> {
   const live = await liveServer(cacheDir);
-  if (live) await terminate(live.pid);
-  return launch(repoRoot, cacheDir, opts, live);
+  if (live) {
+    writeHandover(cacheDir, live);
+    await terminate(live.pid);
+  }
+  return launch(repoRoot, cacheDir, opts);
 }
 
 /** `techtree stop`: stop the live server and wait for it to exit, or clear a stale lockfile. Returns a message. */
@@ -161,25 +184,20 @@ async function terminate(pid: number): Promise<void> {
   }
 }
 
-/**
- * Spawn a detached `serve` with output appended to `server.log`, on `reuse`'s port and token when given.
- * Called by a handing-over server too, which is why it does not wait.
- */
-export function spawnServer(cli: string, repoRoot: string, cacheDir: string, reuse?: Pick<ServerInfo, "port" | "token">): void {
+/** Spawn a detached `serve` with output appended to `server.log`. Called by a handing-over server too, which is why it does not wait. */
+export function spawnServer(cli: string, repoRoot: string, cacheDir: string): void {
   const logPath = join(cacheDir, "server.log");
   const log = openSync(logPath, "a", 0o600);
   chmodSync(logPath, 0o600); // the log holds the token-bearing URL; also tighten a log created by an older version
-  const args = [cli, "serve", repoRoot, ...(reuse ? ["--port", String(reuse.port)] : [])];
-  const env = reuse ? { ...process.env, TECHTREE_TOKEN: reuse.token } : process.env;
   try {
-    spawn(process.execPath, args, { detached: true, stdio: ["ignore", log, log], cwd: repoRoot, env }).unref();
+    spawn(process.execPath, [cli, "serve", repoRoot], { detached: true, stdio: ["ignore", log, log], cwd: repoRoot }).unref();
   } finally {
     closeSync(log);
   }
 }
 
-async function launch(repoRoot: string, cacheDir: string, opts: LaunchOptions, reuse?: ServerInfo): Promise<ServerInfo> {
-  spawnServer(opts.cli ?? ensureBuilt(), repoRoot, cacheDir, reuse);
+async function launch(repoRoot: string, cacheDir: string, opts: LaunchOptions): Promise<ServerInfo> {
+  spawnServer(opts.cli ?? ensureBuilt(), repoRoot, cacheDir);
   const deadline = Date.now() + (opts.timeoutMs ?? LAUNCH_TIMEOUT_MS);
   while (Date.now() < deadline) {
     await sleep(100);

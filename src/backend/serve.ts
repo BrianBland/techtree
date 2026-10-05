@@ -12,10 +12,13 @@ import {
   distDir,
   liveServer,
   packageVersion,
+  readHandover,
+  removeHandover,
   removeLock,
   spawnServer,
   stopServer as stopServerIn,
   watchBuild,
+  writeHandover,
   writeLock,
   type ServerInfo,
 } from "./launch.ts";
@@ -44,18 +47,20 @@ export async function serve(repoRoot: string, opts: { port?: number } = {}): Pro
   let lastRequest = Date.now();
   const version = packageVersion();
   const build = currentBuild();
-  const token = takeHandoverToken() ?? randomBytes(32).toString("hex");
+  const pending = readHandover(dir);
+  const token = pending?.token ?? randomBytes(32).toString("hex");
   const server = await startServer({
     backend,
     token,
     version,
     build,
-    port: opts.port,
+    port: opts.port || pending?.port,
     staticDir: join(distDir(), "web"),
     onRequest: () => (lastRequest = Date.now()),
   });
   backend.attach({ url: `http://127.0.0.1:${server.port}`, token });
   writeLock(dir, { pid: process.pid, port: server.port, token, url: server.url, version, build });
+  removeHandover(dir);
   console.log(server.url);
 
   let stopping = false;
@@ -78,8 +83,10 @@ export async function serve(repoRoot: string, opts: { port?: number } = {}): Pro
   const handover = async (next: string) => {
     const deadline = Date.now() + HANDOVER_WAIT_MS;
     while (backend.analyzing() && Date.now() < deadline) await sleep(HANDOVER_POLL_MS);
-    if (!(await shutdown(`build ${next} available, handing over on port ${server.port}`))) return;
-    spawnServer(process.argv[1], repoRoot, dir, { port: server.port, token });
+    if (stopping) return;
+    writeHandover(dir, { port: server.port, token });
+    await shutdown(`build ${next} available, handing over on port ${server.port}`);
+    spawnServer(process.argv[1], repoRoot, dir);
     process.exit(0);
   };
   const stopWatching = watchBuild(build, (next) => void handover(next));
@@ -88,13 +95,6 @@ export async function serve(repoRoot: string, opts: { port?: number } = {}): Pro
   }, Math.min(IDLE_CHECK_MS, idleMs));
   process.on("SIGINT", () => void stop("SIGINT"));
   process.on("SIGTERM", () => void stop("SIGTERM"));
-}
-
-/** The token a handing-over server passed down; removed from the environment so pi children never see it. */
-function takeHandoverToken(): string | undefined {
-  const token = process.env.TECHTREE_TOKEN;
-  delete process.env.TECHTREE_TOKEN;
-  return token || undefined;
 }
 
 /**

@@ -6,7 +6,7 @@ import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, wri
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { ensureServer, liveServer, lockPath, packageVersion, pidAlive, readLock, writeLock, type ServerInfo } from "../../src/backend/launch.ts";
+import { ensureServer, liveServer, lockPath, packageVersion, pidAlive, readLock, restartServer, writeLock, type ServerInfo } from "../../src/backend/launch.ts";
 import { stopServer } from "../../src/backend/serve.ts";
 import { cacheDir, repoId } from "../../src/paths.ts";
 import type { Backend } from "../../src/server/backend.ts";
@@ -194,4 +194,23 @@ test("ensureServer restarts a live server built from another build id, keeping p
   assert.notEqual(fresh.pid, old.pid);
   assert.equal(fresh.build, "b");
   assert.deepEqual([fresh.port, fresh.token], [old.port, old.token]);
+});
+
+test("a launch that wins ownership during a restart takes over the original port and token", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  withCacheHome(t, cache);
+  const dir = cacheDir(repoId(repo));
+  const pids: number[] = [];
+  t.after(() => pids.forEach((pid) => pidAlive(pid) && process.kill(pid, "SIGKILL")));
+
+  const old = await ensureServer(repo, dir, { cli: CLI });
+  pids.push(old.pid);
+  const brokenCli = join(tmp, "crash.mjs");
+  writeFileSync(brokenCli, "process.exit(1);\n");
+  await assert.rejects(restartServer(repo, dir, { cli: brokenCli, timeoutMs: 500 }), /did not start/);
+  assert.equal(pidAlive(old.pid), false);
+
+  const racer = await ensureServer(repo, dir, { cli: CLI });
+  pids.push(racer.pid);
+  assert.deepEqual([racer.port, racer.token], [old.port, old.token]);
 });
