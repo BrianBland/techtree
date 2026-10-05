@@ -72,15 +72,12 @@ export class RepoBackend implements Backend {
   private derived?: { result: ScoreResult; busyKey: string; suggestions: Suggestion[]; coverage?: ApiOverview["coverage"] };
   private scoring?: Promise<void>;
   private rescoreQueued = false;
-  private firstResult: Promise<void>;
-  private resolveFirstResult!: () => void;
+  private scoreError?: string;
 
   constructor(opts: RepoBackendOptions) {
     this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, log: (msg) => console.error(msg), ...opts };
     this.cache = dbCache(opts.db);
-    this.firstResult = new Promise((resolve) => (this.resolveFirstResult = resolve));
     this.result = this.cache.get<ScoreResult>(...RESULT_KEY);
-    if (this.result) this.resolveFirstResult();
     this.unsubscribePrs = this.opts.prs.onChange((pr) => this.emit({ type: "pr", pr }));
   }
 
@@ -268,16 +265,21 @@ export class RepoBackend implements Backend {
       recordFindings(db, result.findings, result.createdAt, true);
       this.cache.set(...RESULT_KEY, result);
       this.result = result;
-      this.resolveFirstResult();
+      this.scoreError = undefined;
       this.emit({ type: "scores", snapshot: { sha: result.sha, createdAt: result.createdAt } });
     } catch (err) {
-      log(`scoring failed: ${errorText(err)}`);
+      this.scoreError = errorText(err);
+      log(`scoring failed: ${this.scoreError}`);
     }
   }
 
+  /** The latest result, waiting for a run in progress when there is none yet. */
   private async latest(): Promise<ScoreResult> {
-    await this.firstResult;
-    return this.result!;
+    while (!this.result) {
+      if (!this.scoring) throw new HttpError(503, `not scored yet${this.scoreError ? `: ${this.scoreError}` : ""}`);
+      await this.scoring;
+    }
+    return this.result;
   }
 
   /** Suggestions for `result`, recomputed when the result or the busy paths change. */

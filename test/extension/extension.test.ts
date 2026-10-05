@@ -2,7 +2,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { existsSync } from "node:fs";
 import { join } from "node:path";
-import techtree from "../../extensions/techtree.ts";
+import techtree from "../../extensions/index.ts";
 import { ensureServer, lockPath, pidAlive } from "../../src/backend/launch.ts";
 import { cacheDir, repoId } from "../../src/paths.ts";
 import { CLI, TODO_FILE, fixture, until, withCacheHome } from "../backend/helpers.ts";

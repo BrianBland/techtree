@@ -138,3 +138,13 @@ test("scan emits running and done events, then rescores", async (t) => {
   ]);
   assert.equal((await backend.getOverview()).coverage.scannedNodes, 1);
 });
+
+test("reads fail with 503 when the first scoring run failed", async (t) => {
+  const { tmp, cache } = fixture(t);
+  const notARepo = join(tmp, "plain");
+  mkdirSync(notARepo);
+  const { backend } = await boot(t, notARepo, cache, tmp);
+  const err = await backend.getState().catch((e) => e);
+  assert.equal(status(err), 503);
+  assert.match(err.message, /^not scored yet: /);
+});
