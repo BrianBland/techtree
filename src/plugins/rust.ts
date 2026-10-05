@@ -214,26 +214,53 @@ function packageName(cargoToml: string): string | undefined {
 }
 
 const DEP_TABLE = /^(?:target\..+\.)?(?:dev-|build-)?dependencies(?:\.(.+))?$/;
+const WORKSPACE_DEP_TABLE = /^workspace\.dependencies(?:\.(.+))?$/;
 
-/** Package names a Cargo.toml depends on, honouring `package = "…"` renames. */
-export function dependencyNames(cargoToml: string): Set<string> {
-  const deps = new Set<string>();
+interface DependencyEntry {
+  key: string;
+  renamedTo?: string;
+  inherited: boolean;
+}
+
+/** Entries of every dependency table whose header matches `table` (group 1 = dotted-table dependency key). */
+function dependencyEntries(cargoToml: string, table: RegExp): DependencyEntry[] {
+  const entries: DependencyEntry[] = [];
   const unquote = (s: string) => s.trim().replace(/^["']|["']$/g, "");
+  const renamedTo = (text: string) => /\bpackage\s*=\s*["']([^"']+)/.exec(text)?.[1];
+  const inherited = (text: string) => /\bworkspace\s*=\s*true\b/.test(text);
   for (const section of tomlSections(cargoToml)) {
-    const table = DEP_TABLE.exec(section.header);
-    if (!table) continue;
-    if (table[1] !== undefined) {
-      const renamed = section.lines.map((l) => /^package\s*=\s*["']([^"']+)/.exec(l)?.[1]).find(Boolean);
-      deps.add(renamed ?? unquote(table[1]));
+    const header = table.exec(section.header);
+    if (!header) continue;
+    if (header[1] !== undefined) {
+      const body = section.lines.join("\n");
+      entries.push({ key: unquote(header[1]), renamedTo: renamedTo(body), inherited: inherited(body) });
       continue;
     }
     for (const line of section.lines) {
       const key = /^("[^"]+"|'[^']+'|[\w-]+)/.exec(line)?.[1];
-      if (!key) continue;
-      deps.add(/package\s*=\s*["']([^"']+)/.exec(line)?.[1] ?? unquote(key));
+      if (key) entries.push({ key: unquote(key), renamedTo: renamedTo(line), inherited: inherited(line) });
     }
   }
-  return deps;
+  return entries;
+}
+
+/** Dependency key → package name for renamed entries of the root `[workspace.dependencies]`. */
+function workspaceRenames(rootCargoToml: string): Map<string, string> {
+  const renames = new Map<string, string>();
+  for (const e of dependencyEntries(rootCargoToml, WORKSPACE_DEP_TABLE)) if (e.renamedTo) renames.set(e.key, e.renamedTo);
+  return renames;
+}
+
+/**
+ * Package names a Cargo.toml depends on, honouring `package = "…"` renames, both local and
+ * inherited (`workspace = true`) from the workspace's `renames`.
+ */
+export function dependencyNames(cargoToml: string, renames = new Map<string, string>()): Set<string> {
+  return new Set(
+    dependencyEntries(cargoToml, DEP_TABLE).map(
+      (e) => e.renamedTo ?? (e.inherited ? renames.get(e.key) : undefined) ?? e.key,
+    ),
+  );
 }
 
 function readText(path: string): string | undefined {
@@ -308,7 +335,7 @@ export function parseClippyOutput(stdout: string, repoRoot: string, tree: Tree):
     if (typeof msg.manifest_path !== "string") continue;
     const crateNode = nodeOfFile(toRepoPath(msg.manifest_path));
     if (tree.nodes[crateNode]?.kind !== "crate") continue;
-    if (msg.reason === "compiler-artifact") built.add(crateNode);
+    if (msg.reason === "compiler-artifact" && !msg.target?.kind?.includes("custom-build")) built.add(crateNode);
     if (msg.reason !== "compiler-message") continue;
     const m = msg.message;
     const code: string | undefined = m.code?.code;
@@ -321,7 +348,7 @@ export function parseClippyOutput(stdout: string, repoRoot: string, tree: Tree):
     let file = toRepoPath(abs);
     if (!allFiles.has(file)) file = posix.join(crateNode, span.file_name);
     if (!allFiles.has(file)) continue;
-    const key = [file, span.line_start, code, m.message].join("\0");
+    const key = [file, span.byte_start, span.byte_end, code, m.message].join("\0");
     if (seen.has(key)) continue;
     seen.add(key);
     const machineApplicable = (m.children ?? []).some((c: any) =>
@@ -433,9 +460,10 @@ function analysisFor(ctx: CollectCtx): Promise<Analysis> {
 
 function fanIn(ctx: CollectCtx, crates: Crate[]): Map<string, number> {
   const counts = new Map<string, number>();
+  const renames = workspaceRenames(readText(join(ctx.repoRoot, "Cargo.toml")) ?? "");
   for (const crate of crates) {
     const toml = readText(join(ctx.repoRoot, crate.node, "Cargo.toml")) ?? "";
-    for (const dep of dependencyNames(toml)) if (dep !== crate.name) counts.set(dep, (counts.get(dep) ?? 0) + 1);
+    for (const dep of dependencyNames(toml, renames)) if (dep !== crate.name) counts.set(dep, (counts.get(dep) ?? 0) + 1);
   }
   return counts;
 }

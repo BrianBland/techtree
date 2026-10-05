@@ -1,5 +1,5 @@
 import type { CollectCtx, MetricPlugin, MetricValues, NodeId } from "../types.ts";
-import { nodeOfFile, run } from "./util/source.ts";
+import { nodeOfFile, run, treeFiles } from "./util/source.ts";
 
 const DAY_MS = 86_400_000;
 export const PR_CACHE_MS = 10 * 60_000;
@@ -20,16 +20,15 @@ async function git(ctx: CollectCtx, args: string[]): Promise<string> {
   return res.stdout;
 }
 
-async function recentActivity(ctx: CollectCtx): Promise<Map<NodeId, Activity>> {
+async function recentActivity(ctx: CollectCtx, scope: Set<string>): Promise<Map<NodeId, Activity>> {
   const out = await git(ctx, ["log", "--since=90.days", "--numstat", "--no-renames", "--format=%x00%ae"]);
   const activity = new Map<NodeId, Activity>();
   for (const commit of out.split("\0").slice(1)) {
     const [author, ...lines] = commit.split("\n");
     for (const line of lines) {
       const [added, deleted, file] = line.split("\t");
-      if (file === undefined) continue;
+      if (!scope.has(file)) continue;
       const node = nodeOfFile(file);
-      if (!(node in ctx.tree.nodes)) continue;
       const a = activity.get(node) ?? { churn: 0, authors: new Set() };
       a.churn += (Number(added) || 0) + (Number(deleted) || 0);
       a.authors.add(author);
@@ -39,14 +38,14 @@ async function recentActivity(ctx: CollectCtx): Promise<Map<NodeId, Activity>> {
   return activity;
 }
 
-async function lastTouched(ctx: CollectCtx): Promise<Map<NodeId, number>> {
+async function lastTouched(ctx: CollectCtx, scope: Set<string>): Promise<Map<NodeId, number>> {
   const out = await git(ctx, ["log", "--name-only", "--no-renames", "--format=%x00%ct"]);
   const newest = new Map<NodeId, number>();
   for (const commit of out.split("\0").slice(1)) {
     const [time, ...files] = commit.split("\n");
     for (const file of files) {
       const node = nodeOfFile(file);
-      if (file && !newest.has(node)) newest.set(node, Number(time) * 1000);
+      if (scope.has(file) && !newest.has(node)) newest.set(node, Number(time) * 1000);
     }
   }
   return newest;
@@ -96,7 +95,8 @@ export const gitPlugin: MetricPlugin = {
     let activity: Map<NodeId, Activity>;
     let touched: Map<NodeId, number>;
     try {
-      [activity, touched] = await Promise.all([recentActivity(ctx), lastTouched(ctx)]);
+      const scope = new Set(treeFiles(ctx.tree));
+      [activity, touched] = await Promise.all([recentActivity(ctx, scope), lastTouched(ctx, scope)]);
     } catch (e) {
       ctx.log(`git: ${(e as Error).message}`);
       return {};

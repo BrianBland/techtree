@@ -149,7 +149,8 @@ test("public fns never mentioned by the crate's test code are reported per file"
 
 const CLIPPY_FIXTURE = join(import.meta.dirname, "fixtures", "clippy.jsonl");
 
-function clippyWorkspace(): { root: string; calls: () => string[] } {
+/** Workspace with crates alpha and broken plus a fake cargo replaying `output` (`@ROOT@` = workspace root). */
+function clippyWorkspace(output = readFileSync(CLIPPY_FIXTURE, "utf8")): { root: string; calls: () => string[] } {
   const root = fixture({
     "Cargo.toml": `[workspace]\nmembers = ["crates/*"]\n`,
     "crates/alpha/Cargo.toml": `[package]\nname = "alpha"\n`,
@@ -160,7 +161,8 @@ function clippyWorkspace(): { root: string; calls: () => string[] } {
   const bin = fixture({});
   const log = join(bin, "calls.log");
   // Cargo reports canonical paths (e.g. /private/var on macOS), so the recording is replayed with the realpath.
-  script(join(bin, "cargo"), `echo "$*" >> "${log}"\nsed "s#@ROOT@#${realpathSync(root)}#g" "${CLIPPY_FIXTURE}"\nexit 101`);
+  writeFiles(bin, { "out.jsonl": output });
+  script(join(bin, "cargo"), `echo "$*" >> "${log}"\nsed "s#@ROOT@#${realpathSync(root)}#g" "${join(bin, "out.jsonl")}"\nexit 101`);
   const saved = process.env.PATH;
   process.env.PATH = `${bin}:${saved}`;
   test.after(() => (process.env.PATH = saved));
@@ -213,4 +215,76 @@ test("clippy results are cached per crate key; only changed or uncached crates a
     "clippy --message-format=json -p broken",
     "clippy --message-format=json -p alpha",
   ]);
+});
+
+const ALPHA_MANIFEST = "@ROOT@/crates/alpha/Cargo.toml";
+
+function artifact(kind: string): string {
+  return JSON.stringify({ reason: "compiler-artifact", manifest_path: ALPHA_MANIFEST, target: { kind: [kind], name: kind } });
+}
+
+function lenZero(column: number): string {
+  const byte = 60 + column;
+  return JSON.stringify({
+    reason: "compiler-message",
+    manifest_path: ALPHA_MANIFEST,
+    message: {
+      level: "warning",
+      message: "length comparison to zero",
+      code: { code: "clippy::len_zero" },
+      spans: [
+        {
+          file_name: "crates/alpha/src/lib.rs",
+          is_primary: true,
+          line_start: 6,
+          column_start: column,
+          byte_start: byte,
+          byte_end: byte + 12,
+          text: [{ text: "    v.len() == 0" }],
+        },
+      ],
+      children: [],
+    },
+  });
+}
+
+test("a crate whose build script fails gets no lint value and is not cached", async (t) => {
+  const failedBuildScript = [artifact("custom-build"), JSON.stringify({ reason: "build-finished", success: false })].join("\n");
+  const { root, calls } = clippyWorkspace(failedBuildScript);
+  process.env.TECHTREE_CLIPPY = "1";
+  t.after(() => delete process.env.TECHTREE_CLIPPY);
+  const cache = memoryCache();
+  const logs: string[] = [];
+  const config = { plugins: { rust: { exclude: ["broken"] } } };
+  const values = await rustPlugin.collect(makeCtx(annotated(root), { cache, config, logs }));
+  await rustPlugin.collect(makeCtx(annotated(root), { cache, config }));
+
+  assert.equal(values["crates/alpha/src"].lint_warnings, undefined);
+  assert.ok(logs.some((l) => l.includes("alpha")));
+  assert.deepEqual(calls(), ["clippy --message-format=json -p alpha", "clippy --message-format=json -p alpha"]);
+});
+
+test("separate diagnostics on one line each count, while repeated emissions of one span collapse", async (t) => {
+  const { root } = clippyWorkspace([artifact("lib"), lenZero(5), lenZero(5), lenZero(20)].join("\n"));
+  process.env.TECHTREE_CLIPPY = "1";
+  t.after(() => delete process.env.TECHTREE_CLIPPY);
+  const ctx = makeCtx(annotated(root), { config: { plugins: { rust: { exclude: ["broken"] } } } });
+  const values = await rustPlugin.collect(ctx);
+  const findings = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "clippy");
+
+  assert.equal(values["crates/alpha/src"].lint_warnings, 2);
+  assert.equal(findings.length, 2);
+  assert.notEqual(findings[0].id, findings[1].id);
+});
+
+test("fan_in credits aliases a member inherits from [workspace.dependencies] to the real package", async () => {
+  const root = fixture({
+    "Cargo.toml": `[workspace]\nmembers = ["crates/*"]\n\n[workspace.dependencies]\ncore-alias = { package = "my-core", path = "crates/core" }\n\n[workspace.dependencies.other-alias]\npackage = "my-core"\npath = "crates/core"\n`,
+    "crates/core/Cargo.toml": `[package]\nname = "my-core"\n`,
+    "crates/a/Cargo.toml": `[package]\nname = "a"\n\n[dependencies]\ncore-alias = { workspace = true }\n`,
+    "crates/b/Cargo.toml": `[package]\nname = "b"\n\n[dev-dependencies]\nother-alias.workspace = true\n`,
+    "crates/c/Cargo.toml": `[package]\nname = "c"\n\n[dependencies.core-alias]\nworkspace = true\n`,
+  });
+  const values = await rustPlugin.collect(makeCtx(annotated(root)));
+  assert.deepEqual(values["crates/core"], { fan_in: 3 });
 });

@@ -89,3 +89,16 @@ test("a directory outside git yields no values and a log line instead of failing
   assert.deepEqual(await gitPlugin.collect(makeCtx(buildTree(root), { logs })), {});
   assert.equal(logs.length, 1);
 });
+
+test("only history of files in the tree counts: excluded and deleted files are ignored", async () => {
+  const root = repo();
+  commit(root, { "hot/gone.txt": "1\n2\n3\n4\n5\n" }, "dan", 3);
+  git(root, ["rm", "-q", "hot/gone.txt"]);
+  commit(root, {}, "dan", 2);
+  const tree = buildTree(root);
+  tree.nodes["hot"].files = ["hot/c.txt"];
+  tree.nodes["old"].files = [];
+  const values = await gitPlugin.collect(makeCtx(tree));
+  assert.deepEqual(values["hot"], { churn_90d: 1, authors_90d: 1, last_touched_days: 5, open_pr_overlap: 0 });
+  assert.equal(values["old"], undefined);
+});
