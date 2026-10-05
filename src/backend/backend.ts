@@ -90,6 +90,8 @@ export interface RepoBackendOptions {
 
 const OVERVIEW_SUGGESTIONS = 8;
 const LIVE_STATES: Task["state"][] = ["queued", "running", "needs_input"];
+/** States whose task still claims its findings (DESIGN "Claimed findings"). */
+const CLAIMING_STATES: Task["state"][] = [...LIVE_STATES, "review", "staged", "pr_open"];
 const NO_COVERAGE: ApiOverview["coverage"] = { scannedNodes: 0, totalNodes: 0, scannedLoc: 0, totalLoc: 0 };
 const RESULT_KEY = ["backend", "result"] as const;
 const MODELS_TTL_MS = 10 * 60_000;
@@ -742,10 +744,11 @@ export class RepoBackend implements Backend {
   private suggestions({ project, result, config }: View): Suggestion[] {
     if (!isScored(project)) return [];
     const busy = this.busyPaths();
-    const busyKey = busy.join("\0");
+    const claimed = new Set(this.tasks(project.id).flatMap((t) => (CLAIMING_STATES.includes(t.state) ? t.findingIds : [])));
+    const busyKey = [...busy, "", ...[...claimed].sort()].join("\0");
     const cached = this.derived.get(project.id);
     if (cached?.result === result && cached.busyKey === busyKey) return cached.suggestions;
-    const suggestions = suggestTasks(result, config, busy);
+    const suggestions = suggestTasks(result, config, busy).filter((s) => !s.findingIds.some((id) => claimed.has(id)));
     this.derived.set(project.id, { result, busyKey, suggestions });
     return suggestions;
   }

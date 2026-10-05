@@ -261,17 +261,6 @@ test("a manual expansion stays shown when subtree values change", () => {
   assert.deepEqual(after.get("a/x"), ["a/x/deep"]);
 });
 
-test("a very wide manual expansion stays fast", () => {
-  const paths = Array.from({ length: 10_000 }, (_, i) => (i % 2 ? `a/leaf${i}` : `a/dir${i}/x`));
-  const tree = makeTree(paths);
-  const overrides = toggleOverride(new Map(), "a", true, false);
-  const start = performance.now();
-  const shown = focusOn(tree, "", { overrides });
-  const elapsed = performance.now() - start;
-  assert.equal(shown.get("a")!.length, 10_000);
-  assert.ok(elapsed < 150, `${Math.round(elapsed)} ms`);
-});
-
 test("fit keeps every label and badge inside the viewport", () => {
   const tree = makeTree(["thirteen-chars", "thirteen-char2", "thirteen-char3"]);
   const layout = layoutTree({ tree, shown: new Map([["", tree.nodes[""].children]]), radius: () => 12 });

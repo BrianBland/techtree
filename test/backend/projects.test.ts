@@ -92,6 +92,18 @@ test("projects: overviews list a project's queued and running tasks under active
   assert.deepEqual((await backend.getOverview()).activeTasks, []);
 });
 
+test("projects: a started suggestion is no longer offered until its task is discarded", { timeout: 30_000 }, async (t) => {
+  const backend = await boot(t);
+  const [first] = (await backend.getOverview()).suggestions;
+  assert.ok(first, "the fixture has a suggestion");
+  const offered = async () => (await backend.getOverview()).suggestions.some((s) => s.findingIds.join() === first.findingIds.join());
+  const task = await backend.startTask({ node: first.node, findingIds: first.findingIds, prompt: "scenario:hang", manualReview: true });
+  assert.equal(await offered(), false);
+  await until(async () => (await backend.getState()).tasks.find((x) => x.worktree), "task worktree");
+  await backend.discard(task.id);
+  assert.equal(await offered(), true);
+});
+
 test("projects: the cross-project overview lists every project's attention items first, then labelled suggestions", { timeout: 30_000 }, async (t) => {
   const backend = await boot(t);
   const perf = await backend.createProject({ name: "Perf" });

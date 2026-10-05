@@ -245,7 +245,7 @@ export function SuggestionRow({ suggestion: s, onStart }: { suggestion: Suggesti
       <div>
         {linkify(s.title)}
         <div class="muted small">
-          +{fmt(s.impact.node)} here · {s.effort} · priority {fmt(s.priority)}
+          {s.impact.node < 0 ? "" : "+"}{fmt(s.impact.node)} here · {s.effort} · priority {fmt(s.priority)}
           {s.conflict > 0 ? ` · conflict ${Math.round(s.conflict * 100)}%` : ""}
         </div>
       </div>
@@ -712,5 +712,6 @@ function Sparkline({ values }: { values: (number | null)[] }) {
 
 export function fmt(n: number | null | undefined): string {
   if (n === null || n === undefined) return "–";
-  return Number.isInteger(n) ? String(n) : n.toFixed(1);
+  const text = Number.isInteger(n) ? String(n) : n.toFixed(1);
+  return /^-0(\.0)?$/.test(text) ? text.slice(1) : text;
 }

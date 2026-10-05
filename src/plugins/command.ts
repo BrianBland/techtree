@@ -101,7 +101,7 @@ function parseOutput(stdout: string, tree: Tree, project: string): CommandOutput
     const aggregate = AGGREGATES.includes(r.aggregate as Aggregate) ? (r.aggregate as Aggregate) : "sum";
     return [{ key: r.key as string, label: r.label as string, direction: r.direction as Direction, aggregate, ...(typeof r.unit === "string" && { unit: r.unit }) }];
   });
-  return { metrics, values: collectValues(raw.values, metrics, tree), findings: collectFindings(raw.findings, tree, project) };
+  return { metrics, values: collectValues(raw.values, metrics, tree), findings: withDefaultEffects(collectFindings(raw.findings, tree, project, metrics), raw.values, metrics) };
 }
 
 /** Per-node values: a file's values count for its directory; repeats combine with the metric's aggregate. */
@@ -128,7 +128,8 @@ function collectValues(raw: unknown, metrics: MetricDef[], tree: Tree): MetricVa
   return values;
 }
 
-function collectFindings(raw: unknown, tree: Tree, project: string): Finding[] {
+function collectFindings(raw: unknown, tree: Tree, project: string, metrics: MetricDef[]): Finding[] {
+  const keys = new Set(metrics.map((d) => d.key));
   if (!Array.isArray(raw)) return [];
   return raw.flatMap((f): Finding[] => {
     const r = f as Record<string, unknown>;
@@ -148,9 +149,31 @@ function collectFindings(raw: unknown, tree: Tree, project: string): Finding[] {
         detail: typeof r.detail === "string" ? r.detail : "",
         severity: r.severity as Severity,
         effort: EFFORTS.includes(r.effort as Effort) ? (r.effort as Effort) : "small",
-        metricEffects: {},
+        metricEffects: Object.fromEntries(
+          Object.entries(typeof r.metricEffects === "object" && r.metricEffects !== null ? r.metricEffects : {}).filter(
+            ([key, value]) => keys.has(key) && typeof value === "number" && Number.isFinite(value),
+          ),
+        ),
       },
     ];
+  });
+}
+
+/** Findings without effects of their own: an even share of each `lower_better` value at their file (else node) path, negated. */
+function withDefaultEffects(findings: Finding[], rawValues: unknown, metrics: MetricDef[]): Finding[] {
+  const values = (typeof rawValues === "object" && rawValues !== null ? rawValues : {}) as Record<string, Record<string, unknown>>;
+  const lower = metrics.filter((d) => d.direction === "lower_better").map((d) => d.key);
+  const pathOf = (f: Finding) => (f.file !== undefined && Object.hasOwn(values, f.file) ? f.file : f.node);
+  const perPath = new Map<string, number>();
+  for (const f of findings) perPath.set(pathOf(f), (perPath.get(pathOf(f)) ?? 0) + 1);
+  return findings.map((f) => {
+    if (Object.keys(f.metricEffects).length) return f;
+    const at = Object.hasOwn(values, pathOf(f)) ? values[pathOf(f)] : {};
+    const effects = lower.flatMap((key) => {
+      const value = at?.[key];
+      return typeof value === "number" && Number.isFinite(value) && value > 0 ? [[key, -value / perPath.get(pathOf(f))!]] : [];
+    });
+    return { ...f, metricEffects: Object.fromEntries(effects) };
   });
 }
 
