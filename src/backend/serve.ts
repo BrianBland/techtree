@@ -11,7 +11,7 @@ const DEFAULT_IDLE_MS = 2 * 60 * 60 * 1000;
 const IDLE_CHECK_MS = 60_000;
 
 /** `techtree serve`: run the repo's server in the foreground until signalled or idle (DESIGN "Server lifecycle"). */
-export async function serve(repoRoot: string): Promise<void> {
+export async function serve(repoRoot: string, opts: { port?: number } = {}): Promise<void> {
   const dir = cacheDir(repoId(repoRoot));
   const existing = await liveServer(dir);
   if (existing) {
@@ -27,6 +27,7 @@ export async function serve(repoRoot: string): Promise<void> {
     backend,
     token,
     version,
+    port: opts.port,
     staticDir: join(PACKAGE_ROOT, "dist", "web"),
     onRequest: () => (lastRequest = Date.now()),
   });

@@ -1,5 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
 import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import type { AddressInfo } from "node:net";
@@ -85,4 +86,26 @@ test("stop removes a stale lockfile", async (t) => {
   writeLock(dir, lock({ pid: 2 ** 22 + 12345 }));
   assert.match(await stopServer(repo), /removed stale/);
   assert.equal(existsSync(lockPath(dir)), false);
+});
+
+test("serve --port listens on the given port and prints the URL; a bad port is a usage error", async (t) => {
+  const { repo, cache } = fixture(t);
+  withCacheHome(t, cache);
+  const probe = createServer();
+  await new Promise<void>((resolve) => probe.listen(0, "127.0.0.1", resolve));
+  const port = (probe.address() as AddressInfo).port;
+  await new Promise((resolve) => probe.close(resolve));
+
+  const child = spawn(process.execPath, [CLI, "serve", repo, "--port", String(port)], { stdio: ["ignore", "pipe", "ignore"] });
+  t.after(() => child.kill("SIGKILL"));
+  let stdout = "";
+  child.stdout.on("data", (chunk) => (stdout += chunk));
+  const info = await until(() => liveServer(cacheDir(repoId(repo))), "server on the given port");
+  assert.equal(info.port, port);
+  await until(() => stdout.includes(info.url), "printed URL");
+  child.kill("SIGTERM");
+
+  const bad = spawnSync(process.execPath, [CLI, "serve", repo, "--port", "nope"], { encoding: "utf8" });
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /invalid --port nope/);
 });

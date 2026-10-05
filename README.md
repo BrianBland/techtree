@@ -25,7 +25,7 @@ From a shell:
 
 ```sh
 node dist/cli.js score [repo]   # score headlessly and print a summary
-node dist/cli.js serve [repo]   # run the server in the foreground
+node dist/cli.js serve [repo] [--port N]   # run the server in the foreground
 node dist/cli.js stop [repo]    # stop it
 ```
 
@@ -36,5 +36,5 @@ State lives in `~/.cache/techtree/<repo-id>/` (SQLite, task logs, `server.json`,
 ```sh
 npm run typecheck
 npm test
-node src/server/dev.ts   # UI against a synthetic backend
+npm run build && node dist/cli.js serve . --port 4321   # UI dev loop: rebuild, then reload the page
 ```
