@@ -49,6 +49,7 @@ const PHASES: TaskPhase[] = ["plan", "explore", "edit", "test", "pr"];
 
 const CONTINUE_PROMPT = "techtree restarted. Continue the task where you left off.";
 const PR_LOOKUP_TIMEOUT_MS = 60_000;
+const PR_CHECKOUT_TIMEOUT_MS = 300_000;
 const NUDGE_PROMPT =
   "You stopped before the task was finished (checklist incomplete, or no PR found where one is required). " +
   "Continue the task. If you are blocked, call techtree_report with {needs_input: question}.";
@@ -61,6 +62,8 @@ export class TaskRunner {
   /** First prompt for queued tasks that resume an existing worktree and session. */
   private readonly resumePrompts = new Map<string, string>();
   private readonly packageRoot: string;
+  /** Tasks holding a worker slot while `gh pr checkout` prepares their worktree. */
+  private readonly checkingOut = new Set<string>();
   private closed = false;
   private recovering = false;
 
@@ -227,7 +230,7 @@ export class TaskRunner {
   private pump(): void {
     if (this.closed || this.recovering) return;
     for (const task of this.tasks.values()) {
-      if (this.workers.size >= this.opts.config.workers) return;
+      if (this.workers.size + this.checkingOut.size >= this.opts.config.workers) return;
       if (task.state === "queued") this.launch(task);
     }
   }
@@ -242,32 +245,58 @@ export class TaskRunner {
       return;
     }
     task.state = "running";
+    if (task.pr !== undefined) {
+      void this.launchOnPr(task, task.pr);
+      return;
+    }
+    const { path, branch } = this.worktreeFor(task);
     try {
-      this.createWorktree(task);
+      git(this.opts.repoRoot, "worktree", "add", "-b", branch, path, this.opts.config.baseRef);
     } catch (err) {
       this.fail(task, `worktree: ${(err as Error).message}`);
       return;
     }
-    this.save(task);
-    this.spawnWorker(task, task.pr === undefined ? `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}` : task.prompt);
+    this.useWorktree(task, path, branch);
+    this.spawnWorker(task, `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}`);
   }
 
-  private createWorktree(task: Task): void {
+  /** Check the PR out without blocking the event loop (gh may be slow), then start the worker if still wanted. */
+  private async launchOnPr(task: Task, pr: number): Promise<void> {
+    this.checkingOut.add(task.id);
+    this.save(task);
+    const { path, branch } = this.worktreeFor(task);
+    try {
+      git(this.opts.repoRoot, "worktree", "add", "--detach", path, this.opts.config.baseRef);
+      await promisify(execFile)("gh", ["pr", "checkout", String(pr), "--branch", branch], {
+        cwd: path,
+        timeout: PR_CHECKOUT_TIMEOUT_MS,
+      });
+    } catch (err) {
+      this.checkingOut.delete(task.id);
+      if (task.state === "running") this.fail(task, `worktree: ${(err as Error).message}`);
+      else this.pump();
+      return;
+    }
+    this.checkingOut.delete(task.id);
+    this.useWorktree(task, path, branch);
+    if (task.state !== "running" || this.closed) return this.pump();
+    this.spawnWorker(task, task.prompt);
+  }
+
+  private worktreeFor(task: Task): { path: string; branch: string } {
     const path = this.opts.config.worktreeTemplate
       .replaceAll("{home}", homedir())
       .replaceAll("{repo}", basename(this.opts.repoRoot))
       .replaceAll("{task}", task.id);
-    const branch = `techtree/${task.id}`;
     mkdirSync(dirname(path), { recursive: true });
-    if (task.pr === undefined) {
-      git(this.opts.repoRoot, "worktree", "add", "-b", branch, path, this.opts.config.baseRef);
-    } else {
-      git(this.opts.repoRoot, "worktree", "add", "--detach", path, this.opts.config.baseRef);
-      execFileSync("gh", ["pr", "checkout", String(task.pr), "--branch", branch], { cwd: path, stdio: ["ignore", "pipe", "pipe"] });
-    }
+    return { path, branch: `techtree/${task.id}` };
+  }
+
+  private useWorktree(task: Task, path: string, branch: string): void {
     task.worktree = path;
     task.branch = branch;
     this.log(task, `worktree ${path} on ${branch}`);
+    this.save(task);
   }
 
   private sessionDir(task: Task): string {

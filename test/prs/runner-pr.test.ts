@@ -43,7 +43,7 @@ async function setup(t: TestContext) {
       "#!/bin/sh",
       'echo "$*" >> "$GH_LOG"',
       'case "$1 $2" in',
-      '  "pr checkout") git checkout -q -b "$5" pr-head ;;',
+      '  "pr checkout") sleep "${FAKE_GH_DELAY:-0}"; git checkout -q -b "$5" pr-head ;;',
       '  "pr view") cat .fake-pr 2>/dev/null || exit 1 ;;',
       "  *) exit 1 ;;",
       "esac",
@@ -51,7 +51,7 @@ async function setup(t: TestContext) {
     ].join("\n"),
   );
   chmodSync(join(bin, "gh"), 0o755);
-  const saved = { PATH: process.env.PATH, GH_LOG: process.env.GH_LOG };
+  const saved = { PATH: process.env.PATH, GH_LOG: process.env.GH_LOG, FAKE_GH_DELAY: process.env.FAKE_GH_DELAY };
   process.env.PATH = `${bin}:${saved.PATH}`;
   process.env.GH_LOG = join(tmp, "gh.log");
 
@@ -84,7 +84,7 @@ async function setup(t: TestContext) {
   t.after(() => {
     runner!.close();
     server.close();
-    Object.assign(process.env, saved);
+    for (const [key, value] of Object.entries(saved)) value === undefined ? delete process.env[key] : (process.env[key] = value);
     rmSync(tmp, { recursive: true, force: true });
   });
   const waitFor = (id: string, pred: (task: Task) => boolean) =>
@@ -132,4 +132,32 @@ test("resumeTask respawns a pr_open task on its session with the given prompt", 
   const task = await h.waitFor(started.id, (x) => x.state === "pr_open" || x.state === "failed");
   assert.equal(task.state, "pr_open", task.error);
   assert.ok(readFileSync(task.logPath!, "utf8").includes("prompt: /skill:techtree-babysit CI failing"));
+});
+
+const babysitStart = (prompt: string) =>
+  ({ node: "", findingIds: [], title: "Babysit PR #7", prompt, manualReview: false, plannedFrom: 0, plannedTo: 0, pr: 7 });
+
+test("a slow PR checkout does not block the event loop", async (t) => {
+  const h = await setup(t);
+  process.env.FAKE_GH_DELAY = "1";
+  const started = Date.now();
+  const id = h.runner.start(babysitStart("Fix. scenario:auto")).id;
+  await new Promise((r) => setTimeout(r, 20));
+  assert.ok(Date.now() - started < 500, "timers keep firing while gh checks out");
+  assert.equal(h.runner.get(id)!.worktree, undefined, "checkout still in progress");
+  const task = await h.waitFor(id, (x) => x.state === "pr_open" || x.state === "failed");
+  assert.equal(task.state, "pr_open", task.error);
+});
+
+test("a task cancelled during its PR checkout never starts a worker", async (t) => {
+  const h = await setup(t);
+  process.env.FAKE_GH_DELAY = "0.3";
+  const id = h.runner.start(babysitStart("Fix. scenario:auto")).id;
+  h.runner.cancel(id);
+  await h.waitFor(id, (x) => x.worktree !== undefined);
+  await new Promise((r) => setTimeout(r, 100));
+  const task = h.runner.get(id)!;
+  assert.equal(task.state, "failed");
+  assert.equal(task.error, "cancelled");
+  assert.equal(task.pid, undefined);
 });

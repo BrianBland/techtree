@@ -1,7 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify, isDeepStrictEqual } from "node:util";
-import type { Db } from "../db.ts";
-import type { CiState, PrState, ServerEvent, Task, Tree } from "../types.ts";
+import { dbCache, type Db } from "../db.ts";
+import type { Cache, CiState, PrState, ServerEvent, Task, Tree } from "../types.ts";
 import { anchorPr } from "./anchor.ts";
 
 export interface PrPollerOptions {
@@ -20,6 +20,13 @@ export interface PrPollerOptions {
   onEvent?: (event: ServerEvent) => void;
   /** Called for every open PR after each successful poll; `prev` is undefined for a PR seen for the first time. */
   onUpdate?: (prev: PrState | undefined, next: PrState) => void;
+  /** Called for a PR that left the open list (merged or closed). */
+  onRemove?: (pr: PrState) => void;
+}
+
+interface Staged {
+  prev: PrState | undefined;
+  row: Row;
 }
 
 interface Row {
@@ -55,6 +62,8 @@ const HOUR = 3600 * 1000;
 const STUCK_AFTER_MS = 24 * HOUR;
 const STALE_AFTER_MS = 72 * HOUR;
 const GH_TIMEOUT_MS = 60_000;
+/** Cache kind marking PR numbers known to be merged or closed. */
+const RETIRED = "pr-retired";
 
 /** Polls `gh` for the repo's open PRs and keeps the `prs` table current. See docs/DESIGN.md "PRs". */
 export class PrPoller {
@@ -66,6 +75,7 @@ export class PrPoller {
   delayMs: number;
   private readonly opts: PrPollerOptions;
   private readonly rows = new Map<number, Row>();
+  private readonly cache: Cache;
   private failures = 0;
   private running: Promise<void> | undefined;
   private timer: NodeJS.Timeout | undefined;
@@ -73,6 +83,7 @@ export class PrPoller {
 
   constructor(opts: PrPollerOptions) {
     this.opts = opts;
+    this.cache = dbCache(opts.db);
     this.delayMs = this.interval();
     const rows = opts.db.prepare("SELECT data, fix_attempts, last_progress_at FROM prs ORDER BY number").all() as {
       data: string;
@@ -134,15 +145,31 @@ export class PrPoller {
     return this.opts.intervalMs ?? 60_000;
   }
 
+  /** Look the current gh user up again; undefined when gh cannot tell. Babysit calls this before acting on a toggle. */
+  async refreshUser(): Promise<string | undefined> {
+    this.user = undefined;
+    this.user = await this.lookupUser().catch(() => undefined);
+    return this.user;
+  }
+
+  private async lookupUser(): Promise<string> {
+    const login = (await this.gh("api", "user", "--jq", ".login")).trim();
+    if (!login) throw new Error("gh api user returned no login");
+    return login;
+  }
+
   private async pollOnce(): Promise<void> {
-    if (this.user === undefined) this.user = (await this.gh("api", "user", "--jq", ".login").catch(() => "")).trim() || undefined;
-    let prs: GhPr[];
+    let staged: Staged[];
     try {
-      prs = parseList(await this.gh("pr", "list", "--author", "@me", "--state", "open", "--limit", "100", "--json", FIELDS));
+      this.user = undefined;
+      this.user = await this.lookupUser();
+      const prs = parseList(await this.gh("pr", "list", "--author", "@me", "--state", "open", "--limit", "100", "--json", FIELDS));
       for (const number of this.taskPrNumbers().filter((n) => !prs.some((p) => p.number === n))) {
-        const pr = JSON.parse(await this.gh("pr", "view", String(number), "--json", FIELDS)) as GhPr;
+        const [pr] = parseList(`[${await this.gh("pr", "view", String(number), "--json", FIELDS)}]`);
         if (pr.state === "OPEN") prs.push(pr);
+        else this.retire(number);
       }
+      staged = this.stage(prs);
     } catch (err) {
       this.failures++;
       this.status = `gh failed: ${errorLine(err)}`;
@@ -152,20 +179,25 @@ export class PrPoller {
     this.failures = 0;
     this.status = "ok";
     this.delayMs = this.interval();
-    this.apply(prs);
+    this.commit(staged);
   }
 
+  /** Task PRs still worth a `gh pr view`: on a `pr_open` task and not known to be merged or closed. */
   private taskPrNumbers(): number[] {
     const tasks = this.opts.tasks?.() ?? [];
-    return [...new Set(tasks.filter((t) => t.state === "pr_open" && t.pr !== undefined).map((t) => t.pr!))];
+    const numbers = tasks.filter((t) => t.state === "pr_open" && t.pr !== undefined).map((t) => t.pr!);
+    return [...new Set(numbers)].filter((n) => !this.cache.get(RETIRED, String(n)));
   }
 
-  private apply(prs: GhPr[]): void {
+  private retire(number: number): void {
+    this.cache.set(RETIRED, String(number), true);
+  }
+
+  private stage(prs: GhPr[]): Staged[] {
     const now = this.opts.now?.() ?? Date.now();
     const tree = this.opts.tree?.();
     const tasks = this.opts.tasks?.() ?? [];
-    const updates: [PrState | undefined, PrState][] = [];
-    for (const gh of prs) {
+    return prs.map((gh) => {
       const old = this.rows.get(gh.number);
       const prev = old && structuredClone(old.pr);
       const pr = toPrState(gh, tree, tasks, prev);
@@ -174,18 +206,25 @@ export class PrPoller {
       const lastProgressAt = !old ? pr.updatedAt : progressed ? new Date(now).toISOString() : old.lastProgressAt;
       pr.stale = now - Date.parse(pr.updatedAt) >= STALE_AFTER_MS;
       pr.stuck = now - Date.parse(lastProgressAt) >= STUCK_AFTER_MS;
-      const row = { pr, fixAttempts: old?.fixAttempts ?? 0, lastProgressAt };
-      this.rows.set(pr.number, row);
+      return { prev, row: { pr, fixAttempts: old?.fixAttempts ?? 0, lastProgressAt } };
+    });
+  }
+
+  private commit(staged: Staged[]): void {
+    for (const { prev, row } of staged) {
+      this.rows.set(row.pr.number, row);
       this.save(row);
-      if (!isDeepStrictEqual(prev, pr)) this.opts.onEvent?.({ type: "pr", pr });
-      updates.push([prev, pr]);
+      if (!isDeepStrictEqual(prev, row.pr)) this.opts.onEvent?.({ type: "pr", pr: row.pr });
     }
-    for (const number of this.rows.keys()) {
-      if (prs.some((p) => p.number === number)) continue;
+    for (const [number, { pr }] of this.rows) {
+      if (staged.some((s) => s.row.pr.number === number)) continue;
       this.rows.delete(number);
       this.opts.db.prepare("DELETE FROM prs WHERE number = ?").run(number);
+      this.retire(number);
+      this.opts.onEvent?.({ type: "pr_removed", number });
+      this.opts.onRemove?.(pr);
     }
-    for (const [prev, next] of updates) this.opts.onUpdate?.(prev, next);
+    for (const { prev, row } of staged) this.opts.onUpdate?.(prev, row.pr);
   }
 
   private save(row: Row): void {
@@ -210,7 +249,8 @@ export class PrPoller {
 
 function parseList(stdout: string): GhPr[] {
   const prs = JSON.parse(stdout) as unknown;
-  if (!Array.isArray(prs)) throw new Error("gh pr list did not return a list");
+  if (!Array.isArray(prs)) throw new Error("gh did not return a list of PRs");
+  if (!prs.every((p) => typeof p?.number === "number")) throw new Error("gh returned a malformed PR");
   return prs as GhPr[];
 }
 

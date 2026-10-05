@@ -7,6 +7,7 @@ export interface BabysitRunner {
   get(taskId: string): Task | undefined;
   start(req: StartTask): Task;
   resumeTask(taskId: string, prompt: string): Task;
+  cancel(taskId: string): Task;
 }
 
 export interface BabysitterOptions {
@@ -19,7 +20,7 @@ const LIVE_STATES: TaskState[] = ["queued", "running", "needs_input"];
 
 /**
  * Reacts to PR events on babysat PRs by resuming or starting a `techtree-babysit` agent.
- * Wire `onUpdate` to the poller's `onUpdate` option. See docs/DESIGN.md "PRs".
+ * Wire `onUpdate` and `onRemove` to the poller's options of the same names. See docs/DESIGN.md "PRs".
  */
 export class Babysitter {
   private readonly opts: BabysitterOptions;
@@ -28,21 +29,34 @@ export class Babysitter {
     this.opts = opts;
   }
 
-  /** Toggle babysitting; switching on resets the fix attempts and acts on the PR's current state. */
-  setBabysit(number: number, on: boolean): PrState {
+  /**
+   * Toggle babysitting; switching on resets the fix attempts, re-checks the current gh user
+   * and acts on the PR's current state.
+   */
+  async setBabysit(number: number, on: boolean): Promise<PrState> {
     const { poller } = this.opts;
     if (!on) return poller.update(number, { babysit: false });
     const pr = poller.update(number, { babysit: true }, 0);
+    await poller.refreshUser();
     this.onUpdate(undefined, pr);
     return pr;
+  }
+
+  /** A merged or closed PR: stop the fix running for it. */
+  onRemove(pr: PrState): void {
+    if (pr.babysit) this.stopFix(pr);
   }
 
   onUpdate(prev: PrState | undefined, next: PrState): void {
     if (!next.babysit) return;
     const { poller, runner } = this.opts;
     const report = (patch: Partial<PrState>, fixAttempts?: number) => poller.update(next.number, patch, fixAttempts);
-    if (next.ci === "pass" && next.review === "APPROVED" && next.mergeable === "MERGEABLE")
-      return void report({ babysit: false, babysitStatus: "ready to merge" });
+    if (next.ci === "pass" && next.review === "APPROVED" && next.mergeable === "MERGEABLE") {
+      this.stopFix(next);
+      return void report({ babysit: false, babysitStatus: "ready to merge" }, 0);
+    }
+    const healthy = next.ci === "pass" && next.mergeable !== "CONFLICTING" && next.review !== "CHANGES_REQUESTED";
+    if (healthy && poller.fixAttempts(next.number) > 0) report({}, 0);
     const triggers = triggersOf(prev, next).join(", ");
     if (!triggers) return;
     // The hard observe-only rule: an agent could push or reply, so none runs on someone else's PR.
@@ -68,6 +82,16 @@ export class Babysitter {
             pr: next.number,
           }).id;
     report({ taskId, babysitStatus: `fix attempt ${attempts + 1}/${MAX_FIX_ATTEMPTS}: ${triggers}` }, attempts + 1);
+  }
+
+  private liveTask(pr: PrState): Task | undefined {
+    const task = pr.taskId ? this.opts.runner.get(pr.taskId) : undefined;
+    return task && LIVE_STATES.includes(task.state) ? task : undefined;
+  }
+
+  private stopFix(pr: PrState): void {
+    const task = this.liveTask(pr);
+    if (task) this.opts.runner.cancel(task.id);
   }
 }
 

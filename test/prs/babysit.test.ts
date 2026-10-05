@@ -17,6 +17,7 @@ class FakeRunner implements BabysitRunner {
   tasks = new Map<string, Task>();
   started: StartTask[] = [];
   resumed: { taskId: string; prompt: string }[] = [];
+  cancelled: string[] = [];
 
   get(taskId: string) {
     return this.tasks.get(taskId);
@@ -31,6 +32,12 @@ class FakeRunner implements BabysitRunner {
     this.resumed.push({ taskId, prompt });
     const task = this.tasks.get(taskId)!;
     task.state = "queued";
+    return task;
+  }
+  cancel(taskId: string): Task {
+    this.cancelled.push(taskId);
+    const task = this.tasks.get(taskId)!;
+    task.state = "failed";
     return task;
   }
   launches() {
@@ -66,6 +73,7 @@ async function setup(t: TestContext, initial: Record<string, unknown> = {}): Pro
     tree: () => makeTree("src"),
     tasks: () => [...runner.tasks.values()],
     onUpdate: (prev, next) => babysitter.onUpdate(prev, next),
+    onRemove: (removed) => babysitter.onRemove(removed),
   });
   const babysitter = new Babysitter({ poller, runner });
   const pr = async (over: Record<string, unknown> = {}) => {
@@ -81,7 +89,7 @@ const pending = { statusCheckRollup: [{ __typename: "CheckRun", status: "IN_PROG
 
 test("CI turning red on a babysat PR without a task starts a babysit task on the PR", async (t) => {
   const h = await setup(t);
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   assert.equal(h.runner.launches(), 0, "green PR: nothing to do");
   await h.pr(failing);
   assert.equal(h.runner.started.length, 1);
@@ -107,7 +115,7 @@ test("a PR whose task is pr_open resumes that task's session", async (t) => {
   const h = await setup(t);
   h.runner.tasks.set("w1", makeTask({ id: "w1", pr: 1, worktree: "/wt/w1" }));
   await h.pr();
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   await h.pr({ mergeable: "CONFLICTING" });
   assert.deepEqual(h.runner.started, []);
   assert.equal(h.runner.resumed.length, 1);
@@ -117,7 +125,7 @@ test("a PR whose task is pr_open resumes that task's session", async (t) => {
 
 test("while a fix is running, new events do not launch another agent", async (t) => {
   const h = await setup(t);
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   await h.pr(failing);
   await h.pr({ ...failing, reviewDecision: "CHANGES_REQUESTED" });
   assert.equal(h.runner.launches(), 1);
@@ -131,7 +139,7 @@ test("changes requested, a new review and a merge conflict are triggers", async 
     [{ mergeable: "CONFLICTING" }, "merge conflict"],
   ] as const) {
     const h = await setup(t);
-    h.babysitter.setBabysit(1, true);
+    await h.babysitter.setBabysit(1, true);
     await h.pr(over);
     assert.equal(h.runner.started.length, 1, label);
     assert.match(h.runner.started[0].prompt!, new RegExp(label));
@@ -140,7 +148,7 @@ test("changes requested, a new review and a merge conflict are triggers", async 
 
 test("an approval or a passing CI alone is not a trigger", async (t) => {
   const h = await setup(t, pending);
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   await h.pr({ reviews: [{ author: { login: "alice" }, state: "APPROVED" }] });
   await h.pr({ statusCheckRollup: [] });
   assert.equal(h.runner.launches(), 0);
@@ -148,7 +156,7 @@ test("an approval or a passing CI alone is not a trigger", async (t) => {
 
 test("switching babysit on acts on a PR that is already failing", async (t) => {
   const h = await setup(t, failing);
-  const pr = h.babysitter.setBabysit(1, true);
+  const pr = await h.babysitter.setBabysit(1, true);
   assert.equal(pr.babysit, true);
   assert.equal(h.runner.started.length, 1);
   assert.equal(h.poller.get(1)?.babysitStatus, "fix attempt 1/3: CI failing");
@@ -156,9 +164,9 @@ test("switching babysit on acts on a PR that is already failing", async (t) => {
 
 test("babysit switches off when the PR is ready to merge, and never merges", async (t) => {
   const h = await setup(t, failing);
-  h.babysitter.setBabysit(1, true);
-  h.runner.tasks.get("b1")!.state = "pr_open";
+  await h.babysitter.setBabysit(1, true);
   await h.pr({ statusCheckRollup: [], reviewDecision: "APPROVED", mergeable: "MERGEABLE" });
+  assert.deepEqual(h.runner.cancelled, ["b1"], "a fix still queued or running is stopped");
   assert.equal(h.poller.get(1)?.babysit, false);
   assert.equal(h.poller.get(1)?.babysitStatus, "ready to merge");
   assert.ok(!h.gh.calls().some((c) => c.startsWith("pr merge")), "no gh merge call");
@@ -166,7 +174,7 @@ test("babysit switches off when the PR is ready to merge, and never merges", asy
 
 test("after 3 failed fix attempts babysit gives up", async (t) => {
   const h = await setup(t);
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   for (let attempt = 1; attempt <= 3; attempt++) {
     await h.pr(failing);
     assert.equal(h.runner.launches(), attempt);
@@ -179,14 +187,14 @@ test("after 3 failed fix attempts babysit gives up", async (t) => {
   assert.equal(h.poller.get(1)?.babysit, false);
   assert.equal(h.poller.get(1)?.babysitStatus, "gave up after 3 fix attempts");
 
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   assert.equal(h.runner.launches(), 4, "switching on again resets the attempts");
 });
 
 test("observe-only: another author's PR is never pushed to or replied on, only reported", async (t) => {
   const h = await setup(t, { author: { login: "alice" } });
   h.runner.tasks.set("w1", makeTask({ id: "w1", pr: 1, worktree: "/wt/w1" }));
-  h.babysitter.setBabysit(1, true);
+  await h.babysitter.setBabysit(1, true);
   await h.pr({ ...failing, mergeable: "CONFLICTING" });
   assert.equal(h.runner.launches(), 0);
   assert.equal(h.poller.get(1)?.babysitStatus, "observe-only: CI failing, merge conflict");
@@ -194,28 +202,62 @@ test("observe-only: another author's PR is never pushed to or replied on, only r
 });
 
 test("observe-only while the current gh user is unknown", async (t) => {
-  const gh = fakeGh(t);
-  gh.setUser(null);
-  const cache = mkdtempSync(join(tmpdir(), "techtree-babysit-"));
-  t.after(() => rmSync(cache, { recursive: true, force: true }));
-  const runner = new FakeRunner();
-  const poller: PrPoller = new PrPoller({
-    db: openDb(cache), repoRoot: cache, gh: gh.gh, onUpdate: (p, n) => babysitter.onUpdate(p, n),
-  });
-  const babysitter = new Babysitter({ poller, runner });
-  gh.setList([ghPr(1, failing)]);
-  await poller.poll();
-  babysitter.setBabysit(1, true);
-  assert.equal(runner.launches(), 0);
-  assert.equal(poller.get(1)?.babysitStatus, "observe-only: CI failing");
+  const h = await setup(t, failing);
+  h.gh.setUser(null);
+  await h.babysitter.setBabysit(1, true);
+  assert.equal(h.runner.launches(), 0);
+  assert.equal(h.poller.get(1)?.babysitStatus, "observe-only: CI failing");
 });
 
-test("a merged or closed PR stops babysitting", async (t) => {
+test("the gh user is re-checked: after an account switch a former own PR is observe-only", async (t) => {
   const h = await setup(t);
-  h.babysitter.setBabysit(1, true);
+  h.runner.tasks.set("w1", makeTask({ id: "w1", pr: 1, worktree: "/wt/w1" }));
+  await h.pr();
+  await h.babysitter.setBabysit(1, true);
+  h.gh.setUser("another-account");
+  await h.pr(failing);
+  assert.equal(h.runner.launches(), 0, "poll-driven launch");
+  assert.equal(h.poller.get(1)?.babysitStatus, "observe-only: CI failing");
+
+  await h.babysitter.setBabysit(1, false);
+  h.gh.setUser("me");
+  await h.pr(pending);
+  h.gh.setUser("another-account");
+  await h.babysitter.setBabysit(1, true);
+  await h.pr(failing);
+  assert.equal(h.runner.launches(), 0, "toggle after the switch");
+});
+
+test("successful fixes do not use up the failed-attempt budget", async (t) => {
+  const h = await setup(t);
+  await h.babysitter.setBabysit(1, true);
+  for (let fix = 1; fix <= 4; fix++) {
+    await h.pr(failing);
+    assert.equal(h.runner.launches(), fix);
+    assert.equal(h.poller.get(1)?.babysitStatus, "fix attempt 1/3: CI failing");
+    h.runner.tasks.get("b1")!.state = "pr_open";
+    await h.pr();
+  }
+  assert.equal(h.poller.get(1)?.babysit, true);
+});
+
+test("a merged or closed PR stops babysitting and its running fix", async (t) => {
+  const h = await setup(t, failing);
+  await h.babysitter.setBabysit(1, true);
+  assert.equal(h.runner.launches(), 1);
   h.gh.setList([]);
   await h.poller.poll();
   assert.equal(h.poller.get(1), undefined);
-  assert.throws(() => h.babysitter.setBabysit(1, true), /unknown PR #1/);
-  assert.equal(h.runner.launches(), 0);
+  assert.deepEqual(h.runner.cancelled, ["b1"]);
+  await assert.rejects(h.babysitter.setBabysit(1, true), /unknown PR #1/);
+  assert.equal(h.runner.launches(), 1);
+});
+
+test("a closed PR without babysit leaves its task alone", async (t) => {
+  const h = await setup(t);
+  h.runner.tasks.set("w1", makeTask({ id: "w1", pr: 1, worktree: "/wt/w1", state: "running" }));
+  await h.pr();
+  h.gh.setList([]);
+  await h.poller.poll();
+  assert.deepEqual(h.runner.cancelled, []);
 });

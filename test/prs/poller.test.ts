@@ -138,18 +138,34 @@ test("task PRs missing from the author list are fetched one by one; closed ones 
   assert.match(calls[1], /^pr list .*--author @me/);
   assert.deepEqual(calls.slice(2).map((c) => c.split(" ").slice(0, 3).join(" ")), ["pr view 2", "pr view 3"]);
 
+  const before = h.gh.calls().length;
   await h.poller.poll();
-  assert.equal(h.gh.calls().filter((c) => c.startsWith("api user")).length, 1, "the user is looked up once");
+  assert.deepEqual(
+    h.gh.calls().slice(before).map((c) => c.split(" ").slice(0, 3).join(" ")),
+    ["api user --jq", "pr list --author", "pr view 2"],
+    "the user is re-checked every poll; a PR found merged or closed is not fetched again",
+  );
 });
 
-test("merged or closed PRs leave the list and the table", async (t) => {
-  const h = setup(t);
+test("a task PR seen merged once is never fetched again, even after a restart", async (t) => {
+  const tasks = [task({ id: "a", pr: 3 })];
+  const h = setup(t, { tasks: () => tasks });
+  h.gh.setView(3, ghPr(3, { state: "CLOSED" }));
+  await h.poller.poll();
+  await h.newPoller().poll();
+  assert.equal(h.gh.calls().filter((c) => c.startsWith("pr view")).length, 1);
+});
+
+test("merged or closed PRs leave the list and the table, with a pr_removed event", async (t) => {
+  const removed: ServerEvent[] = [];
+  const h = setup(t, { onEvent: (e) => e.type === "pr_removed" && removed.push(e) });
   h.gh.setList([ghPr(1), ghPr(2)]);
   await h.poller.poll();
   h.gh.setList([ghPr(2)]);
   await h.poller.poll();
   assert.deepEqual(h.poller.list().map((p) => p.number), [2]);
   assert.deepEqual(h.newPoller().list().map((p) => p.number), [2]);
+  assert.deepEqual(removed, [{ type: "pr_removed", number: 1 }]);
 });
 
 test("stale after 3 days without update, stuck after 24h without progress", async (t) => {
@@ -224,6 +240,30 @@ test("gh failures never throw: status explains, PRs are kept, polling backs off"
   assert.equal(h.poller.status, "ok");
   assert.equal(h.poller.delayMs, 1000);
   assert.equal(h.poller.list().length, 2);
+});
+
+test("a failed user lookup fails the poll and keeps the previous PRs", async (t) => {
+  const h = setup(t);
+  h.gh.setList([ghPr(1)]);
+  await h.poller.poll();
+  h.gh.setUser(null);
+  h.gh.setList([ghPr(2)]);
+  await h.poller.poll();
+  assert.match(h.poller.status, /^gh failed: no user/);
+  assert.equal(h.poller.user, undefined);
+  assert.deepEqual(h.poller.list().map((p) => p.number), [1]);
+});
+
+test("malformed PR entries fail the poll without touching saved PRs", async (t) => {
+  const h = setup(t);
+  h.gh.setList([ghPr(1)]);
+  await h.poller.poll();
+  for (const bad of [[null], [ghPr(2), { number: 3, files: [null] }], [{ title: "no number" }]]) {
+    h.gh.setList(bad as never);
+    await h.poller.poll();
+    assert.match(h.poller.status, /^gh failed: /, JSON.stringify(bad));
+    assert.deepEqual(h.poller.list().map((p) => p.number), [1]);
+  }
 });
 
 test("a missing gh binary or malformed output is a status, not a crash", async (t) => {
