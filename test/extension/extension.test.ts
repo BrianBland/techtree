@@ -40,7 +40,7 @@ function withEnv(t: TestContext, name: string, value: string | undefined) {
   });
 }
 
-test("inside a worker child only techtree_report is registered", (t) => {
+test("inside a worker child only techtree_report is registered", { timeout: 30_000 }, (t) => {
   withEnv(t, "TECHTREE_TASK", "task-1");
   const { tools, commands, events } = fakePi();
   assert.deepEqual([...tools.keys()], ["techtree_report"]);
@@ -48,7 +48,7 @@ test("inside a worker child only techtree_report is registered", (t) => {
   assert.equal(events.size, 0);
 });
 
-test("the factory registers /techtree and the tools without starting a server", (t) => {
+test("the factory registers /techtree and the tools without starting a server", { timeout: 30_000 }, (t) => {
   withEnv(t, "TECHTREE_TASK", undefined);
   const { repo, cache } = fixture(t);
   withCacheHome(t, cache);
@@ -59,7 +59,7 @@ test("the factory registers /techtree and the tools without starting a server", 
   assert.equal(existsSync(lockPath(join(cache, "techtree", repoId(repo)))), false);
 });
 
-test("/techtree shows the live server's URL and a status widget; the tools report status and findings", async (t) => {
+test("/techtree shows the live server's URL and a status widget; the tools report status and findings", { timeout: 30_000 }, async (t) => {
   withEnv(t, "TECHTREE_TASK", undefined);
   const { repo, cache } = fixture(t);
   withCacheHome(t, cache);

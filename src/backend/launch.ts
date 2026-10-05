@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -83,7 +83,9 @@ export async function ensureServer(repoRoot: string, cacheDir: string, opts: Lau
   const live = await liveServer(cacheDir);
   if (live) return live;
   const cli = opts.cli ?? ensureBuilt();
-  const log = openSync(join(cacheDir, "server.log"), "a");
+  const logPath = join(cacheDir, "server.log");
+  const log = openSync(logPath, "a", 0o600);
+  chmodSync(logPath, 0o600); // the log holds the token-bearing URL; also tighten a log created by an older version
   try {
     spawn(process.execPath, [cli, "serve", repoRoot], { detached: true, stdio: ["ignore", log, log], cwd: repoRoot }).unref();
   } finally {

@@ -3,6 +3,7 @@ import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { nodeCtas, rankCtas } from "../core/cta.ts";
 import { score } from "../core/pipeline.ts";
+import { dict } from "../core/tree.ts";
 import { buildModel, findingsImpact } from "../core/scoring.ts";
 import { nodeHistory, recordFindings, saveSnapshot } from "../core/store.ts";
 import { suggestTasks } from "../core/suggest.ts";
@@ -65,7 +66,9 @@ export class RepoBackend implements Backend {
   private readonly opts: Required<RepoBackendOptions>;
   private readonly cache: Cache;
   private readonly listeners = new Set<(event: ServerEvent) => void>();
-  private readonly scanning = new Set<NodeId>();
+  /** Scans in progress by node; settled once their pi children have exited. */
+  private readonly scanning = new Map<NodeId, Promise<void>>();
+  private readonly stopScans = new AbortController();
   private readonly unsubscribePrs: () => void;
   private taskRunner?: TaskRunner;
   private result?: ScoreResult;
@@ -89,7 +92,7 @@ export class RepoBackend implements Backend {
     const { db, config, repoRoot, cacheDir } = this.opts;
     this.taskRunner = new TaskRunner({ db, config, repoRoot, cacheDir, ...server, onEvent: (e) => this.emit(e) });
     this.taskRunner.recover();
-    if (!this.result || this.result.sha !== git(repoRoot, "rev-parse", "HEAD")) void this.rescore();
+    if (!this.result || this.result.sha !== git(repoRoot, "rev-parse", "HEAD").trim()) void this.rescore();
   }
 
   /** Whether anything should keep the server alive: SSE clients, live or queued tasks, scoring or scans. */
@@ -107,14 +110,17 @@ export class RepoBackend implements Backend {
     while (this.scoring) await this.scoring;
   }
 
-  close(): void {
+  /** Detach from task workers and stop running scans, resolving once their children have exited. */
+  async close(): Promise<void> {
     this.unsubscribePrs();
     this.taskRunner?.close();
+    this.stopScans.abort(new Error("techtree server stopped"));
+    await Promise.all(this.scanning.values());
   }
 
   async getState(): Promise<ApiState> {
     const result = await this.latest();
-    const findingCounts: Record<NodeId, number> = {};
+    const findingCounts = dict<number>();
     for (const f of result.findings) findingCounts[f.node] = (findingCounts[f.node] ?? 0) + 1;
     const { repoRoot, config } = this.opts;
     return {
@@ -132,7 +138,7 @@ export class RepoBackend implements Backend {
 
   async getNode(id: NodeId): Promise<ApiNode> {
     const result = await this.latest();
-    if (!result.tree.nodes[id]) throw new HttpError(404, `no node ${JSON.stringify(id)}`);
+    if (!hasNode(result, id)) throw new HttpError(404, `no node ${JSON.stringify(id)}`);
     const tasks = this.runner().list();
     const prs = this.opts.prs.list();
     const suggestions = this.suggestions(result);
@@ -182,7 +188,7 @@ export class RepoBackend implements Backend {
 
   async startTask(req: StartTaskRequest): Promise<Task> {
     const result = await this.latest();
-    if (!result.tree.nodes[req.node]) throw new HttpError(404, `no node ${JSON.stringify(req.node)}`);
+    if (!hasNode(result, req.node)) throw new HttpError(404, `no node ${JSON.stringify(req.node)}`);
     const byId = new Map(result.findings.map((f) => [f.id, f]));
     const unknown = req.findingIds.filter((id) => !byId.has(id));
     if (unknown.length) throw new HttpError(400, `unknown findings: ${unknown.join(", ")}`);
@@ -236,11 +242,11 @@ export class RepoBackend implements Backend {
 
   async scan(node: NodeId): Promise<void> {
     const result = await this.latest();
-    if (!result.tree.nodes[node]) throw new HttpError(404, `no node ${JSON.stringify(node)}`);
+    if (!hasNode(result, node)) throw new HttpError(404, `no node ${JSON.stringify(node)}`);
     if (this.scanning.has(node)) throw new HttpError(409, `node ${JSON.stringify(node)} is already being scanned`);
-    this.scanning.add(node);
     this.emit({ type: "scan", node, status: "running" });
-    scanNode(node, this.collectCtx(result), {
+    const run = scanNode(node, this.collectCtx(result), {
+      signal: this.stopScans.signal,
       onProgress: (p) => this.emit({ type: "scan", node, status: "running", message: `${p.done}/${p.total} batches` }),
     })
       .then((p) => {
@@ -250,6 +256,7 @@ export class RepoBackend implements Backend {
       })
       .catch((err: unknown) => this.emit({ type: "scan", node, status: "failed", message: errorText(err) }))
       .finally(() => this.scanning.delete(node));
+    this.scanning.set(node, run);
   }
 
   subscribe(listener: (event: ServerEvent) => void): () => void {
@@ -297,8 +304,8 @@ export class RepoBackend implements Backend {
       .list()
       .flatMap((t) => (t.worktree && LIVE_STATES.includes(t.state) ? [t.worktree] : []));
     if (worktrees.length) {
-      const base = git(this.opts.repoRoot, "rev-parse", this.opts.config.baseRef);
-      for (const worktree of worktrees) for (const file of git(worktree, "diff", "--name-only", base).split("\n")) if (file) paths.add(file);
+      const base = git(this.opts.repoRoot, "rev-parse", this.opts.config.baseRef).trim();
+      for (const worktree of worktrees) for (const file of git(worktree, "diff", "--name-only", "-z", base).split("\0")) if (file) paths.add(file);
     }
     for (const pr of this.opts.prs.list()) for (const file of pr.files) paths.add(file);
     return [...paths].sort();
@@ -345,10 +352,15 @@ function findingsPrompt(node: NodeId, findings: Finding[]): string {
   return `Fix these techtree findings in ${where}:\n${items.join("\n")}`;
 }
 
-/** Trimmed stdout of a git command, or "" when it fails (e.g. a worktree that was removed). */
+/** Own-property check: a restored result's plain objects would otherwise "contain" ids like "toString". */
+function hasNode(result: ScoreResult, id: NodeId): boolean {
+  return Object.hasOwn(result.tree.nodes, id);
+}
+
+/** Stdout of a git command, or "" when it fails (e.g. a worktree that was removed). */
 function git(cwd: string, ...args: string[]): string {
   try {
-    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] }).trim();
+    return execFileSync("git", args, { cwd, encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] });
   } catch {
     return "";
   }

@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { mkdirSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
@@ -22,7 +22,7 @@ async function boot(t: TestContext, repo: string, cache: string, tmp: string, pi
   const server = await startServer({ backend, staticDir: tmp, token: "tok" });
   backend.attach({ url: `http://127.0.0.1:${server.port}`, token: "tok" });
   const shutdown = async () => {
-    backend.close();
+    await backend.close();
     await server.close();
   };
   t.after(shutdown);
@@ -32,7 +32,7 @@ async function boot(t: TestContext, repo: string, cache: string, tmp: string, pi
 
 const status = (err: unknown) => (err as HttpError).status;
 
-test("scores on start, runs a task through review with a diff, and survives a restart", async (t) => {
+test("scores on start, runs a task through review with a diff, and survives a restart", { timeout: 30_000 }, async (t) => {
   const { tmp, repo, cache } = fixture(t);
   const first = await boot(t, repo, cache, tmp);
   assert.ok(first.events.some((e) => e.type === "scores"), "initial scoring emits a scores event");
@@ -79,7 +79,7 @@ test("scores on start, runs a task through review with a diff, and survives a re
   assert.match(await second.backend.taskDiff(started.id), /change-\d+\.txt/);
 });
 
-test("maps unknown ids and wrong task states to HTTP errors", async (t) => {
+test("maps unknown ids and wrong task states to HTTP errors", { timeout: 30_000 }, async (t) => {
   const { tmp, repo, cache } = fixture(t);
   const { backend } = await boot(t, repo, cache, tmp);
   assert.equal(status(await backend.getNode("nope").catch((e) => e)), 404);
@@ -95,7 +95,7 @@ test("maps unknown ids and wrong task states to HTTP errors", async (t) => {
   assert.equal(status(await backend.openPr(task.id).catch((e) => e)), 409);
 });
 
-test("rescore requests during a run queue exactly one more run", async (t) => {
+test("rescore requests during a run queue exactly one more run", { timeout: 30_000 }, async (t) => {
   const { tmp, repo, cache } = fixture(t);
   const { backend, events } = await boot(t, repo, cache, tmp);
   const before = events.filter((e) => e.type === "scores").length;
@@ -106,7 +106,7 @@ test("rescore requests during a run queue exactly one more run", async (t) => {
   assert.equal(events.filter((e) => e.type === "scores").length - before, 2);
 });
 
-test("files changed in a running task's worktree make overlapping suggestions conflict", async (t) => {
+test("files changed in a running task's worktree make overlapping suggestions conflict", { timeout: 30_000 }, async (t) => {
   const { tmp, repo, cache } = fixture(t);
   const { backend } = await boot(t, repo, cache, tmp);
   const node = TODO_FILE.slice(0, TODO_FILE.lastIndexOf("/"));
@@ -120,7 +120,7 @@ test("files changed in a running task's worktree make overlapping suggestions co
   await backend.cancel(task.id);
 });
 
-test("scan emits running and done events, then rescores", async (t) => {
+test("scan emits running and done events, then rescores", { timeout: 30_000 }, async (t) => {
   const { tmp, repo, cache } = fixture(t);
   const fakeScanner = join(tmp, "fake-scan.mjs");
   writeFileSync(fakeScanner, 'console.log("[]");\n');
@@ -139,7 +139,7 @@ test("scan emits running and done events, then rescores", async (t) => {
   assert.equal((await backend.getOverview()).coverage.scannedNodes, 1);
 });
 
-test("reads fail with 503 when the first scoring run failed", async (t) => {
+test("reads fail with 503 when the first scoring run failed", { timeout: 30_000 }, async (t) => {
   const { tmp, cache } = fixture(t);
   const notARepo = join(tmp, "plain");
   mkdirSync(notARepo);
@@ -148,3 +148,60 @@ test("reads fail with 503 when the first scoring run failed", async (t) => {
   assert.equal(status(err), 503);
   assert.match(err.message, /^not scored yet: /);
 });
+
+const TODOS = "fn a() {}\n// TODO one\n// TODO two\n// TODO three\n";
+
+test("prototype-named ids are ordinary nodes, before and after a restart", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t, { "constructor/lib.rs": TODOS, "__proto__/lib.rs": TODOS });
+  const first = await boot(t, repo, cache, tmp);
+  const counts = JSON.parse(JSON.stringify((await first.backend.getState()).findingCounts));
+  assert.equal(counts.constructor, 1);
+  assert.equal(counts.__proto__, 1);
+  assert.equal(status(await first.backend.getNode("toString").catch((e) => e)), 404);
+  await first.shutdown();
+
+  const { backend } = await boot(t, repo, cache, tmp);
+  assert.equal(status(await backend.getNode("toString").catch((e) => e)), 404);
+  assert.equal(status(await backend.startTask({ node: "toString", findingIds: [], manualReview: true }).catch((e) => e)), 404);
+  assert.equal(status(await backend.scan("hasOwnProperty").catch((e) => e)), 404);
+  assert.equal((await backend.getNode("constructor")).findings.length, 1);
+});
+
+test("busy paths keep non-ASCII file names exact", { timeout: 30_000 }, async (t) => {
+  const file = "src/uni/café.rs";
+  const { tmp, repo, cache } = fixture(t, { [file]: TODOS });
+  const { backend } = await boot(t, repo, cache, tmp);
+  const [before] = (await backend.getNode("src/uni")).suggestions;
+  assert.equal(before.conflict, 0);
+  const task = await backend.startTask({ node: "src/uni", findingIds: [], prompt: "scenario:hang", manualReview: true });
+  const running = await until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.worktree && x.state === "running")), "running task");
+  writeFileSync(join(running.worktree!, file), "changed\n");
+  const [after] = (await backend.getNode("src/uni")).suggestions;
+  assert.equal(after.conflict, 1);
+  await backend.cancel(task.id);
+});
+
+test("closing the backend stops running scans and waits for their children", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  const pidFile = join(tmp, "scanner.pid");
+  const hangingScanner = join(tmp, "hang-scan.mjs");
+  writeFileSync(
+    hangingScanner,
+    `import { writeFileSync } from "node:fs";\nwriteFileSync(${JSON.stringify(pidFile)}, String(process.pid));\nsetInterval(() => {}, 1000);\n`,
+  );
+  const { backend } = await boot(t, repo, cache, tmp, [process.execPath, hangingScanner]);
+  await backend.scan("src/util");
+  const pid = Number(await until(() => (existsSync(pidFile) ? readFileSync(pidFile, "utf8") : undefined), "scanner started"));
+  t.after(() => isAlive(pid) && process.kill(pid, "SIGKILL"));
+  await backend.close();
+  assert.equal(isAlive(pid), false, "the scanner child has exited");
+});
+
+function isAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+}

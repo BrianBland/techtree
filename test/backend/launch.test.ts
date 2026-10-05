@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -15,7 +15,7 @@ import { CLI, fixture, until, withCacheHome } from "./helpers.ts";
 
 const lock = (over: Partial<ServerInfo>): ServerInfo => ({ pid: process.pid, port: 1, token: "t", url: "u", version: "0", ...over });
 
-test("/api/health answers without a token and reveals only the version", async (t) => {
+test("/api/health answers without a token and reveals only the version", { timeout: 30_000 }, async (t) => {
   const staticDir = mkdtempSync(join(tmpdir(), "techtree-health-"));
   const server = await startServer({ backend: {} as Backend, staticDir, version: "9.9.9" });
   t.after(async () => {
@@ -28,7 +28,7 @@ test("/api/health answers without a token and reveals only the version", async (
   assert.equal((await fetch(`http://127.0.0.1:${server.port}/api/state`)).status, 401);
 });
 
-test("a lockfile is live only with a running pid whose port answers /api/health", async (t) => {
+test("a lockfile is live only with a running pid whose port answers /api/health", { timeout: 30_000 }, async (t) => {
   const dir = mkdtempSync(join(tmpdir(), "techtree-lock-"));
   const health = createServer((req, res) => res.writeHead(req.url === "/api/health" ? 200 : 404).end("{}"));
   await new Promise<void>((resolve) => health.listen(0, "127.0.0.1", resolve));
@@ -47,7 +47,7 @@ test("a lockfile is live only with a running pid whose port answers /api/health"
   assert.deepEqual(await liveServer(dir), lock({ port }));
 });
 
-test("ensureServer starts one detached server, reuses it, replaces a stale one, and stop shuts it down", async (t) => {
+test("ensureServer starts one detached server, reuses it, replaces a stale one, and stop shuts it down", { timeout: 30_000 }, async (t) => {
   const { repo, cache } = fixture(t);
   withCacheHome(t, cache);
   const dir = cacheDir(repoId(repo));
@@ -78,7 +78,7 @@ test("ensureServer starts one detached server, reuses it, replaces a stale one, 
   assert.equal(await stopServer(repo), "no techtree server running");
 });
 
-test("stop removes a stale lockfile", async (t) => {
+test("stop removes a stale lockfile", { timeout: 30_000 }, async (t) => {
   const { repo, cache } = fixture(t);
   withCacheHome(t, cache);
   const dir = cacheDir(repoId(repo));
@@ -88,7 +88,7 @@ test("stop removes a stale lockfile", async (t) => {
   assert.equal(existsSync(lockPath(dir)), false);
 });
 
-test("serve --port listens on the given port and prints the URL; a bad port is a usage error", async (t) => {
+test("serve --port listens on the given port and prints the URL; a bad port is a usage error", { timeout: 30_000 }, async (t) => {
   const { repo, cache } = fixture(t);
   withCacheHome(t, cache);
   const probe = createServer();
@@ -108,4 +108,38 @@ test("serve --port listens on the given port and prints the URL; a bad port is a
   const bad = spawnSync(process.execPath, [CLI, "serve", repo, "--port", "nope"], { encoding: "utf8" });
   assert.equal(bad.status, 1);
   assert.match(bad.stderr, /invalid --port nope/);
+});
+
+test("concurrent serve processes for one repo start a single server", { timeout: 30_000 }, async (t) => {
+  const { repo, cache } = fixture(t);
+  withCacheHome(t, cache);
+  const children = Array.from({ length: 4 }, () => spawn(process.execPath, [CLI, "serve", repo], { stdio: ["ignore", "pipe", "ignore"] }));
+  t.after(() => children.forEach((c) => c.kill("SIGKILL")));
+  const urls = await Promise.all(
+    children.map(
+      (child) =>
+        new Promise<string>((resolve) => {
+          let out = "";
+          child.stdout.on("data", (chunk) => {
+            out += chunk;
+            if (out.includes("\n")) resolve(out.split("\n")[0]);
+          });
+        }),
+    ),
+  );
+  assert.equal(new Set(urls).size, 1, "every process reports the same server");
+  await until(() => children.filter((c) => c.exitCode === null).length === 1, "the losing processes to exit");
+  const owner = children.find((c) => c.exitCode === null)!;
+  assert.equal((await liveServer(cacheDir(repoId(repo))))?.pid, owner.pid);
+  owner.kill("SIGTERM");
+});
+
+test("the detached server's log, which holds the token URL, is private to the user", { timeout: 30_000 }, async (t) => {
+  const { repo, cache } = fixture(t);
+  withCacheHome(t, cache);
+  const dir = cacheDir(repoId(repo));
+  writeFileSync(join(dir, "server.log"), "older log\n", { mode: 0o644 });
+  const server = await ensureServer(repo, dir, { cli: CLI });
+  t.after(() => pidAlive(server.pid) && process.kill(server.pid, "SIGKILL"));
+  assert.equal(statSync(join(dir, "server.log")).mode & 0o777, 0o600);
 });

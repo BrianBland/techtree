@@ -18,13 +18,14 @@ Object.assign(process.env, {
 });
 
 /** A temp dir (symlinks resolved, as `git rev-parse --show-toplevel` reports it) holding a committed fixture repo (`repo/`) and an isolated XDG cache (`cache/`), removed after the test. */
-export function fixture(t: TestContext): { tmp: string; repo: string; cache: string } {
+export function fixture(t: TestContext, extraFiles: Record<string, string> = {}): { tmp: string; repo: string; cache: string } {
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "techtree-backend-")));
   const repo = join(tmp, "repo");
   const files: Record<string, string> = {
     [TODO_FILE]: "fn a() {}\n// TODO one\n// TODO two\n// TODO three\n",
     "src/util/mod.rs": "fn b() {}\n",
     "README.md": "fixture\n",
+    ...extraFiles,
   };
   for (const [path, text] of Object.entries(files)) {
     mkdirSync(dirname(join(repo, path)), { recursive: true });
