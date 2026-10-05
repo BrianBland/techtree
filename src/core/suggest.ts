@@ -1,10 +1,12 @@
-import type { Config, Effort, Finding, Impact, NodeId, NodeScore, ScoreResult, Suggestion, Tree } from "../types.ts";
+import type { Config, Effort, Finding, Impact, ScoreResult, Suggestion } from "../types.ts";
+import { hotNodes } from "./hot.ts";
 import { buildModel, commonAncestor, findingsImpact } from "./scoring.ts";
+
+export { hotNodes };
 
 /** Relative cost of each effort level, the divisor in priority. */
 export const EFFORT_COST: Record<Effort, number> = { trivial: 1, small: 2, medium: 5, large: 13 };
 
-const HOT_METRICS = ["churn_90d", "fan_in"];
 const REVIEW_TAGS = ["concurrency", "security", "api"];
 
 /** impact ÷ effort cost × (1 − conflict). */
@@ -20,26 +22,6 @@ export function conflict(paths: string[], busy: string[]): number {
 
 function overlaps(a: string, b: string): boolean {
   return a === b || a === "" || b === "" || a.startsWith(`${b}/`) || b.startsWith(`${a}/`);
-}
-
-/** Nodes in the top decile of `churn_90d` or `fan_in` among nodes of their kind. */
-export function hotNodes(tree: Tree, scores: Record<NodeId, NodeScore>): Set<NodeId> {
-  const hot = new Set<NodeId>();
-  for (const metric of HOT_METRICS) {
-    const byKind = new Map<string, { id: NodeId; raw: number }[]>();
-    for (const score of Object.values(scores)) {
-      const raw = score.metrics[metric]?.raw;
-      if (raw === undefined) continue;
-      const kind = tree.nodes[score.node].kind;
-      if (!byKind.has(kind)) byKind.set(kind, []);
-      byKind.get(kind)!.push({ id: score.node, raw });
-    }
-    for (const nodes of byKind.values()) {
-      const threshold = nodes.map((n) => n.raw).sort((a, b) => b - a)[Math.ceil(nodes.length / 10) - 1];
-      for (const n of nodes) if (n.raw > 0 && n.raw >= threshold) hot.add(n.id);
-    }
-  }
-  return hot;
 }
 
 /** Complexity heuristic: whether a task should default to manual review before its PR. */
