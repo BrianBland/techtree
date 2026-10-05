@@ -300,6 +300,9 @@ test("unwraps in binary entry points and build scripts are not counted; confiden
       "pub fn b(r: Result<u8, ()>) -> u8 { r.expect(\"validated by caller\") }",
       "pub fn c(m: &std::sync::Mutex<u8>) -> u8 { *m.lock().unwrap() }",
       "pub fn d() -> std::net::IpAddr { \"127.0.0.1\".parse::<std::net::IpAddr>().unwrap() }",
+      "const CAP: NonZeroUsize = NonZeroUsize::new(16).unwrap();",
+      "pub(crate) static MAX: NonZeroU8 =",
+      "    NonZeroU8::new(3).expect(\"non-zero\");",
       "",
     ].join("\n"),
   });

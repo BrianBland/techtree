@@ -143,7 +143,7 @@ Own values are per node: a directory's own files only; the core aggregates up. D
 | `fn_count` | `fn` items in non-test Rust code | neutral | sum | |
 | `pub_fn_count` | `pub fn` items in non-test Rust code | neutral | sum | |
 | `complexity` | branch points (`if`, `match`, `while`, `for … in`, `loop`, `&&`, `\|\|`) in non-test code | lower_better | sum | `fn_count` |
-| `unwrap_density` | `.unwrap()` / `.expect(` in non-test code, excluding binary entry points (`main.rs`, files under `src/bin/`) and build scripts (`build.rs`) | lower_better | sum | `loc` |
+| `unwrap_density` | `.unwrap()` / `.expect(` in non-test code, excluding binary entry points (`main.rs`, files under `src/bin/`) and build scripts (`build.rs`), and calls in `const`/`static` item initializers (evaluated at compile time, so they cannot panic at runtime) | lower_better | sum | `loc` |
 | `test_count` | test fns (`#[test]`, `#[<path>::test]`, `#[rstest]`) | neutral | sum | |
 | `test_ratio` | test fns (same count as `test_count`) | higher_better | sum | `pub_fn_count` |
 | `ignored_tests` | `#[ignore]` attributes | lower_better | sum | |

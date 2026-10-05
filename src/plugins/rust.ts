@@ -60,6 +60,13 @@ const LOCK_GUARD = /\.(?:lock|read|write)\(\)\s*$/;
 const LITERAL_PARSE = /"[^"\n]*"\s*\.parse(?:::<[^()]*>)?\(\)\s*$/;
 const ENTRY_POINT = /(^|\/)(main|build)\.rs$|(^|\/)src\/bin\//;
 const IDENT = /[A-Za-z_]\w*/g;
+const CONST_ITEM = /^\s*(?:pub(?:\([^)]*\))?\s+)?(?:const|static)\s+[A-Z_]/;
+
+/** Whether the unwrap at `index` is in a `const`/`static` initializer: compile-time evaluated, so it can't panic at runtime. */
+function inConstItem(code: string, index: number): boolean {
+  const start = Math.max(code.lastIndexOf(";", index), code.lastIndexOf("{", index), code.lastIndexOf("}", index)) + 1;
+  return CONST_ITEM.test(code.slice(start, index));
+}
 
 /** How likely an unwrap/expect at `index` is a real panic risk (DESIGN "Confidence"). */
 function unwrapWeight(code: string, index: number): number {
@@ -337,7 +344,7 @@ function analyzeFile(file: string, code: string, kind: FileKind, testRegions: [n
     for (let k = from; k < to; k++) if (mask[k] !== "\n") mask[k] = " ";
   }
   const nonTest = kind === "src" ? mask.join("") : "";
-  const unwraps = ENTRY_POINT.test(file) ? [] : [...nonTest.matchAll(UNWRAP)].map((m) => m.index);
+  const unwraps = ENTRY_POINT.test(file) ? [] : [...nonTest.matchAll(UNWRAP)].map((m) => m.index).filter((i) => !inConstItem(nonTest, i));
   return {
     file,
     kind,
