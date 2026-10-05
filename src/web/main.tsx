@@ -8,6 +8,7 @@ import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, st
 import { TreeView } from "./TreeView.tsx";
 import { NodePanel, StartDialog } from "./Panel.tsx";
 import { Overview } from "./Overview.tsx";
+import { PanelResizer, usePanelWidth } from "./PanelResizer.tsx";
 import { ProjectSwitcher } from "./Projects.tsx";
 
 function App() {
@@ -110,6 +111,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
   const [selected, setSelected] = useState<NodeId | null>(focus || null);
   const [overrides, setOverrides] = useState<Overrides>(new Map());
   const [fitRequest, setFitRequest] = useState(0);
+  const [panelWidth, setPanelWidth] = usePanelWidth();
   const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[]; project: string } | null>(null);
   const { tree, scores, metricDefs } = state;
 
@@ -222,7 +224,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
           {error}
         </div>
       )}
-      <main>
+      <main style={{ "--panel-width": `${panelWidth}px` }}>
         <TreeView
           tree={tree}
           layout={layout}
@@ -239,6 +241,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
           onToggle={onToggle}
           onStub={onStub}
         />
+        <PanelResizer width={panelWidth} onResize={setPanelWidth} onResizeEnd={() => setFitRequest((n) => n + 1)} />
         {selected === null ? (
           <Overview
             state={state}

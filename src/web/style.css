@@ -147,7 +147,8 @@ main { flex: 1; display: flex; min-height: 0; }
 @keyframes pulse-glow { 50% { box-shadow: 0 0 0 2px var(--gold); } }
 
 .panel {
-  width: 440px;
+  width: var(--panel-width, 440px);
+  flex: none;
   background: var(--hud);
   border-left: 3px solid var(--ink);
   box-shadow: inset 2px 0 0 var(--line);
@@ -263,3 +264,5 @@ main { flex: 1; display: flex; min-height: 0; }
 .project-tag { display: inline-block; margin-right: 6px; padding: 0 4px; font-size: 11px; color: var(--ink); background: var(--accent); }
 .goal { margin: 4px 0 0; color: var(--text); white-space: pre-wrap; }
 button.link.danger { color: var(--bad); margin-right: auto; }
+.panel-resizer { flex: none; width: 6px; margin-right: -3px; cursor: col-resize; touch-action: none; background: var(--ink); z-index: 1; }
+.panel-resizer:hover, .panel-resizer:active { background: var(--accent); }

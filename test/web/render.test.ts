@@ -566,3 +566,39 @@ test("New task here starts a free-form task in the selected project", UI_TIMEOUT
   assert.equal(task.node, "");
   assert.match(task.prompt, /^Profile the startup path/);
 });
+
+test("dragging the panel's left edge resizes it within bounds, remembers the width and double-click resets it", UI_TIMEOUT, async (t) => {
+  const stored = new Map([["techtree.panelWidth", "500"]]);
+  const localStorage = { getItem: (k: string) => stored.get(k) ?? null, setItem: (k: string, v: string) => stored.set(k, v), removeItem: (k: string) => stored.delete(k) };
+  Object.assign(globalThis, { localStorage, innerWidth: 1600 });
+  t.after(() => {
+    delete (globalThis as { localStorage?: unknown }).localStorage;
+    delete (globalThis as { innerWidth?: unknown }).innerWidth;
+  });
+  const { app, byClass } = await bootUi(t);
+  const handle = () => byClass("panel-resizer")[0];
+  const width = () => handle().getAttribute("aria-valuenow");
+  const tick = () => new Promise((r) => setTimeout(r, 0));
+  await app.waitFor(() => byClass("panel-resizer").length === 1, "resize handle");
+  assert.equal(width(), "500", "the saved width is restored");
+
+  const drag = async (from: number, to: number) => {
+    handle().dispatch("pointerdown", { clientX: from, pointerId: 1 });
+    await tick();
+    handle().dispatch("pointermove", { clientX: to, pointerId: 1 });
+    await tick();
+    handle().dispatch("pointerup", { pointerId: 1 });
+    await tick();
+  };
+  await drag(1000, 800);
+  assert.deepEqual([width(), stored.get("techtree.panelWidth")], ["700", "700"]);
+  await drag(1000, 0);
+  assert.equal(width(), "1200", "at most 75% of the window");
+  await drag(500, 1500);
+  assert.equal(width(), "320", "at least 320 px");
+
+  handle().dispatch("dblclick");
+  await tick();
+  assert.equal(width(), "440");
+  assert.equal(stored.has("techtree.panelWidth"), false);
+});
