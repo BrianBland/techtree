@@ -1,3 +1,4 @@
+import { nodeCtas, rankCtas } from "../core/cta.ts";
 import { DEFAULT_WEIGHTS } from "../config.ts";
 import type {
   ApiNode,
@@ -311,6 +312,7 @@ export function createMockBackend({ seed = 1, tickMs = 1500 }: MockOptions = {})
         prs: prs.filter((p) => p.node === id),
         tasks: tasks.filter((t) => t.node === id),
         suggestions: suggestionsFor(id),
+        ...nodeCtas(id, rankCtas(tasks, prs, candidates.flatMap(suggestionsFor))),
       });
     },
 

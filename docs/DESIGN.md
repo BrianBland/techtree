@@ -182,17 +182,26 @@ The precise rules the scorer implements:
 
 ## UI
 
-- **Tree:** left to right, root to deepest directory, as a tidy tree with collapse/expand and zoom/pan. Node size and edge width scale with √weight; the weight metric is selectable (loc, test_count, test_time, …). Node fill comes from the selected score: a single-hue ramp normalized to the repo's range. Siblings are sorted by a selectable key (default: alphabetical).
-  - Layout: each subtree occupies a contiguous vertical band no shorter than its children's bands or its own node, parents are centred on their children, and depth sets the column, so nodes never overlap. Layout depends only on the visible set, the weight metric and the sort; switching the score only recolours.
-  - Initially the tree is expanded breadth-first from the root up to depth 3 while at most 150 nodes are visible; deeper nodes start collapsed. Clicking a node selects it; its +/− handle expands or collapses it.
-  - Score choices: composite or the percentile of any non-neutral metric. Sort choices: name (default), score (best first), weight (largest first). Nodes without a value are drawn in neutral grey.
+- **Tree:** left to right, root to deepest directory, as a tidy tree with collapse/expand and zoom/pan. It should look and feel like a game tech tree and feel alive, not like a plain graph:
+  - Each node is a pixel-art square tile (crisp edges, no anti-aliasing) sized by √weight; the weight metric is selectable (loc, test_count, test_time, …). Edge width also scales with √weight.
+  - Tile fill comes from the selected score on a diverging ramp so the worst nodes stand out: bad scores are hot and saturated (red/orange), good scores cool (teal/green), and the bottom decile visibly pulses. The ramp is normalized to the repo's range.
+  - The tile surfaces more at a glance through filled segments: one pixel segment per weighted metric coloured by its percentile, plus badges for open PRs, tasks needing input and finding count.
+  - A progress bar along the tile's bottom shows quality, or the research bar while a task runs.
+  - Ambient motion: running tasks animate, attention items pulse, score changes flash. Motion respects `prefers-reduced-motion`.
+  - Siblings are sorted by a selectable key (default: alphabetical).
 - **Overlays:** running tasks appear as a research bar under the node. The bar is solid up to `plannedFrom`, then shows a loading stripe up to `plannedTo` filled to checklist completion, then empty. Its color follows the score ramp. Open PRs appear as a count bubble on the top-right corner of their anchor node. The anchor is the deepest node that contains at least 60% of the PR's changed lines.
-- **Node panel** (on click): composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, running tasks with live log tail, and suggested next tasks. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic) and lets you edit the prompt.
+- **Node panel** (on click): first the node's own calls to action, then the top calls to action from its children (each labelled with and linking to its child node); then composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, running tasks with live log tail, and suggested next tasks. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic) and lets you edit the prompt.
 - **Overview** (no selection): calls to action:
   1. tasks in `needs_input` or `review`
   2. PRs that are failing, stuck (no progress in 24h), or stale (no update in 3 days)
   3. the top suggested tasks by priority, favouring low conflict
   4. a scan-coverage summary
+
+**Calls to action** (`Cta`, used by the node panel and overview), ranked highest first:
+1. tasks in `needs_input`, then `review`;
+2. PRs that are failing, then stuck, then stale;
+3. suggestions by priority.
+A node's `ownCtas` are those anchored at the node; `childCtas` are the top 10 anchored strictly below it.
 
 **Complexity heuristic** for pre-ticking manual review: tick it if any of these hold:
 - the effort is `medium` or larger,

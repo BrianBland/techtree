@@ -203,6 +203,19 @@ export interface ApiNode {
   prs: PrState[];
   tasks: Task[];
   suggestions: Suggestion[];
+  ownCtas: Cta[]; // calls to action anchored at this node, ranked
+  childCtas: Cta[]; // top calls to action from descendants (not this node), ranked, at most 10
+}
+
+/** A call to action: something the user should do, ranked for the node panel and overview. */
+export interface Cta {
+  kind: "task" | "pr" | "suggestion";
+  node: NodeId;
+  rank: number; // higher first; see DESIGN "Calls to action"
+  reason: string; // short label, e.g. "needs input", "CI failing", "+6.2 quality"
+  task?: Task;
+  pr?: PrState;
+  suggestion?: Suggestion;
 }
 
 export interface ApiOverview {
