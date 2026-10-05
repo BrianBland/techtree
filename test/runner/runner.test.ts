@@ -539,3 +539,42 @@ test("the chat transcript of an unknown task is an error, not an empty list", as
   const h = await setup(t);
   assert.throws(() => h.runner.chat("nope"), /unknown task/);
 });
+
+test("a task whose commits cancel out ends done as no_change with the agent's last message; a message resumes it", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("revert"));
+  const done = await h.waitFor(task.id, (x) => x.state === "done");
+  assert.equal(done.outcome, "no_change");
+  assert.equal(done.summary, "The finding is a false positive; nothing to change.");
+
+  h.runner.message(task.id, "Please make the change anyway.");
+  const reviewed = await h.waitFor(task.id, (x) => x.state === "review");
+  assert.equal(reviewed.outcome, undefined);
+  assert.equal(reviewed.summary, undefined);
+});
+
+test("the agent can report no_change explicitly and propose dismissing findings", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("explain", false));
+  const done = await h.waitFor(task.id, (x) => x.state === "done");
+  assert.equal(done.outcome, "no_change");
+  assert.equal(done.summary, "Already correct.");
+  assert.deepEqual(done.proposedDismiss, { findingIds: ["f1"], reason: "false positive" });
+});
+
+test("a failing no-change diff check fails the task instead of crashing the server", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("breakgit"));
+  const failed = await h.waitFor(task.id, (x) => x.state === "failed");
+  assert.match(failed.error!, /^diff check failed/);
+});
+
+test("a bundled task's agent cannot be resumed on its own branch", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("happy"));
+  await h.waitFor(task.id, (x) => x.state === "review");
+  h.runner.stage(task.id);
+  h.runner.bundled([task.id], "b1", 77);
+  assert.throws(() => h.runner.message(task.id, "fix CI"), /combined PR/);
+  assert.throws(() => h.runner.resumeTask(task.id, "fix CI"), /combined PR/);
+});

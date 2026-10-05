@@ -115,6 +115,25 @@ function Detail({ id, detail, state, version, onStart, onSelect, onError }: Deta
           })}
         </tbody>
       </table>
+      {detail.dismissed.length > 0 && (
+        <details class="dismissed">
+          <summary class="muted small">{detail.dismissed.length} dismissed</summary>
+          <ul class="list">
+            {detail.dismissed.map((f) => (
+              <li key={f.id} class="row">
+                <div>
+                  {linkify(f.title)}
+                  <div class="muted small">
+                    {f.source} · {f.file}
+                    {f.reason ? ` · ${f.reason}` : ""}
+                  </div>
+                </div>
+                <button onClick={() => post("/api/findings/undismiss", { findingIds: [f.id] }).catch((e: Error) => onError(e.message))}>Undo</button>
+              </li>
+            ))}
+          </ul>
+        </details>
+      )}
       <Section title="Findings" items={[...detail.findings].sort((a, b) => b.impact.node - a.impact.node)}>
         {(f) => (
           <li key={f.id}>
@@ -180,6 +199,15 @@ function taskAction(task: Task, path: string, onError: (message: string) => void
       return false;
     },
   );
+}
+
+/** Confirm the agent's proposed dismissal, or dismiss all the task's findings with a reason asked for. */
+function dismissFindings(task: Task, onError: (message: string) => void): void {
+  const proposal = task.proposedDismiss;
+  const reason = proposal ? proposal.reason : prompt("Why dismiss these findings? (e.g. false positive, won't fix)", "false positive");
+  if (reason === null) return;
+  const findingIds = proposal?.findingIds ?? task.findingIds;
+  post("/api/findings/dismiss", { findingIds, reason, project: task.project }).catch((e: Error) => onError(e.message));
 }
 
 function AnswerForm({ task, onError }: { task: Task; onError(message: string): void }) {
@@ -287,6 +315,16 @@ export function TaskCard({ task, prs, scorer, version, onError }: TaskActionsPro
         </ul>
       )}
       {task.error && <p class="error small">{linkify(task.error)}</p>}
+      {task.outcome === "no_change" && (
+        <p class="summary">
+          <strong>No change needed.</strong> {linkify(task.summary || "The agent finished without changes.")}
+        </p>
+      )}
+      {task.proposedDismiss && (
+        <p class="small">
+          Agent proposes dismissing {task.proposedDismiss.findingIds.length} finding(s){task.proposedDismiss.reason ? `: ${task.proposedDismiss.reason}` : "."}
+        </p>
+      )}
       <TaskActions task={task} prs={prs} scorer={scorer} version={version} onError={onError} />
     </li>
   );
@@ -297,7 +335,10 @@ type Pane = "log" | "diff" | "chat";
 /** The task's action bar (see docs/DESIGN.md "Task actions") and the panes it toggles. */
 function TaskActions({ task, prs, scorer, version, onError }: TaskActionsProps) {
   const isChange = (task.kind ?? "change") === "change";
-  const [open, setOpen] = useState<Set<Pane>>(() => new Set(task.state === "review" && isChange ? ["diff"] : []));
+  const [open, setOpen] = useState<Set<Pane>>(new Set());
+  useEffect(() => {
+    if (task.state === "review" && isChange) setOpen((panes) => new Set(panes).add("diff"));
+  }, [task.state]);
   const toggle = (pane: Pane) =>
     setOpen((panes) => {
       const next = new Set(panes);
@@ -319,6 +360,17 @@ function TaskActions({ task, prs, scorer, version, onError }: TaskActionsProps) 
         {task.state === "review" && task.kind === "scorer" && task.proposal && (
           <button class="primary" title="Save the proposal as the project's scorer and rescore" onClick={() => taskAction(task, "accept-scorer", onError)}>
             Accept scorer
+          </button>
+        )}
+        {task.state === "review" && isChange && (
+          <button title="Set aside for a combined PR with other staged tasks" onClick={() => taskAction(task, "stage", onError)}>
+            Stage
+          </button>
+        )}
+        {task.state === "staged" && <button onClick={() => taskAction(task, "unstage", onError)}>Unstage</button>}
+        {task.findingIds.length > 0 && (
+          <button title="Mark the task's findings as false positive / won't fix" onClick={() => dismissFindings(task, onError)}>
+            Dismiss findings
           </button>
         )}
         {(live || task.state === "review") && <button onClick={() => taskAction(task, "cancel", onError)}>Cancel</button>}

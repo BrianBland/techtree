@@ -22,6 +22,8 @@ export interface PrPollerOptions {
   onUpdate?: (prev: PrState | undefined, next: PrState) => void;
   /** Called for a PR that left the open list (merged or closed). */
   onRemove?: (pr: PrState) => void;
+  /** Called after each successful poll, once its changes are committed. */
+  onPolled?: () => void;
 }
 
 interface Staged {
@@ -185,6 +187,7 @@ export class PrPoller {
     this.status = "ok";
     this.delayMs = this.interval();
     this.commit(staged);
+    this.opts.onPolled?.();
   }
 
   /** Task PRs still worth a `gh pr view`: on a `pr_open` task and not known to be merged or closed. */
@@ -263,7 +266,7 @@ function toPrState(gh: GhPr, tree: Tree | undefined, tasks: Task[], prev: PrStat
   const author = gh.author?.login ?? "";
   const files = gh.files ?? [];
   const task = tasks
-    .filter((t) => t.pr === gh.number || t.branch === gh.headRefName)
+    .filter((t) => !t.bundle && (t.pr === gh.number || t.branch === gh.headRefName))
     .sort((a, b) => b.createdAt.localeCompare(a.createdAt))[0];
   const pr: PrState = {
     number: gh.number,

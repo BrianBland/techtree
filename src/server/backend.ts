@@ -4,6 +4,7 @@ import type {
   ApiOverview,
   ApiSource,
   ApiState,
+  Bundle,
   ChatEntry,
   NodeId,
   PrState,
@@ -16,7 +17,7 @@ import type {
   TerminalMode,
 } from "../types.ts";
 
-/** Worker progress sent through `techtree_report`; exactly one field is expected per call. */
+/** Worker progress sent through `techtree_report`; one payload may carry several fields. */
 export interface WorkerReport {
   plan?: string[];
   phase?: TaskPhase;
@@ -26,6 +27,16 @@ export interface WorkerReport {
   items?: unknown;
   /** Scorer tasks: the proposed scorer, validated by the runner. */
   scorer?: unknown;
+  outcome?: "no_change";
+  summary?: string;
+  dismiss?: string[];
+  reason?: string;
+}
+
+export interface BundleInput {
+  project?: string;
+  taskIds: string[];
+  title?: string;
 }
 
 export interface ProjectInput {
@@ -70,6 +81,15 @@ export interface Backend {
   discard(taskId: string): Promise<void>;
   report(taskId: string, report: WorkerReport): Promise<Task>;
   setBabysit(prNumber: number, on: boolean): Promise<PrState>;
+  /** `review` → `staged`, and back (DESIGN "Staging and combined PRs"). */
+  stage(taskId: string): Promise<Task>;
+  unstage(taskId: string): Promise<Task>;
+  /** Open one combined PR from staged tasks. */
+  createBundle(input: BundleInput): Promise<Bundle>;
+  listBundles(project?: string): Promise<Bundle[]>;
+  /** Dismiss findings (false positive / won't fix) or undo it (DESIGN "Dismissed findings"). */
+  dismiss(findingIds: string[], reason?: string, project?: string): Promise<void>;
+  undismiss(findingIds: string[]): Promise<void>;
   rescore(project?: string): Promise<void>;
   scan(node: NodeId, project?: string): Promise<void>;
   /** Register a listener for live events; returns the unsubscribe function. */

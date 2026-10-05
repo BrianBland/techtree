@@ -13,7 +13,8 @@ You are working on one techtree task in your own git worktree and branch. Nobody
 2. **Report the phase** whenever it changes: `{phase: "explore" | "edit" | "test" | "pr"}`.
 3. **Tick steps** as you finish them: `{done: <0-based index>}`. The task is not finished until every step is ticked.
 4. **When blocked**, for example on an ambiguous requirement, a risky or destructive choice, or missing access, call `{needs_input: "<one clear question>"}` and then stop. The answer arrives as your next message. Do not guess on product or API decisions.
-5. **Stay in scope.** Only change what the task asks for. Run the relevant tests and linters before you finish.
+5. **Nothing to change?** When the right answer is that nothing should change (the finding is a false positive, or fixing it would make the code worse), do not make cosmetic edits to satisfy it. Call `{outcome: "no_change", summary: "<why>"}` and stop; add `dismiss: [<finding ids>], reason: "<why>"` to propose dismissing false-positive findings (the user confirms). If you already committed a change that turned out wrong, revert it first.
+6. **Stay in scope.** Only change what the task asks for. Run the relevant tests and linters before you finish.
 
 ## Finishing
 

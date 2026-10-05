@@ -32,6 +32,10 @@ const reportParameters = Type.Object({
       { description: "Scorer tasks only: the proposed project scorer" },
     ),
   ),
+  outcome: Type.Optional(Type.Literal("no_change", { description: "Finish without changes: the right answer is that nothing should change" })),
+  summary: Type.Optional(Type.String({ description: "With outcome no_change: why nothing should change" })),
+  dismiss: Type.Optional(Type.Array(Type.String(), { description: "Finding ids to propose dismissing (false positive / won't fix); the user confirms" })),
+  reason: Type.Optional(Type.String({ description: "With dismiss: why the findings should be dismissed" })),
 });
 
 /** Body of `POST /api/tasks/:id/report`. */
@@ -47,7 +51,8 @@ export const techtreeReportTool: ToolDefinition<typeof reportParameters> = {
   description:
     "Report techtree task progress: {plan: string[]} first, then {phase}, {done: index} as checklist items finish, " +
     "or {needs_input: question} when blocked (then stop and wait for the answer). " +
-    "Plan tasks report work items with {items}; scorer tasks propose a scorer with {scorer}.",
+    "Plan tasks report work items with {items}; scorer tasks propose a scorer with {scorer}. " +
+    "When nothing should change, {outcome: \"no_change\", summary} ends the task; {dismiss: [findingId], reason} proposes dismissing findings.",
   parameters: reportParameters,
   async execute(_toolCallId, params) {
     const { TECHTREE_URL: url, TECHTREE_TOKEN: token = "", TECHTREE_TASK: task } = process.env;
@@ -58,7 +63,11 @@ export const techtreeReportTool: ToolDefinition<typeof reportParameters> = {
       body: JSON.stringify(params),
     });
     if (!res.ok) throw new Error(`techtree_report rejected (${res.status}): ${await res.text()}`);
-    const text = params.needs_input ? "Question sent. Stop now and wait for the answer." : "Reported.";
+    const text = params.needs_input
+      ? "Question sent. Stop now and wait for the answer."
+      : params.outcome
+        ? "Task finished without changes. Stop now."
+        : "Reported.";
     return { content: [{ type: "text", text }], details: undefined };
   },
 };

@@ -129,7 +129,7 @@ export class TaskRunner {
     if (task.state !== "running" && task.state !== "needs_input") throw new Error(`task ${taskId} is ${task.state}`);
     const worker = this.workers.get(taskId);
     if (!worker) throw new Error(`task ${taskId} has no live worker`);
-    const { plan, phase, done, needs_input, items, scorer } = payload;
+    const { plan, phase, done, needs_input, items, scorer, outcome, summary, dismiss, reason } = payload;
     if (phase !== undefined && !PHASES.includes(phase)) throw new Error(`unknown phase ${phase}`);
     if (items !== undefined && task.kind !== "plan") throw new Error("items are for plan tasks only");
     if (scorer !== undefined && task.kind !== "scorer") throw new Error("scorer is for scorer tasks only");
@@ -144,12 +144,17 @@ export class TaskRunner {
     if (phase) task.phase = phase;
     if (done !== undefined) checklist[done].done = true;
     if (proposal) task.proposal = proposal;
+    if (dismiss?.length) task.proposedDismiss = { findingIds: dismiss, ...(reason && { reason }) };
     if (needs_input) {
       task.state = "needs_input";
       task.question = needs_input;
     }
     worker.nudged = false;
     this.log(task, `report: ${JSON.stringify(payload)}`);
+    if (outcome === "no_change") {
+      this.stop(task, worker, "done", summary || worker.lastText);
+      return task;
+    }
     this.save(task);
     return task;
   }
@@ -198,10 +203,50 @@ export class TaskRunner {
     return task;
   }
 
+  /** Put a `review` task aside for a combined PR (DESIGN "Staging and combined PRs"). */
+  stage(taskId: string): Task {
+    const task = this.require(taskId);
+    if (task.state !== "review" || (task.kind ?? "change") !== "change") throw new Error(`task ${taskId} is a ${task.kind ?? "change"} task in ${task.state}, not a change task in review`);
+    task.state = "staged";
+    task.stagedAt = new Date().toISOString();
+    this.save(task);
+    return task;
+  }
+
+  unstage(taskId: string): Task {
+    const task = this.require(taskId);
+    if (task.state !== "staged") throw new Error(`task ${taskId} is ${task.state}, not staged`);
+    task.state = "review";
+    task.stagedAt = undefined;
+    this.save(task);
+    return task;
+  }
+
+  /** Staged tasks now in bundle `bundleId`'s combined PR `pr`. */
+  bundled(taskIds: string[], bundleId: string, pr: number): void {
+    for (const id of taskIds) {
+      const task = this.require(id);
+      Object.assign(task, { state: "pr_open", pr, bundle: bundleId, stagedAt: undefined });
+      this.save(task);
+    }
+  }
+
+  /** A bundle's PR left the open list: merged → `done`, closed → back to `review`. */
+  bundleClosed(taskIds: string[], merged: boolean): void {
+    for (const id of taskIds) {
+      const task = this.tasks.get(id);
+      if (!task || task.state !== "pr_open") continue;
+      if (merged) task.state = "done";
+      else Object.assign(task, { state: "review", pr: undefined, bundle: undefined });
+      this.save(task);
+    }
+  }
+
   /** Respawn a `pr_open` task on its session with `prompt` (babysit), through the queue. */
   resumeTask(taskId: string, prompt: string): Task {
     const task = this.require(taskId);
     if (task.state !== "pr_open" || !task.worktree) throw new Error(`task ${taskId} is ${task.state}, not pr_open with a worktree`);
+    refuseBundled(task);
     this.resume(task, prompt);
     return task;
   }
@@ -219,11 +264,12 @@ export class TaskRunner {
       this.prompt(task, worker, text, "steer");
       return task;
     }
-    if (!RESUMABLE_BY_MESSAGE.includes(task.state))
+    if (!RESUMABLE_BY_MESSAGE.includes(task.state) && task.outcome !== "no_change")
       throw new Error(`task ${taskId} is ${task.state}${task.state === "running" ? " and its worker has not started yet" : ""}`);
+    refuseBundled(task);
     if (!task.worktree) throw new Error(`task ${taskId} has no worktree`);
     if (!this.hasSession(task)) throw new Error(`task ${taskId} has no pi session`);
-    task.error = undefined;
+    Object.assign(task, { error: undefined, outcome: undefined, summary: undefined });
     this.resume(task, text);
     return task;
   }
@@ -486,7 +532,7 @@ export class TaskRunner {
     if (record.type === "agent_settled" && worker.unacknowledgedPrompts === 0) {
       // A dialog blocks the agent, so settling proves pi already resolved it (e.g. by its timeout).
       if (worker.dialog) this.dropDialog(task, worker, "dialog resolved without an answer");
-      if (task.state === "running") void this.onSettled(task, worker);
+      if (task.state === "running") this.onSettled(task, worker).catch((err: Error) => this.log(task, `settle failed: ${err.message}`));
     }
   }
 
@@ -514,6 +560,13 @@ export class TaskRunner {
   private async onSettled(task: Task, worker: Worker): Promise<void> {
     if (checklistDone(task) && isReadOnly(task)) return this.stop(task, worker, task.kind === "scorer" ? "review" : "done");
     if (checklistDone(task)) {
+      if (task.pr === undefined) {
+        const promptsSent = worker.promptsSent;
+        const changed = await this.hasNetDiff(task).catch((err: Error) => err);
+        if (this.workers.get(task.id) !== worker || task.state !== "running" || worker.promptsSent !== promptsSent) return;
+        if (changed instanceof Error) return this.fail(task, `diff check failed: ${changed.message}`);
+        if (!changed) return this.stop(task, worker, "done", worker.lastText);
+      }
       const prStage = !task.manualReview || task.phase === "pr" || task.pr !== undefined;
       if (!prStage) return this.stop(task, worker, "review");
       const promptsSent = worker.promptsSent;
@@ -535,9 +588,13 @@ export class TaskRunner {
     this.save(task);
   }
 
-  private stop(task: Task, worker: Worker, state: "review" | "pr_open" | "done"): void {
+  /** Finish the task in `state`; a change task ending `done` has the `no_change` outcome and `summary`. */
+  private stop(task: Task, worker: Worker, state: "review" | "pr_open" | "done", summary?: string): void {
     task.state = state;
-    this.log(task, `state: ${state}`);
+    const noChange = state === "done" && !isReadOnly(task);
+    task.outcome = noChange ? "no_change" : undefined;
+    task.summary = noChange ? summary : undefined;
+    this.log(task, `state: ${state}${task.outcome ? ` (${task.outcome})` : ""}`);
     this.workers.delete(task.id);
     task.pid = undefined;
     this.save(task);
@@ -581,6 +638,11 @@ export class TaskRunner {
     });
   }
 
+  private async hasNetDiff(task: Task): Promise<boolean> {
+    const { stdout } = await promisify(execFile)("git", ["diff", "--name-only", `${this.baseSha()}...HEAD`], { cwd: task.worktree, maxBuffer: 64 * 1024 * 1024 });
+    return stdout.trim() !== "";
+  }
+
   private baseSha(): string {
     return git(this.opts.repoRoot, "rev-parse", this.opts.config.baseRef).trim();
   }
@@ -611,6 +673,11 @@ export class TaskRunner {
     appendFileSync(task.logPath!, lines.join("\n") + "\n");
     for (const line of lines) this.opts.onEvent?.({ type: "log", taskId: task.id, line });
   }
+}
+
+/** A bundled task's worktree holds only its own change; follow-up work belongs on the combined PR's branch. */
+function refuseBundled(task: Task): void {
+  if (task.state === "pr_open" && task.bundle) throw new Error(`task ${task.id} is part of combined PR #${task.pr}; work on that PR instead`);
 }
 
 function checklistDone(task: Task): boolean {
