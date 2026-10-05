@@ -70,9 +70,12 @@ export function layoutTree({ tree, shown, radius }: LayoutInput): Layout {
   const nodes: PlacedNode[] = [];
   const byId = new Map<NodeId, PlacedNode>();
   const edges: Layout["edges"] = [];
+  const halfWidths = new Map<NodeId, number>();
 
   function slot(placed: PlacedNode, label: number): number {
-    return 2 * Math.max(DECORATED_HALF_WIDTH * placed.r, label / 2) + NODE_GAP;
+    const half = Math.max(DECORATED_HALF_WIDTH * placed.r, label / 2);
+    halfWidths.set(placed.id, half);
+    return 2 * half + NODE_GAP;
   }
 
   function leaf(placed: PlacedNode, own: number, left: number): number {
@@ -114,9 +117,9 @@ export function layoutTree({ tree, shown, radius }: LayoutInput): Layout {
   place(tree.nodes[""], 0, 0);
   const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
   for (const n of nodes) {
-    bounds.minX = Math.min(bounds.minX, n.x - n.r);
+    bounds.minX = Math.min(bounds.minX, n.x - halfWidths.get(n.id)!);
     bounds.minY = Math.min(bounds.minY, n.y - n.r);
-    bounds.maxX = Math.max(bounds.maxX, n.x + n.r);
+    bounds.maxX = Math.max(bounds.maxX, n.x + halfWidths.get(n.id)!);
     bounds.maxY = Math.max(bounds.maxY, n.y + n.r + LABEL_HEIGHT);
   }
   return { nodes, byId, edges, bounds };
@@ -175,9 +178,17 @@ export function focusView({ tree, focus, order, overrides, attention, values, bu
     shown.set(id, kids);
     visible += revealed(id, kids);
   };
-  /** The `count` most valuable children, in sort order; all of them when only one would be left out. */
+  const toManual = withAncestors(tree, new Set([...overrides].filter(([, expanded]) => expanded).map(([id]) => id)));
+  const forced = (node: TreeNode) => toManual.has(node.id);
+  const openable = (node: TreeNode) => node.children.length > 0 && overrides.get(node.id) !== false;
+  /**
+   * The `count` most valuable children, in sort order; all of them when only one would be left out.
+   * Children leading to a manual expansion are always kept, so value changes never hide it.
+   */
   const best = (node: TreeNode, count: number) => {
-    const picked = new Set(sortedChildren(tree, node, byValue).slice(0, node.children.length === count + 1 ? count + 1 : count));
+    const ranked = sortedChildren(tree, node, byValue);
+    const picked = new Set(ranked.slice(0, ranked.length === count + 1 ? count + 1 : count));
+    for (const child of ranked) if (forced(child)) picked.add(child);
     return sortedChildren(tree, node, order).filter((n) => picked.has(n)).map((n) => n.id);
   };
 
@@ -197,29 +208,32 @@ export function focusView({ tree, focus, order, overrides, attention, values, bu
     contextNodes.push(...kids);
   }
 
-  const frontier: TreeNode[] = [];
+  let frontier: TreeNode[] = [];
+  let full = false;
+  const reach = (kids: NodeId[]) => {
+    for (const id of kids) if (openable(tree.nodes[id]) && (!full || forced(tree.nodes[id]))) frontier.push(tree.nodes[id]);
+  };
   const focusNode = tree.nodes[focus];
   const focusOverride = overrides.get(focus);
-  if (focusOverride !== false && focusNode.children.length > 0) {
+  if (openable(focusNode)) {
     open(focus, focusOverride ? sortedChildren(tree, focusNode, order).map((n) => n.id) : best(focusNode, MAX_FOCUS_CHILDREN));
-    frontier.push(...shown.get(focus)!.map((id) => tree.nodes[id]));
+    reach(shown.get(focus)!);
   }
   const automatic: NodeId[] = [];
-  let full = false;
   while (frontier.length > 0) {
     let top = 0;
     for (let i = 1; i < frontier.length; i++) if (byValue(frontier[i], frontier[top]) < 0) top = i;
     const [node] = frontier.splice(top, 1);
     const override = overrides.get(node.id);
-    if (node.children.length === 0 || override === false || (!override && full)) continue;
     const kids = override ? sortedChildren(tree, node, order).map((n) => n.id) : best(node, CHAIN_CHILDREN);
-    if (!override && visible + revealed(node.id, kids) > budget) {
+    if (!forced(node) && visible + revealed(node.id, kids) > budget) {
       full = true;
+      frontier = frontier.filter(forced);
       continue;
     }
     open(node.id, kids);
     if (!override) automatic.push(node.id);
-    frontier.push(...kids.map((id) => tree.nodes[id]));
+    reach(kids);
   }
   const leadsToManual = withAncestors(tree, new Set([...overrides].filter(([id, expanded]) => expanded && shown.has(id)).map(([id]) => id)));
   for (let i = automatic.length - 1; i >= 0 && visible > budget; i--) {

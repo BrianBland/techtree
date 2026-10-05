@@ -164,3 +164,12 @@ test("subtree value: the largest node value below, from attention, running work,
   assert.ok(stuck.get("a")! > stuck.get("c")!, "attention beats running work");
   assert.equal(stuck.get(""), stuck.get("a/b"));
 });
+
+test("subtree values ignore inherited properties of JSON-decoded state, e.g. a directory named constructor", () => {
+  const node = (id: string, parent: string | null, children: string[]) => ({ id, name: id || "repo", kind: "dir", parent, children, files: [] });
+  const tree: Tree = { repoRoot: "/r", nodes: { "": node("", null, ["constructor"]), constructor: node("constructor", "", ["constructor/deep"]), "constructor/deep": node("constructor/deep", "constructor", []) } };
+  const state = JSON.parse(JSON.stringify({ tree, scores: {}, tasks: [{ node: "constructor/deep", state: "review" }], prs: [], findingCounts: {} }));
+  const values = subtreeValues(state);
+  assert.equal(values.get("constructor"), 1_000_000);
+  assert.equal(values.get(""), 1_000_000);
+});

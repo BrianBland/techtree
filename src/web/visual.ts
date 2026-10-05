@@ -73,17 +73,18 @@ const FINDING_VALUE = 10;
 export function subtreeValues({ tree, scores, tasks, prs, findingCounts }: Pick<ApiState, "tree" | "scores" | "tasks" | "prs" | "findingCounts">): Map<NodeId, number> {
   const attention = attentionNodes(tasks, prs);
   const running = new Set(tasks.filter((t) => t.state === "running").map((t) => t.node));
-  const loc = (id: NodeId) => scores[id]?.metrics.loc?.raw ?? 0;
+  const score = (id: NodeId) => (Object.hasOwn(scores, id) ? scores[id] : undefined);
+  const loc = (id: NodeId) => score(id)?.metrics.loc?.raw ?? 0;
   const values = new Map<NodeId, number>();
   const visit = (id: NodeId): number => {
     const node = tree.nodes[id];
-    const quality = scores[id]?.quality;
+    const quality = score(id)?.quality;
     const ownLoc = Math.max(0, loc(id) - node.children.reduce((sum, child) => sum + loc(child), 0));
     let value =
       (attention.has(id) ? ATTENTION_VALUE : 0) +
       (running.has(id) ? RUNNING_VALUE : 0) +
       (quality === null || quality === undefined ? 0 : (100 - quality) * Math.sqrt(ownLoc)) +
-      FINDING_VALUE * (findingCounts[id] ?? 0);
+      FINDING_VALUE * (Object.hasOwn(findingCounts, id) ? findingCounts[id] : 0);
     for (const child of node.children) value = Math.max(value, visit(child));
     values.set(id, value);
     return value;

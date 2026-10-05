@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { DECORATED_HALF_WIDTH, focusView, labelName, labelWidth, layoutTree, siblingOrder, stubId, toggleOverride, type PlacedNode, type ShownChildren } from "../../src/web/layout.ts";
 import { subtreeValues } from "../../src/web/visual.ts";
+import { fitView } from "../../src/web/view.ts";
 import type { NodeId, Task, Tree, TreeNode } from "../../src/types.ts";
 
 function makeTree(paths: string[]): Tree {
@@ -248,6 +249,37 @@ test("manual expansions stay within the budget by undoing automatic ones, latest
   const manual = focusOn(deep, "", { overrides: toggleOverride(new Map(), grandchild, true, false) });
   assert.equal(manual.get(grandchild)?.length, 20, "a manual expansion under an automatic one keeps its parent open");
   assert.ok(visibleCount(deep, manual) <= 70, `${visibleCount(deep, manual)} visible`);
+});
+
+test("a manual expansion stays shown when subtree values change", () => {
+  const tree = makeTree(["a/w", "a/x/deep", "a/y", "a/z"]);
+  const overrides = toggleOverride(new Map(), "a/x", true, false);
+  const before = focusOn(tree, "", { overrides, values: hotSpots(tree, { "a/x/deep": 9 }) });
+  assert.deepEqual(before.get("a/x"), ["a/x/deep"]);
+  const after = focusOn(tree, "", { overrides, values: hotSpots(tree, { "a/y": 9, "a/z": 9 }) });
+  assert.ok(after.get("a")!.includes("a/x"), "the path to the manual expansion is kept");
+  assert.deepEqual(after.get("a/x"), ["a/x/deep"]);
+});
+
+test("a very wide manual expansion stays fast", () => {
+  const paths = Array.from({ length: 10_000 }, (_, i) => (i % 2 ? `a/leaf${i}` : `a/dir${i}/x`));
+  const tree = makeTree(paths);
+  const overrides = toggleOverride(new Map(), "a", true, false);
+  const start = performance.now();
+  const shown = focusOn(tree, "", { overrides });
+  const elapsed = performance.now() - start;
+  assert.equal(shown.get("a")!.length, 10_000);
+  assert.ok(elapsed < 150, `${Math.round(elapsed)} ms`);
+});
+
+test("fit keeps every label and badge inside the viewport", () => {
+  const tree = makeTree(["thirteen-chars", "thirteen-char2", "thirteen-char3"]);
+  const layout = layoutTree({ tree, shown: new Map([["", tree.nodes[""].children]]), radius: () => 12 });
+  const view = fitView(layout.bounds, 400, 600);
+  for (const n of layout.nodes) {
+    const half = Math.max(DECORATED_HALF_WIDTH * n.r, labelWidth(tree.nodes[n.id].name, tree.nodes[n.id].children.length > 0, 0) / 2);
+    assert.ok((n.x - half) * view.k + view.x >= 0 && (n.x + half) * view.k + view.x <= 400, `${n.id} clipped`);
+  }
 });
 
 test("siblings sort by name, by score (best first, missing last) or by weight (largest first)", () => {
