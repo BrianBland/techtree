@@ -45,3 +45,12 @@ export function researchBar(task: Task): { solid: number; progress: number; plan
 function round(x: number): number {
   return Math.round(x * 1e6) / 1e6;
 }
+
+/** SVG polyline points for a sparkline of 0..100 values; gaps (null) are skipped. */
+export function sparkline(values: (number | null)[], width: number, height: number): string {
+  const step = values.length > 1 ? width / (values.length - 1) : 0;
+  return values
+    .map((v, i) => (v === null ? null : `${round(i * step)},${round(height - (v / 100) * height)}`))
+    .filter((p) => p !== null)
+    .join(" ");
+}

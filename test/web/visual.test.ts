@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { NO_SCORE, ramp, researchBar, sqrtScale } from "../../src/web/visual.ts";
+import { NO_SCORE, ramp, researchBar, sparkline, sqrtScale } from "../../src/web/visual.ts";
 import { fitView, zoomAt } from "../../src/web/view.ts";
 import type { Task } from "../../src/types.ts";
 
@@ -72,4 +72,9 @@ test("zooming keeps the point under the cursor fixed and clamps the scale", () =
   assert.deepEqual([(110 - view.x) / view.k, (220 - view.y) / view.k], [(110 - zoomed.x) / zoomed.k, (220 - zoomed.y) / zoomed.k]);
   assert.equal(zoomAt(view, 0, 0, 1000).k, 8);
   assert.equal(zoomAt(view, 0, 0, 0.0001).k, 0.05);
+});
+
+test("sparklines map 0..100 onto the box, top is best, gaps are skipped", () => {
+  assert.equal(sparkline([0, 50, null, 100], 30, 10), "0,10 10,5 30,0");
+  assert.equal(sparkline([], 30, 10), "");
 });
