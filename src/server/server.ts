@@ -132,6 +132,7 @@ function apiRoutes(backend: Backend): Route[] {
     get(/^\/api\/overview$/, () => backend.getOverview()),
     get(/^\/api\/tasks\/([^/]+)\/log$/, (_req, url, [id]) => backend.taskLog(id, tailParam(url))),
     get(/^\/api\/tasks\/([^/]+)\/diff$/, (_req, _url, [id]) => backend.taskDiff(id)),
+    get(/^\/api\/models$/, () => backend.models()),
     post(/^\/api\/tasks$/, async (req) => backend.startTask(startTaskRequest(await readJson(req)))),
     post(/^\/api\/tasks\/([^/]+)\/answer$/, async (req, _url, [id]) => {
       const { text } = await readJson(req);
@@ -216,16 +217,24 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
-  const { node, findingIds, title, prompt, manualReview } = body;
+  const { node, findingIds, title, prompt, manualReview, model } = body;
   const valid =
     typeof node === "string" &&
     Array.isArray(findingIds) &&
     findingIds.every((id) => typeof id === "string") &&
     typeof manualReview === "boolean" &&
     (title === undefined || typeof title === "string") &&
-    (prompt === undefined || typeof prompt === "string");
+    (prompt === undefined || typeof prompt === "string") &&
+    (model === undefined || typeof model === "string");
   if (!valid) throw new HttpError(400, "body must be a StartTaskRequest");
-  return { node, findingIds, manualReview, ...(title === undefined ? {} : { title }), ...(prompt === undefined ? {} : { prompt }) };
+  return {
+    node,
+    findingIds,
+    manualReview,
+    ...(title === undefined ? {} : { title }),
+    ...(prompt === undefined ? {} : { prompt }),
+    ...(model ? { model } : {}),
+  };
 }
 
 function workerReport(body: Record<string, unknown>): WorkerReport {

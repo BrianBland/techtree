@@ -1,21 +1,21 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
 import { openDb, suppressSqliteWarning } from "../../src/db.ts";
 import { HttpError } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
-import type { ServerEvent, Task } from "../../src/types.ts";
+import type { Config, ServerEvent, Task } from "../../src/types.ts";
 import { FAKE_PI, TODO_FILE, fixture, until } from "./helpers.ts";
 
 suppressSqliteWarning();
 
-async function boot(t: TestContext, repo: string, cache: string, tmp: string, piCommand = [process.execPath, FAKE_PI]) {
+async function boot(t: TestContext, repo: string, cache: string, tmp: string, piCommand = [process.execPath, FAKE_PI], extra: Partial<Config> = {}) {
   mkdirSync(cache, { recursive: true });
-  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand });
+  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand, ...extra });
   const backend = new RepoBackend({ db: openDb(cache), repoRoot: repo, cacheDir: cache, config, log: () => {} });
   const events: ServerEvent[] = [];
   backend.subscribe((e) => events.push(e));
@@ -205,3 +205,44 @@ function isAlive(pid: number): boolean {
     return false;
   }
 }
+
+/** A pi command that logs each run to `runs` and fails while `broken` exists. */
+function countingPi(tmp: string): { command: string[]; runs: () => number; broken: string } {
+  const runs = join(tmp, "pi-runs");
+  const broken = join(tmp, "pi-broken");
+  const script = join(tmp, "pi.sh");
+  writeFileSync(script, `#!/bin/sh\necho run >> "${runs}"\n[ -e "${broken}" ] && exit 1\nexec "${process.execPath}" "${FAKE_PI}" "$@"\n`);
+  chmodSync(script, 0o755);
+  return { command: [script], runs: () => (existsSync(runs) ? readFileSync(runs, "utf8").split("\n").length - 1 : 0), broken };
+}
+
+test("models come from pi --list-models, cached; a failed listing is empty and retried", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  const pi = countingPi(tmp);
+  writeFileSync(pi.broken, "");
+  const { backend } = await boot(t, repo, cache, tmp, pi.command);
+  assert.deepEqual(await backend.models(), { default: null, models: [] });
+  assert.deepEqual((await backend.models()).models, []);
+  assert.equal(pi.runs(), 2, "failures are not cached");
+
+  execFileSync("rm", [pi.broken]);
+  assert.deepEqual((await backend.models()).models, ["fake/alpha", "fake/beta"]);
+  assert.deepEqual((await backend.models()).models, ["fake/alpha", "fake/beta"]);
+  assert.equal(pi.runs(), 3, "a good listing is cached");
+});
+
+test("the default model is config.defaultModel, else the last model a task used, else null", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  const { backend } = await boot(t, repo, cache, tmp);
+  assert.equal((await backend.models()).default, null);
+  const first = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true, model: "fake/alpha" });
+  const second = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true, model: "fake/beta" });
+  await backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true });
+  assert.equal((await backend.models()).default, "fake/beta");
+  for (const task of [first, second]) await backend.cancel(task.id);
+
+  const other = fixture(t);
+  const configured = await boot(t, other.repo, other.cache, other.tmp, undefined, { defaultModel: "fake/alpha" });
+  await configured.backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true, model: "fake/beta" });
+  assert.equal((await configured.backend.models()).default, "fake/alpha");
+});

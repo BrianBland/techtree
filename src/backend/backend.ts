@@ -11,11 +11,13 @@ import { dbCache, type Db } from "../db.ts";
 import { repoId } from "../paths.ts";
 import { defaultPlugins } from "../plugins/index.ts";
 import { llmScanPlugin, scanCoverage, scanNode } from "../plugins/llm-scan.ts";
+import { listModels } from "./models.ts";
 import { Babysitter } from "../prs/babysit.ts";
 import { PrPoller } from "../prs/poller.ts";
 import { TaskRunner } from "../runner/runner.ts";
 import { HttpError, type Backend, type WorkerReport } from "../server/backend.ts";
 import type {
+  ApiModels,
   ApiNode,
   ApiOverview,
   ApiState,
@@ -64,6 +66,7 @@ export interface RepoBackendOptions {
 const OVERVIEW_SUGGESTIONS = 8;
 const LIVE_STATES: Task["state"][] = ["queued", "running", "needs_input"];
 const RESULT_KEY = ["backend", "result"] as const;
+const MODELS_TTL_MS = 10 * 60_000;
 
 /** The real `Backend`: scorer, store, task runner, LLM scan and PR source. See docs/DESIGN.md "Backend". */
 export class RepoBackend implements Backend {
@@ -81,6 +84,7 @@ export class RepoBackend implements Backend {
   private scoring?: Promise<void>;
   private rescoreQueued = false;
   private scoreError?: string;
+  private modelList?: { at: number; models: Promise<string[]> };
 
   constructor(opts: RepoBackendOptions) {
     this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, pollPrs: false, log: (msg) => console.error(msg), ...opts };
@@ -207,6 +211,20 @@ export class RepoBackend implements Backend {
 
   async taskDiff(taskId: string): Promise<string> {
     return this.runnerCall(() => this.runner().diff(taskId));
+  }
+
+  /** pi's models (cached; a failed or empty listing is retried next time) and the start-dialog default. */
+  async models(): Promise<ApiModels> {
+    const { config } = this.opts;
+    const lastUsed = this.runner().list().findLast((t) => t.model)?.model;
+    if (!this.modelList || Date.now() - this.modelList.at > MODELS_TTL_MS) {
+      const entry = { at: Date.now(), models: listModels(config.piCommand) };
+      this.modelList = entry;
+      void entry.models.then((models) => {
+        if (!models.length && this.modelList === entry) this.modelList = undefined;
+      });
+    }
+    return { default: config.defaultModel || lastUsed || null, models: await this.modelList.models };
   }
 
   async startTask(req: StartTaskRequest): Promise<Task> {

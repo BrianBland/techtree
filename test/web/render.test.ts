@@ -47,6 +47,15 @@ test("switching score, weight or sort re-renders ~1000 visible nodes in under 20
   assert.ok(timings.switchSort < 200, `sort switch ${timings.switchSort} ms`);
 });
 
+test("changing focus on a ~600-node workspace-shaped tree re-renders in under 200 ms within the node budget", { timeout: 30_000 }, async (t) => {
+  const { focusBench } = await importTsx<typeof import("./render-bench.tsx")>("./render-bench.tsx");
+  const timings = focusBench(600);
+  t.diagnostic(JSON.stringify({ ...timings, switchFocus: Math.round(timings.switchFocus * 10) / 10 }));
+  assert.ok(timings.nodes >= 600, `${timings.nodes} nodes`);
+  assert.ok(timings.maxVisible <= 150, `${timings.maxVisible} visible`);
+  assert.ok(timings.switchFocus < 200, `focus switch ${timings.switchFocus} ms`);
+});
+
 test("decorated sibling tiles never paint over each other", { timeout: 30_000 }, async () => {
   const { decoratedSiblingBoxes } = await importTsx<typeof import("./tile-boxes.tsx")>("./tile-boxes.tsx");
   const boxes = decoratedSiblingBoxes(3).filter((b) => b.node !== "repo");
@@ -54,11 +63,18 @@ test("decorated sibling tiles never paint over each other", { timeout: 30_000 },
     const own = boxes.filter((b) => b.node === node);
     return { top: Math.min(...own.map((b) => b.top)), bottom: Math.max(...own.map((b) => b.bottom)) };
   };
-  assert.ok(boxes.some((b) => b.cls === "alarm") && boxes.some((b) => b.cls === "ring"), "decorations rendered");
+  assert.ok(boxes.some((b) => b.cls === "glow") && boxes.some((b) => b.cls === "ring"), "decorations rendered");
   const [a, b, c] = ["n0", "n1", "n2"].map(extent);
-  // Rings and alarms are stroked 2 units wide, half of it outside their box.
+  // Rings and glows are stroked 2 units wide, half of it outside their box.
   assert.ok(a.bottom + 1 < b.top - 1, `n0 ${JSON.stringify(a)} overlaps n1 ${JSON.stringify(b)}`);
   assert.ok(b.bottom + 1 < c.top - 1, `n1 ${JSON.stringify(b)} overlaps n2 ${JSON.stringify(c)}`);
+});
+
+test("only nodes that need you glow; worst scores stand out by colour alone", { timeout: 30_000 }, async () => {
+  const { decoratedSiblingBoxes } = await importTsx<typeof import("./tile-boxes.tsx")>("./tile-boxes.tsx");
+  const boxes = decoratedSiblingBoxes(3, new Set(["n1"]));
+  assert.deepEqual(boxes.filter((b) => b.cls === "glow").map((b) => b.node), ["n1"]);
+  assert.ok(!boxes.some((b) => ["alarm", "shimmer"].includes(b.cls)), "no score-driven motion");
 });
 
 const TODOS = "fn a() {}\n// TODO one\n// TODO two\n// TODO three\n";
@@ -108,6 +124,7 @@ function delegate(real: Backend): Backend {
     getOverview: () => real.getOverview(),
     taskLog: (id, tail) => real.taskLog(id, tail),
     taskDiff: (id) => real.taskDiff(id),
+    models: () => real.models(),
     startTask: (req) => real.startTask(req),
     answer: (id, text) => real.answer(id, text),
     openPr: (id) => real.openPr(id),
@@ -195,9 +212,18 @@ test("the UI boots against the server and repo backend, opens nodes and answers 
   await app.waitFor(() => startButtons().length > 0, "suggestions with Start buttons");
   startButtons()[0].dispatch("click");
   await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
+  const options = () => byClass("dialog")[0].querySelectorAll((n) => n.localName === "option").map((n) => n.textContent);
+  await app.waitFor(() => options().includes("fake/beta"), "models from pi in the start dialog");
+  assert.deepEqual(options(), ["pi default", "fake/alpha", "fake/beta"]);
+  const picker = byClass("dialog")[0].querySelectorAll((n) => n.localName === "select")[0] as unknown as { value: string; dispatch(t: string): void };
+  picker.value = "fake/beta";
+  picker.dispatch("change");
+  await new Promise((r) => setTimeout(r, 0)); // let Preact re-render with the picked model before submitting
   byClass("dialog")[0].dispatch("submit");
   await app.waitFor(() => byClass("dialog").length === 0, "dialog to close");
-  assert.equal((await backend.getState()).tasks.length, before + 1);
+  const { tasks } = await backend.getState();
+  assert.equal(tasks.length, before + 1);
+  assert.equal(tasks.at(-1)!.model, "fake/beta");
 });
 
 test("the node panel lists its own calls to action, then its children's, which select their node", UI_TIMEOUT, async (t) => {

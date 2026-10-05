@@ -1,4 +1,4 @@
-import type { MetricDef, NodeId, NodeScore, Task, TaskPhase } from "../types.ts";
+import type { MetricDef, NodeId, NodeScore, PrState, Task, TaskPhase } from "../types.ts";
 
 export const NO_SCORE = "hsl(228 10% 42%)";
 /** The selected-score key meaning the composite quality rather than one metric. */
@@ -54,11 +54,12 @@ function rampColor(t: number): string {
   return `hsl(${(mix(h0, h1) + 360) % 360} ${mix(s0, s1)}% ${mix(l0, l1)}%)`;
 }
 
-/** Whether a score is in the bottom decile: at or below the ⌈n/10⌉-th lowest of the n scored values. */
-export function bottomDecile(values: (number | null)[]): (value: number | null) => boolean {
-  const scored = values.filter((v) => v !== null).sort((a, b) => a - b);
-  const threshold = scored.length ? scored[Math.ceil(scored.length / 10) - 1] : -Infinity;
-  return (value) => value !== null && value <= threshold;
+/** Nodes that need you: a task in `needs_input` or `review`, or a failing, stuck or stale PR. */
+export function attentionNodes(tasks: Task[], prs: PrState[]): Set<NodeId> {
+  return new Set([
+    ...tasks.filter((t) => t.state === "needs_input" || t.state === "review").map((t) => t.node),
+    ...prs.filter((p) => p.ci === "fail" || p.stuck || p.stale).map((p) => p.node),
+  ]);
 }
 
 /** Metric keys shown as stat pips: weighted quality metrics, heaviest first. */
@@ -116,8 +117,6 @@ export function sparkline(values: (number | null)[], width: number, height: numb
 /** What a tree tile shows at a glance. */
 export interface TileLook {
   fill: string;
-  worst: boolean;
-  hot: boolean;
   /** Stat pip colours by percentile, null where the node lacks the metric. */
   pips: (string | null)[];
   /** Composite quality for the XP bar. */
@@ -129,23 +128,17 @@ export interface TileLookInput {
   scores: Record<NodeId, NodeScore>;
   scoreKey: string;
   statKeys: string[];
-  hot: ReadonlySet<NodeId>;
   findingCounts: Record<NodeId, number>;
 }
 
-/** Tile looks for the selected score: fill and bottom decile over the repo's range, pips on a fixed 0..100 ramp. */
-export function tileLooks({ scores, scoreKey, statKeys, hot, findingCounts }: TileLookInput): (id: NodeId) => TileLook {
-  const values = Object.values(scores).map((s) => scoreValue(s, scoreKey));
-  const fill = ramp(values);
-  const worst = bottomDecile(values);
+/** Tile looks for the selected score: fill over the repo's range, pips on a fixed 0..100 ramp. */
+export function tileLooks({ scores, scoreKey, statKeys, findingCounts }: TileLookInput): (id: NodeId) => TileLook {
+  const fill = ramp(Object.values(scores).map((s) => scoreValue(s, scoreKey)));
   const pip = ramp([0, 100]);
   return (id) => {
     const score = scores[id];
-    const value = scoreValue(score, scoreKey);
     return {
-      fill: fill(value),
-      worst: worst(value),
-      hot: hot.has(id),
+      fill: fill(scoreValue(score, scoreKey)),
       pips: statKeys.map((key) => {
         const pct = score?.metrics[key]?.pct;
         return pct === undefined || pct === null ? null : pip(pct);

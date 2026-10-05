@@ -1,4 +1,5 @@
 import type {
+  ApiModels,
   ApiNode,
   ApiOverview,
   ApiState,
@@ -28,6 +29,7 @@ export interface Backend {
   getOverview(): Promise<ApiOverview>;
   taskLog(taskId: string, tail: number): Promise<string>;
   taskDiff(taskId: string): Promise<string>;
+  models(): Promise<ApiModels>;
   startTask(req: StartTaskRequest): Promise<Task>;
   answer(taskId: string, text: string): Promise<Task>;
   openPr(taskId: string): Promise<Task>;

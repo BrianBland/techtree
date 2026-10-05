@@ -2,9 +2,8 @@ import { render } from "preact";
 import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { ApiState, Finding, NodeId, Suggestion } from "../types.ts";
 import { get, onReconnect, onServerEvent, post } from "./api.ts";
-import { initialExpanded, layoutTree, siblingOrder, toggled, type SortKey } from "./layout.ts";
-import { hotNodes } from "../core/hot.ts";
-import { COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, tileLooks, tileSize } from "./visual.ts";
+import { focusView, layoutTree, siblingOrder, stubId, toggleOverride, type Overrides, type SortKey } from "./layout.ts";
+import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
 import { NodePanel, StartDialog } from "./Panel.tsx";
 import { Overview } from "./Overview.tsx";
@@ -57,7 +56,9 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const [scoreKey, setScoreKey] = useState(COMPOSITE);
   const [weightKey, setWeightKey] = useState("loc");
   const [sortKey, setSortKey] = useState<SortKey>("name");
-  const [selected, setSelected] = useState<NodeId | null>(null);
+  const [focus, setFocus] = useState<NodeId>(() => initialFocus(state));
+  const [selected, setSelected] = useState<NodeId | null>(focus || null);
+  const [overrides, setOverrides] = useState<Overrides>(new Map());
   const [fitRequest, setFitRequest] = useState(0);
   const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[] } | null>(null);
   const { tree, scores, metricDefs } = state;
@@ -76,14 +77,22 @@ function Main({ state, version, error, notice, setError }: MainProps) {
 
   const sortBasis = sortKey === "score" ? scoreOf : sortKey === "weight" ? weightOf : null;
   const order = useMemo(() => siblingOrder(sortKey, scoreOf, weightOf), [sortKey, sortBasis]);
-  const [expanded, setExpanded] = useState(() => initialExpanded(tree, order));
-  const layout = useMemo(() => layoutTree({ tree, expanded, radius, order }), [tree, expanded, radius, order]);
+  const attention = useMemo(() => attentionNodes(state.tasks, state.prs), [state.tasks, state.prs]);
+  const liveFocus = Object.hasOwn(tree.nodes, focus) ? focus : "";
+  const shown = useMemo(
+    () => focusView({ tree, focus: liveFocus, order, overrides, attention }),
+    [tree, liveFocus, order, overrides, attention],
+  );
+  const layout = useMemo(() => layoutTree({ tree, shown, radius }), [tree, shown, radius]);
+
+  useEffect(() => {
+    globalThis.history?.replaceState(null, "", liveFocus ? `?focus=${encodeURIComponent(liveFocus)}` : location.pathname);
+  }, [liveFocus]);
 
   const statKeys = useMemo(() => statMetrics(metricDefs, state.weights), [metricDefs, state.weights]);
-  const hot = useMemo(() => hotNodes(tree, scores), [tree, scores]);
   const look = useMemo(
-    () => tileLooks({ scores, scoreKey, statKeys, hot, findingCounts: state.findingCounts }),
-    [scores, scoreKey, statKeys, hot, state.findingCounts],
+    () => tileLooks({ scores, scoreKey, statKeys, findingCounts: state.findingCounts }),
+    [scores, scoreKey, statKeys, state.findingCounts],
   );
   const previousScores = useRef(scores);
   const deltas = useMemo(() => {
@@ -98,12 +107,15 @@ function Main({ state, version, error, notice, setError }: MainProps) {
 
   const select = (id: NodeId | null) => {
     setSelected(id);
-    if (id === null) return;
-    const ancestors = new Set(expanded);
-    for (let p = tree.nodes[id]?.parent; p != null; p = tree.nodes[p].parent) ancestors.add(p);
-    if (ancestors.size !== expanded.size) setExpanded(ancestors);
+    if (id === null || !Object.hasOwn(tree.nodes, id)) return;
+    setFocus(id);
+    setOverrides(new Map());
+    setFitRequest((n) => n + 1);
   };
-  const onToggle = useCallback((id: NodeId) => setExpanded((e) => toggled(e, id)), []);
+  const onToggle = (id: NodeId) => {
+    const hiding = (layout.byId.get(id)?.hiddenChildren ?? 0) > 0 || layout.byId.has(stubId(id));
+    setOverrides((o) => toggleOverride(o, id, hiding, isAncestor(tree, id, liveFocus)));
+  };
   const scoreChoices = metricDefs.filter((d) => d.direction !== "neutral");
   const weightChoices = metricDefs.filter((d) => d.aggregate === "sum" || d.aggregate === "max");
 
@@ -162,6 +174,7 @@ function Main({ state, version, error, notice, setError }: MainProps) {
           compositeColor={compositeColor}
           tasks={state.tasks}
           prs={state.prs}
+          attention={attention}
           selected={selected}
           fitRequest={fitRequest}
           onSelect={select}
@@ -184,6 +197,17 @@ function Main({ state, version, error, notice, setError }: MainProps) {
       {starting && <StartDialog {...starting} onClose={() => setStarting(null)} onError={setError} />}
     </div>
   );
+}
+
+/** The node named by the page's `?focus=` parameter, or the root. */
+function initialFocus(state: ApiState): NodeId {
+  const id = new URLSearchParams(globalThis.location?.search).get("focus");
+  return id !== null && Object.hasOwn(state.tree.nodes, id) ? id : "";
+}
+
+function isAncestor(tree: ApiState["tree"], id: NodeId, of: NodeId): boolean {
+  for (let p = tree.nodes[of]?.parent ?? null; p !== null; p = tree.nodes[p].parent) if (p === id) return true;
+  return false;
 }
 
 function upsert<T>(items: T[], item: T, key: (item: T) => string | number): T[] {

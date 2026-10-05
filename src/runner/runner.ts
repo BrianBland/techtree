@@ -96,6 +96,7 @@ export class TaskRunner {
       state: "queued",
       ...(req.pr !== undefined && { pr: req.pr }),
       manualReview: req.manualReview,
+      ...(req.model && { model: req.model }),
       plannedFrom: req.plannedFrom,
       plannedTo: req.plannedTo,
       checklist: [],
@@ -319,6 +320,7 @@ export class TaskRunner {
       "-e", join(this.packageRoot, "extensions"),
       "--skill", join(this.packageRoot, "skills", "techtree-worker"),
       "--skill", join(this.packageRoot, "skills", "techtree-babysit"),
+      ...(task.model ? ["--model", task.model] : []),
     ];
     const child = spawn(command, args, {
       cwd: task.worktree,

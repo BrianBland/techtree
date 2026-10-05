@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { ApiNode, ApiState, Cta, Finding, NodeId, PrState, Suggestion, Task } from "../types.ts";
+import type { ApiModels, ApiNode, ApiState, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task } from "../types.ts";
 import { get, onServerEvent, post } from "./api.ts";
 import { sparkline, taskCompletion } from "./visual.ts";
 
@@ -302,6 +302,7 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
             <span class={`state ${task.state}`}>{task.state.replace("_", " ")}</span> · {task.phase} ·{" "}
             {Math.round(taskCompletion(task) * 100)}% · {fmt(task.plannedFrom)} → {fmt(task.plannedTo)}
             {task.manualReview ? " · manual review" : ""}
+            {task.model ? ` · ${task.model}` : ""}
             {task.pr ? ` · PR #${task.pr}` : ""}
           </div>
         </div>
@@ -344,9 +345,21 @@ export function StartDialog({
   const [title, setTitle] = useState(suggestion.title);
   const [prompt, setPrompt] = useState(defaultPrompt(suggestion, findings));
   const [manualReview, setManualReview] = useState(suggestion.manualReview);
+  const [models, setModels] = useState<string[]>([]);
+  const [model, setModel] = useState("");
+  useEffect(() => {
+    get<ApiModels>("/api/models").then(
+      (m) => {
+        setModels(m.models);
+        setModel((current) => current || (m.default ?? ""));
+      },
+      (err: Error) => onError(err.message),
+    );
+  }, []);
   const submit = (e: Event) => {
     e.preventDefault();
-    post<Task>("/api/tasks", { node: suggestion.node, findingIds: suggestion.findingIds, title, prompt, manualReview }).then(
+    const request: StartTaskRequest = { node: suggestion.node, findingIds: suggestion.findingIds, title, prompt, manualReview, ...(model && { model }) };
+    post<Task>("/api/tasks", request).then(
       onClose,
       (err: Error) => onError(err.message),
     );
@@ -362,6 +375,18 @@ export function StartDialog({
         <label>
           Prompt
           <textarea rows={10} value={prompt} onInput={(e) => setPrompt((e.currentTarget as HTMLTextAreaElement).value)} />
+        </label>
+        <label>
+          Model
+          <select value={model} onChange={(e) => setModel((e.currentTarget as HTMLSelectElement).value)}>
+            <option value="">pi default</option>
+            {model && !models.includes(model) && <option value={model}>{model}</option>}
+            {models.map((m) => (
+              <option key={m} value={m}>
+                {m}
+              </option>
+            ))}
+          </select>
         </label>
         <label class="inline">
           <input type="checkbox" checked={manualReview} onChange={(e) => setManualReview((e.currentTarget as HTMLInputElement).checked)} />

@@ -179,6 +179,21 @@ test("manual review: plan, phase and done updates end in review with a diff; ope
   assert.equal(pr.phase, "pr");
 });
 
+test("a task's model is persisted and passed to pi on every spawn, including the Open PR respawn", async (t) => {
+  const h = await setup(t);
+  const { id, model } = h.runner.start({ ...req("happy"), model: "fake/beta" });
+  assert.equal(model, "fake/beta");
+  await h.waitFor(id, (x) => x.state === "review");
+  h.runner.openPr(id);
+  const task = await h.waitFor(id, (x) => x.state === "pr_open");
+  assert.equal(log(task).match(/stderr: model: fake\/beta/g)?.length, 2);
+  const row = h.db.prepare("SELECT data FROM tasks WHERE id = ?").get(id) as { data: string };
+  assert.equal((JSON.parse(row.data) as Task).model, "fake/beta");
+
+  const plain = h.runner.start(req("happy"));
+  assert.doesNotMatch(log(await h.waitFor(plain.id, (x) => x.state === "review")), /model:/);
+});
+
 test("without manual review the worker opens the PR in one go", async (t) => {
   const h = await setup(t);
   const { id } = h.runner.start(req("auto", false));

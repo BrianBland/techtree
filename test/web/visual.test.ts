@@ -1,8 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { COMPOSITE, NO_SCORE, bottomDecile, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, tileLooks, tileSize } from "../../src/web/visual.ts";
+import { COMPOSITE, NO_SCORE, attentionNodes, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, tileLooks, tileSize } from "../../src/web/visual.ts";
 import { fitView, zoomAt } from "../../src/web/view.ts";
-import type { MetricDef, NodeScore, Task } from "../../src/types.ts";
+import type { MetricDef, NodeScore, PrState, Task } from "../../src/types.ts";
 
 const hsl = (color: string) => {
   const [h, s, l] = /^hsl\((\d+) (\d+)% (\d+)%\)$/.exec(color)!.slice(1).map(Number);
@@ -46,13 +46,12 @@ test("diverging ramp: the worst scores are saturated red, the best cool teal-gre
   assert.equal(ramp([])(50), ramp([0, 100])(50));
 });
 
-test("the bottom decile is the ceil(n/10) lowest scored nodes, ties included", () => {
-  const values = [5, 50, 60, 70, 80, 90, 95, 99, 100, 100, 12, null];
-  const worst = bottomDecile(values);
-  assert.deepEqual(values.filter(worst), [5, 12]);
-  assert.equal(worst(null), false);
-  assert.deepEqual([1, 1, 9].filter(bottomDecile([1, 1, 9])), [1, 1]);
-  assert.equal(bottomDecile([null])(0), false);
+test("attention nodes are those with a task needing input or review, or a failing, stuck or stale PR; never a bad score", () => {
+  const task = (node: string, state: Task["state"]) => ({ node, state }) as Task;
+  const pr = (node: string, flags: Partial<PrState>) => ({ node, ci: "pass", stuck: false, stale: false, ...flags }) as PrState;
+  const tasks = [task("ask", "needs_input"), task("rev", "review"), task("run", "running"), task("q", "queued"), task("old", "failed")];
+  const prs = [pr("red", { ci: "fail" }), pr("stuck", { stuck: true }), pr("stale", { stale: true }), pr("ok", {}), pr("wait", { ci: "pending" })];
+  assert.deepEqual([...attentionNodes(tasks, prs)].sort(), ["ask", "red", "rev", "stale", "stuck"]);
 });
 
 test("stat pips are the weighted quality metrics, heaviest first, at most eight", () => {
@@ -130,21 +129,18 @@ test("tile looks colour pips by absolute percentile and leave missing metrics em
     metrics: Object.fromEntries(Object.entries(metrics).map(([k, pct]) => [k, { raw: 0, value: 0, pct }])),
   });
   const scores = { a: score(90, { x: 0, y: 100 }), b: score(91, { x: 100 }), c: score(92, { x: null }) };
-  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x", "y"], hot: new Set(["b"]), findingCounts: { a: 3 } });
+  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x", "y"], findingCounts: { a: 3 } });
   assert.deepEqual(look("a").pips, [ramp([0, 100])(0), ramp([0, 100])(100)]);
   assert.deepEqual(look("b").pips, [ramp([0, 100])(100), null]);
   assert.deepEqual(look("c").pips, [null, null]);
   assert.equal(look("a").fill, ramp([90, 92])(90));
-  assert.deepEqual([look("a").worst, look("b").worst], [true, false]);
-  assert.deepEqual([look("a").hot, look("b").hot], [false, true]);
   assert.deepEqual([look("a").findings, look("b").findings, look("a").xp], [3, 0, 90]);
 });
 
 test("tile looks tolerate unscored nodes and nodes missing from the scores", () => {
   const scores: Record<string, NodeScore> = { a: { node: "a", quality: null, metrics: {} }, b: { node: "b", quality: 70, metrics: {} } };
-  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x"], hot: new Set(), findingCounts: {} });
+  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x"], findingCounts: {} });
   for (const id of ["a", "missing"]) {
-    assert.deepEqual(look(id), { fill: NO_SCORE, worst: false, hot: false, pips: [null], xp: null, findings: 0 });
+    assert.deepEqual(look(id), { fill: NO_SCORE, pips: [null], xp: null, findings: 0 });
   }
-  assert.equal(look("b").worst, true);
 });

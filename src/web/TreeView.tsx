@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "preact/hooks";
 import type { NodeId, PrState, Task, Tree } from "../types.ts";
-import type { Layout, PlacedNode } from "./layout.ts";
+import { stubId, type Layout, type PlacedNode } from "./layout.ts";
 import { researchBar, type TileLook } from "./visual.ts";
 import { fitView, zoomAt, type View } from "./view.ts";
 
@@ -13,10 +13,12 @@ export interface TreeViewProps {
   compositeColor: (score: number) => string;
   tasks: Task[];
   prs: PrState[];
+  /** Nodes that need you: they glow and pulse. */
+  attention: ReadonlySet<NodeId>;
   /** Selected-score changes from the latest rescore; a new map replays the flash. */
   deltas: ReadonlyMap<NodeId, number>;
   selected: NodeId | null;
-  /** Incremented to request fit-to-view. */
+  /** Incremented to request fit-to-view; the view glides to the new fit. */
   fitRequest: number;
   onSelect(id: NodeId): void;
   onToggle(id: NodeId): void;
@@ -27,34 +29,38 @@ const SPRITE = 16;
 const BAR = { x: 2, y: 12, width: 12, height: 2 };
 /**
  * Decorations stay inside the tile's layout band (side + NODE_GAP): badges sit beside the tile
- * rather than above or below it, and the alarm/selection rings hug the tile in world units.
+ * rather than above or below it, and the attention/selection rings hug the tile in world units.
  */
 const BADGE = 7;
 const BADGE_OUTSET = 5;
 const RING_GAP = 3;
 const ELBOW = 20;
+const STUB_EDGE_WIDTH = 2;
 const DRAG_THRESHOLD = 3;
 const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 let flashGeneration = 0;
 
 export function TreeView(props: TreeViewProps) {
-  const { tree, layout, look, edgeWidth, compositeColor, tasks, prs, deltas, selected, fitRequest, onSelect, onToggle } = props;
+  const { tree, layout, look, edgeWidth, compositeColor, tasks, prs, attention, deltas, selected, fitRequest, onSelect, onToggle } = props;
   const svg = useRef<SVGSVGElement>(null);
   const world = useRef<SVGGElement>(null);
   const view = useRef<View>({ x: 0, y: 0, k: 1 });
   const drag = useRef<{ x: number; y: number; moved: boolean } | null>(null);
   const suppressClick = useRef(false);
 
-  const apply = (next: View) => {
+  const apply = (next: View, glide = false) => {
     view.current = next;
-    world.current?.setAttribute("transform", `translate(${next.x},${next.y}) scale(${next.k})`);
+    const style = world.current?.style;
+    if (!style) return;
+    style.transition = glide && !reducedMotion ? "transform 0.35s ease" : "none";
+    style.transform = `translate(${next.x}px,${next.y}px) scale(${next.k})`;
   };
 
   const fitted = useRef(false);
   useEffect(() => {
     const el = svg.current;
     if (el && el.clientWidth > 0) {
-      apply(fitView(layout.bounds, el.clientWidth, el.clientHeight));
+      apply(fitView(layout.bounds, el.clientWidth, el.clientHeight), fitted.current);
       fitted.current = true;
     }
   }, [fitRequest]);
@@ -108,7 +114,7 @@ export function TreeView(props: TreeViewProps) {
       layout.edges.map(([p, c]) => {
         const end = Math.round(c.x - c.r);
         const d = `M${Math.round(p.x + p.r)} ${Math.round(p.y)}H${end - ELBOW}V${Math.round(c.y)}H${end}`;
-        return <path key={c.id} d={d} style={{ d: `path("${d}")` }} stroke-width={edgeWidth(c.id)} />;
+        return <path key={c.id} d={d} style={{ d: `path("${d}")` }} stroke-width={c.stubOf === undefined ? edgeWidth(c.id) : STUB_EDGE_WIDTH} />;
       }),
     [layout, edgeWidth],
   );
@@ -131,6 +137,7 @@ export function TreeView(props: TreeViewProps) {
       <g ref={world}>
         <g class="edges">{edges}</g>
         {layout.nodes.map((n) => {
+          if (n.stubOf !== undefined) return <Stub key={n.id} node={n} onSelect={click(() => onSelect(n.stubOf!))} />;
           const node = tree.nodes[n.id];
           return (
             <Tile
@@ -139,11 +146,13 @@ export function TreeView(props: TreeViewProps) {
               name={node.name}
               crate={node.kind === "crate"}
               expandable={node.children.length > 0}
+              hiding={n.hiddenChildren > 0 || layout.byId.has(stubId(n.id))}
               look={look(n.id)}
               selected={n.id === selected}
               prs={prsByNode.get(n.id)}
               running={runningByNode.get(n.id)?.[0]}
               asking={askingNodes.has(n.id)}
+              attention={attention.has(n.id)}
               delta={deltas.get(n.id)}
               flashKey={flashKey}
               compositeColor={compositeColor}
@@ -162,11 +171,14 @@ interface TileProps {
   name: string;
   crate: boolean;
   expandable: boolean;
+  /** Some children are hidden (collapsed or folded into a stub), so the handle expands. */
+  hiding: boolean;
   look: TileLook;
   selected: boolean;
   prs?: PrState[];
   running?: Task;
   asking: boolean;
+  attention: boolean;
   delta?: number;
   flashKey: number;
   compositeColor: (score: number) => string;
@@ -175,13 +187,13 @@ interface TileProps {
 }
 
 function Tile(props: TileProps) {
-  const { node, name, crate, expandable, look, selected, prs, running, asking, delta, flashKey, compositeColor, onSelect, onToggle } = props;
+  const { node, name, crate, expandable, hiding, look, selected, prs, running, asking, attention, delta, flashKey, compositeColor, onSelect, onToggle } = props;
   const side = node.r * 2;
   const gutter = (side * (SPRITE - 2 + BADGE)) / SPRITE;
-  const classes = ["node", selected && "selected", look.worst && "worst", look.hot && "hot", crate && "crate"].filter(Boolean).join(" ");
+  const classes = ["node", selected && "selected", attention && "attention", crate && "crate"].filter(Boolean).join(" ");
   return (
     <g class={classes} style={{ transform: `translate(${Math.round(node.x - node.r)}px,${Math.round(node.y - node.r)}px)` }} onClick={onSelect}>
-      {look.worst && <rect class="alarm" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
+      {attention && <rect class="glow" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       {selected && <rect class="ring" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       <g transform={`scale(${side / SPRITE})`}>
         <rect class="frame" width={SPRITE} height={SPRITE} />
@@ -192,7 +204,6 @@ function Tile(props: TileProps) {
         {look.pips.map((color, i) => (
           <rect key={i} class={color ? "pip" : "pip empty"} x={2 + (i % 4) * 3} y={2 + Math.floor(i / 4) * 3} width={2} height={2} fill={color ?? undefined} />
         ))}
-        {look.hot && <rect class="shimmer" x={1} y={1} width={SPRITE - 2} height={SPRITE - 2} />}
         <rect class="track" {...BAR} />
         {running ? (
           <ResearchBar task={running} color={compositeColor} />
@@ -207,7 +218,7 @@ function Tile(props: TileProps) {
       {expandable && (
         <g class="handle" onClick={onToggle}>
           <rect x={gutter + 4} y={node.r - 5} width={10} height={10} />
-          <text x={gutter + 9} y={node.r + 3.5}>{node.hiddenChildren ? "+" : "−"}</text>
+          <text x={gutter + 9} y={node.r + 3.5}>{hiding ? "+" : "−"}</text>
         </g>
       )}
       <text class="label" x={gutter + (expandable ? 18 : 6)} y={node.r + 4}>
@@ -219,6 +230,19 @@ function Tile(props: TileProps) {
           {delta > 0 ? `+${delta}` : `−${-delta}`}
         </text>
       )}
+    </g>
+  );
+}
+
+/** A "+N more" stand-in for folded siblings; clicking it focuses their parent. */
+function Stub({ node, onSelect }: { node: PlacedNode; onSelect(e: MouseEvent): void }) {
+  const side = node.r * 2;
+  return (
+    <g class="stub" style={{ transform: `translate(${Math.round(node.x - node.r)}px,${Math.round(node.y - node.r)}px)` }} onClick={onSelect}>
+      <rect width={side} height={side} />
+      <text class="label" x={side + 6} y={node.r + 4}>
+        +{node.hiddenChildren} more
+      </text>
     </g>
   );
 }

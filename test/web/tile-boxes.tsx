@@ -1,6 +1,6 @@
 import { render } from "preact";
 import type { NodeId, PrState, Task, Tree, TreeNode } from "../../src/types.ts";
-import { layoutTree, siblingOrder } from "../../src/web/layout.ts";
+import { layoutTree } from "../../src/web/layout.ts";
 import { ramp, tileSize, type TileLook } from "../../src/web/visual.ts";
 import { TreeView } from "../../src/web/TreeView.tsx";
 import { FakeDocument, type FakeNode } from "./fake-dom.ts";
@@ -13,10 +13,11 @@ export interface Box {
 }
 
 /**
- * Render `count` equal-weight sibling leaves with every decoration (alarm, selection ring, crate marks,
- * question, failing PR and finding badges) and return each tile's painted rect boxes in world units.
+ * Render `count` equal-weight sibling leaves with every decoration (attention glow on `attention`, all
+ * by default; selection ring, crate marks, question, failing PR and finding badges) and return each
+ * tile's painted rect boxes in world units.
  */
-export function decoratedSiblingBoxes(count: number): Box[] {
+export function decoratedSiblingBoxes(count: number, attention?: ReadonlySet<NodeId>): Box[] {
   const doc = new FakeDocument();
   Object.assign(globalThis, { document: doc });
   const root = doc.createElement("div");
@@ -30,8 +31,8 @@ export function decoratedSiblingBoxes(count: number): Box[] {
   const tree: Tree = { repoRoot: "/r", nodes };
   const ids = Object.keys(nodes);
   const side = tileSize(1);
-  const layout = layoutTree({ tree, expanded: new Set(ids), radius: () => side(1) / 2, order: siblingOrder("name", () => null, () => 0) });
-  const look: TileLook = { fill: "red", worst: true, hot: true, pips: Array(8).fill("red"), xp: 50, findings: 12 };
+  const layout = layoutTree({ tree, shown: new Map([["", nodes[""].children]]), radius: () => side(1) / 2 });
+  const look: TileLook = { fill: "red", pips: Array(8).fill("red"), xp: 50, findings: 12 };
   const tasks = ids.map((node, i) => ({ id: `t${i}`, node, state: "needs_input" }) as Task);
   const prs = ids.map((node, i) => ({ number: i, node, ci: "fail" }) as PrState);
   render(
@@ -44,6 +45,7 @@ export function decoratedSiblingBoxes(count: number): Box[] {
       compositeColor={ramp([0, 100])}
       tasks={tasks}
       prs={prs}
+      attention={attention ?? new Set(ids)}
       selected="n0"
       fitRequest={0}
       onSelect={() => {}}
