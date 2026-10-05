@@ -1,7 +1,7 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { ApiModels, ApiNode, ApiSource, ApiState, ChatEntry, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task, TerminalMode } from "../types.ts";
-import { hasScorer } from "../core/projects.ts";
+import type { ApiModels, ApiNode, ApiSource, ApiState, ChatEntry, Cta, Finding, NodeId, PrState, ScorerSpec, StartTaskRequest, Suggestion, Task, TerminalMode } from "../types.ts";
+import { isScannable } from "../core/projects.ts";
 import { get, onServerEvent, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { hasLiveWorker, messageBlocked } from "./task-actions.ts";
@@ -55,14 +55,14 @@ export function NodePanel({ id, state, version, onStart, onSelect, onError, onCl
       </header>
       <div class="actions">
         <button onClick={() => onStart(freeTask(id), [])}>New task here</button>
-        {hasScorer(state.project) && <button onClick={scan}>Scan subtree</button>}
+        {isScannable(state.project) && <button onClick={scan}>Scan subtree</button>}
       </div>
       {detail ? <Detail id={id} detail={detail} state={state} version={version} onStart={onStart} onSelect={onSelect} onError={onError} /> : <p class="muted">Loading…</p>}
       <Section title="Pull requests" items={prs}>
         {(pr) => <PrRow key={pr.number} pr={pr} onError={onError} />}
       </Section>
       <Section title="Tasks" items={tasks}>
-        {(task) => <TaskCard key={task.id} task={task} prs={state.prs} version={version} onError={onError} />}
+        {(task) => <TaskCard key={task.id} task={task} prs={state.prs} scorer={state.project.scorer} version={version} onError={onError} />}
       </Section>
     </aside>
   );
@@ -150,7 +150,7 @@ function OwnCta({ cta, state, version, onStart, onError }: { cta: Cta; state: Ap
     <li class="cta">
       <Reason cta={cta} /> <strong>{task.title}</strong>
       {task.state === "needs_input" && <AnswerForm task={task} onError={onError} />}
-      <TaskActions task={task} prs={state.prs} version={version} onError={onError} />
+      <TaskActions task={task} prs={state.prs} scorer={state.project.scorer} version={version} onError={onError} />
     </li>
   );
 }
@@ -256,7 +256,16 @@ export function PrRow({ pr, reason, tag, onError }: { pr: PrState; reason?: stri
   );
 }
 
-export function TaskCard({ task, prs, version, onError }: { task: Task; prs: PrState[]; version: number; onError(message: string): void }) {
+interface TaskActionsProps {
+  task: Task;
+  prs: PrState[];
+  /** The project's current scorer, the base of a scorer task's proposal diff. */
+  scorer: ScorerSpec;
+  version: number;
+  onError(message: string): void;
+}
+
+export function TaskCard({ task, prs, scorer, version, onError }: TaskActionsProps) {
   return (
     <li class="task">
       <div>
@@ -278,7 +287,7 @@ export function TaskCard({ task, prs, version, onError }: { task: Task; prs: PrS
         </ul>
       )}
       {task.error && <p class="error small">{linkify(task.error)}</p>}
-      <TaskActions task={task} prs={prs} version={version} onError={onError} />
+      <TaskActions task={task} prs={prs} scorer={scorer} version={version} onError={onError} />
     </li>
   );
 }
@@ -286,8 +295,9 @@ export function TaskCard({ task, prs, version, onError }: { task: Task; prs: PrS
 type Pane = "log" | "diff" | "chat";
 
 /** The task's action bar (see docs/DESIGN.md "Task actions") and the panes it toggles. */
-function TaskActions({ task, prs, version, onError }: { task: Task; prs: PrState[]; version: number; onError(message: string): void }) {
-  const [open, setOpen] = useState<Set<Pane>>(() => new Set(task.state === "review" ? ["diff"] : []));
+function TaskActions({ task, prs, scorer, version, onError }: TaskActionsProps) {
+  const isChange = (task.kind ?? "change") === "change";
+  const [open, setOpen] = useState<Set<Pane>>(() => new Set(task.state === "review" && isChange ? ["diff"] : []));
   const toggle = (pane: Pane) =>
     setOpen((panes) => {
       const next = new Set(panes);
@@ -299,10 +309,16 @@ function TaskActions({ task, prs, version, onError }: { task: Task; prs: PrState
   const prUrl = prs.find((p) => p.number === task.pr)?.url;
   return (
     <div>
+      {task.kind === "scorer" && task.state === "review" && <ProposalDiff current={scorer} proposal={task.proposal} />}
       <div class="action-bar">
-        {task.state === "review" && (
+        {task.state === "review" && isChange && (
           <button class="primary" onClick={() => taskAction(task, "open-pr", onError)}>
             Open PR
+          </button>
+        )}
+        {task.state === "review" && task.kind === "scorer" && task.proposal && (
+          <button class="primary" title="Save the proposal as the project's scorer and rescore" onClick={() => taskAction(task, "accept-scorer", onError)}>
+            Accept scorer
           </button>
         )}
         {(live || task.state === "review") && <button onClick={() => taskAction(task, "cancel", onError)}>Cancel</button>}
@@ -397,6 +413,20 @@ function DiffPane({ task, onError }: { task: Task; onError(message: string): voi
                 {line || " "}
               </div>
             ))}
+    </pre>
+  );
+}
+
+/** A scorer proposal as a line diff against the current scorer's rubric, command and plan; reply in the chat to iterate. */
+function ProposalDiff({ current, proposal }: { current: ScorerSpec; proposal?: ScorerSpec }) {
+  if (!proposal) return <p class="muted small">No scorer proposed; reply in the chat to ask for one.</p>;
+  const lines = (spec: ScorerSpec) => JSON.stringify({ rubric: spec.rubric, command: spec.command, plan: spec.plan }, null, 2).split("\n");
+  const before = lines(current);
+  const after = lines(proposal);
+  return (
+    <pre class="diff">
+      {before.filter((l) => !after.includes(l)).map((l, i) => <div key={`-${i}`} class="del">- {l}</div>)}
+      {after.map((l, i) => <div key={i} class={before.includes(l) ? undefined : "add"}>{before.includes(l) ? "  " : "+ "}{l}</div>)}
     </pre>
   );
 }

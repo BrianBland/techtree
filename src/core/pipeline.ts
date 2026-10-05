@@ -1,5 +1,5 @@
 import { execFileSync } from "node:child_process";
-import type { Cache, CollectCtx, Config, Finding, MetricDef, MetricPlugin, MetricValues, ScoreResult } from "../types.ts";
+import type { Cache, CollectCtx, Config, Finding, MetricDef, MetricPlugin, MetricValues, ScoreResult, Tree } from "../types.ts";
 import { buildModel, findingImpact } from "./scoring.ts";
 import { buildTree, dict } from "./tree.ts";
 
@@ -10,12 +10,14 @@ export interface ScoreOptions {
   cache: Cache;
   log(msg: string): void;
   signal?: AbortSignal;
+  /** Score this tree instead of building one (project scorers reuse the shared tree). */
+  tree?: Tree;
 }
 
 /** Score a repo: build the tree, run plugins, aggregate, rank and estimate every finding's impact. */
 export async function score(opts: ScoreOptions): Promise<ScoreResult> {
   const { repoRoot, config, plugins, log } = opts;
-  const tree = buildTree(repoRoot, config);
+  const tree = opts.tree ?? buildTree(repoRoot, config);
   for (const plugin of plugins) {
     try {
       await plugin.annotate?.(tree);

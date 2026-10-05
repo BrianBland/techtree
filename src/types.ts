@@ -74,6 +74,8 @@ export interface Finding {
 
 export type TaskState = "queued" | "running" | "needs_input" | "review" | "pr_open" | "done" | "failed";
 export type TaskPhase = "plan" | "explore" | "edit" | "test" | "pr";
+/** `change` makes a branch and a PR; `scorer` proposes a project scorer; `plan` reports work items (DESIGN "Task kinds"). */
+export type TaskKind = "change" | "scorer" | "plan";
 
 export interface ChecklistItem {
   text: string;
@@ -83,6 +85,7 @@ export interface ChecklistItem {
 export interface Task {
   id: string;
   project: string; // Project.id
+  kind?: TaskKind; // default "change"
   node: NodeId;
   title: string;
   prompt: string;
@@ -97,6 +100,7 @@ export interface Task {
   plannedTo: number;
   checklist: ChecklistItem[];
   phase: TaskPhase;
+  proposal?: ScorerSpec; // a scorer task's proposed scorer
   question?: string; // set while state === "needs_input"
   error?: string;
   pid?: number;
@@ -131,7 +135,7 @@ export interface PrState {
 
 // ---- Projects (DESIGN "Projects") ----
 
-/** How a project is scored. Only `plugins` is implemented; the rest is declared for lane 2. */
+/** How a project is scored (DESIGN "Project scorers"). */
 export interface ScorerSpec {
   plugins?: string[]; // metric plugin ids
   rubric?: string;
@@ -264,6 +268,7 @@ export interface ApiOverview {
   flaggedPrs: PrState[]; // failing, stuck or stale
   suggestions: Suggestion[];
   coverage: { scannedNodes: number; totalNodes: number; scannedLoc: number; totalLoc: number };
+  scorerErrors?: string[]; // failures of the project's scorer in its latest run
 }
 
 export interface StartTaskRequest {
@@ -274,6 +279,7 @@ export interface StartTaskRequest {
   manualReview: boolean;
   model?: string; // "provider/id"; omitted = pi's default
   project?: string; // default "quality"
+  kind?: TaskKind; // default "change"
 }
 
 export interface ApiModels {

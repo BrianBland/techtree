@@ -5,7 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
-import { QUALITY } from "../core/projects.ts";
+import { QUALITY, scorerParts } from "../core/projects.ts";
 import type { Db } from "../db.ts";
 import type { ChatEntry, Config, ServerEvent, StartTaskRequest, Task, TaskPhase, TaskState } from "../types.ts";
 import type { ReportPayload } from "./report-tool.ts";
@@ -101,6 +101,7 @@ export class TaskRunner {
     const task: Task = {
       id,
       project: req.project ?? QUALITY,
+      ...(req.kind && req.kind !== "change" && { kind: req.kind }),
       node: req.node,
       title,
       prompt: [req.brief, req.prompt ?? defaultPrompt(title, req)].filter(Boolean).join("\n\n"),
@@ -123,13 +124,18 @@ export class TaskRunner {
   }
 
   /** Apply a `techtree_report` payload from the task's worker. */
-  report(taskId: string, payload: ReportPayload): Task {
+  report(taskId: string, payload: Omit<ReportPayload, "items" | "scorer"> & { items?: unknown; scorer?: unknown }): Task {
     const task = this.require(taskId);
     if (task.state !== "running" && task.state !== "needs_input") throw new Error(`task ${taskId} is ${task.state}`);
     const worker = this.workers.get(taskId);
     if (!worker) throw new Error(`task ${taskId} has no live worker`);
-    const { plan, phase, done, needs_input } = payload;
+    const { plan, phase, done, needs_input, items, scorer } = payload;
     if (phase !== undefined && !PHASES.includes(phase)) throw new Error(`unknown phase ${phase}`);
+    if (items !== undefined && task.kind !== "plan") throw new Error("items are for plan tasks only");
+    if (scorer !== undefined && task.kind !== "scorer") throw new Error("scorer is for scorer tasks only");
+    const proposal = scorer === undefined ? undefined : scorerParts(scorer);
+    if (typeof proposal === "string") throw new Error(proposal);
+    if (proposal && !Object.keys(proposal).length) throw new Error("scorer must set rubric, command or plan");
     if (plan !== undefined && !Array.isArray(plan)) throw new Error("plan must be a list of steps");
     const checklist = plan ? plan.map((text) => ({ text: String(text), done: false })) : task.checklist;
     if (done !== undefined && !(Number.isInteger(done) && done >= 0 && done < checklist.length))
@@ -137,6 +143,7 @@ export class TaskRunner {
     task.checklist = checklist;
     if (phase) task.phase = phase;
     if (done !== undefined) checklist[done].done = true;
+    if (proposal) task.proposal = proposal;
     if (needs_input) {
       task.state = "needs_input";
       task.question = needs_input;
@@ -175,8 +182,19 @@ export class TaskRunner {
   openPr(taskId: string): Task {
     const task = this.require(taskId);
     if (task.state !== "review") throw new Error(`task ${taskId} is ${task.state}, not review`);
+    if (isReadOnly(task)) throw new Error(`task ${taskId} is a ${task.kind} task and opens no PR`);
     task.phase = "pr";
     this.resume(task, openPrPrompt(task));
+    return task;
+  }
+
+  /** Mark a `review` scorer task with a proposal `done`; the caller saves the proposal. */
+  acceptProposal(taskId: string): Task {
+    const task = this.require(taskId);
+    if (task.kind !== "scorer" || task.state !== "review" || !task.proposal) throw new Error(`task ${taskId} has no scorer proposal to accept`);
+    task.state = "done";
+    this.log(task, "scorer proposal accepted");
+    this.save(task);
     return task;
   }
 
@@ -338,7 +356,9 @@ export class TaskRunner {
     const { path, branch } = this.worktreeFor(task);
     const run = promisify(execFile);
     try {
-      if (task.pr === undefined) {
+      if (isReadOnly(task)) {
+        await run("git", ["worktree", "add", "--detach", path, this.opts.config.baseRef], { cwd: this.opts.repoRoot });
+      } else if (task.pr === undefined) {
         await run("git", ["worktree", "add", "-b", branch, path, this.opts.config.baseRef], { cwd: this.opts.repoRoot });
       } else {
         await run("git", ["worktree", "add", "--detach", path, this.opts.config.baseRef], { cwd: this.opts.repoRoot });
@@ -354,10 +374,10 @@ export class TaskRunner {
     if (!this.tasks.has(task.id)) {
       // Discarded during checkout.
       tryGit(this.opts.repoRoot, "worktree", "remove", "--force", path);
-      tryGit(this.opts.repoRoot, "branch", "-D", branch);
+      if (!isReadOnly(task)) tryGit(this.opts.repoRoot, "branch", "-D", branch);
       return this.pump();
     }
-    this.useWorktree(task, path, branch);
+    this.useWorktree(task, path, isReadOnly(task) ? undefined : branch);
     if (task.state !== "running" || this.closed) return this.pump();
     this.spawnWorker(task, task.pr === undefined ? `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}` : task.prompt);
   }
@@ -371,10 +391,10 @@ export class TaskRunner {
     return { path, branch: `techtree/${task.id}` };
   }
 
-  private useWorktree(task: Task, path: string, branch: string): void {
+  private useWorktree(task: Task, path: string, branch: string | undefined): void {
     task.worktree = path;
     task.branch = branch;
-    this.log(task, `worktree ${path} on ${branch}`);
+    this.log(task, `worktree ${path} ${branch ? `on ${branch}` : "detached"}`);
     this.save(task);
   }
 
@@ -405,6 +425,7 @@ export class TaskRunner {
       "--skill", join(this.packageRoot, "skills", "techtree-worker"),
       "--skill", join(this.packageRoot, "skills", "techtree-babysit"),
       ...this.sessionArgs(task),
+      ...(task.kind === "plan" ? ["--tools", "read,grep,find,ls,techtree_report"] : []),
     ];
     const child = spawn(command, args, {
       cwd: task.worktree,
@@ -491,6 +512,7 @@ export class TaskRunner {
   }
 
   private async onSettled(task: Task, worker: Worker): Promise<void> {
+    if (checklistDone(task) && isReadOnly(task)) return this.stop(task, worker, task.kind === "scorer" ? "review" : "done");
     if (checklistDone(task)) {
       const prStage = !task.manualReview || task.phase === "pr" || task.pr !== undefined;
       if (!prStage) return this.stop(task, worker, "review");
@@ -513,7 +535,7 @@ export class TaskRunner {
     this.save(task);
   }
 
-  private stop(task: Task, worker: Worker, state: "review" | "pr_open"): void {
+  private stop(task: Task, worker: Worker, state: "review" | "pr_open" | "done"): void {
     task.state = state;
     this.log(task, `state: ${state}`);
     this.workers.delete(task.id);
@@ -601,7 +623,16 @@ function defaultPrompt(title: string, req: StartTaskRequest): string {
   return `${title} ${where}.${findings}`;
 }
 
+/** Scorer and plan tasks change no repo code: no branch, no PR (DESIGN "Task kinds"). */
+function isReadOnly(task: Task): boolean {
+  return task.kind === "scorer" || task.kind === "plan";
+}
+
 function finishRule(task: Task): string {
+  if (task.kind === "scorer")
+    return "This is a scorer task: do not change or commit repository files. Propose the scorer with techtree_report {scorer}, tick the checklist, then stop.";
+  if (task.kind === "plan")
+    return "This is a plan task: read only, change nothing. Report the work items with techtree_report {items}, tick the checklist, then stop.";
   return task.manualReview
     ? "Manual review is on: when the checklist is done, commit on the current branch and stop. Do not push or open a PR."
     : "When the checklist is done, commit, push the branch to the upstream remote and open a PR with gh, " +

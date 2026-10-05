@@ -10,6 +10,28 @@ const reportParameters = Type.Object({
   ),
   done: Type.Optional(Type.Integer({ minimum: 0, description: "Index of the checklist item just completed" })),
   needs_input: Type.Optional(Type.String({ description: "Question for the user; pauses the task until answered" })),
+  items: Type.Optional(
+    Type.Array(
+      Type.Object({
+        node: Type.String({ description: "Repo-relative directory the item belongs to; \"\" = repo root" }),
+        title: Type.String(),
+        detail: Type.String(),
+        effort: Type.Union([Type.Literal("trivial"), Type.Literal("small"), Type.Literal("medium"), Type.Literal("large")]),
+        severity: Type.Optional(Type.Union([Type.Literal("low"), Type.Literal("medium"), Type.Literal("high")])),
+      }),
+      { description: "Plan tasks only: work items toward the project goal" },
+    ),
+  ),
+  scorer: Type.Optional(
+    Type.Object(
+      {
+        rubric: Type.Optional(Type.String({ description: "What an LLM scan of each file should look for" })),
+        command: Type.Optional(Type.Array(Type.String(), { description: "argv run in the repo root that prints scorer JSON" })),
+        plan: Type.Optional(Type.Boolean({ description: "Score progress on reported plan items" })),
+      },
+      { description: "Scorer tasks only: the proposed project scorer" },
+    ),
+  ),
 });
 
 /** Body of `POST /api/tasks/:id/report`. */
@@ -24,7 +46,8 @@ export const techtreeReportTool: ToolDefinition<typeof reportParameters> = {
   label: "techtree report",
   description:
     "Report techtree task progress: {plan: string[]} first, then {phase}, {done: index} as checklist items finish, " +
-    "or {needs_input: question} when blocked (then stop and wait for the answer).",
+    "or {needs_input: question} when blocked (then stop and wait for the answer). " +
+    "Plan tasks report work items with {items}; scorer tasks propose a scorer with {scorer}.",
   parameters: reportParameters,
   async execute(_toolCallId, params) {
     const { TECHTREE_URL: url, TECHTREE_TOKEN: token = "", TECHTREE_TASK: task } = process.env;

@@ -4,7 +4,7 @@ import { readFile } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import type { AddressInfo } from "node:net";
 import type { StartTaskRequest, TaskPhase } from "../types.ts";
-import { QUALITY } from "../core/projects.ts";
+import { QUALITY, scorerParts } from "../core/projects.ts";
 import { HttpError, type Backend, type ProjectInput, type WorkerReport } from "./backend.ts";
 
 export interface ServerOptions {
@@ -155,6 +155,7 @@ function apiRoutes(backend: Backend): Route[] {
       return backend.answer(id, text);
     }),
     post(/^\/api\/tasks\/([^/]+)\/open-pr$/, (_req, _url, [id]) => backend.openPr(id)),
+    post(/^\/api\/tasks\/([^/]+)\/accept-scorer$/, (_req, _url, [id]) => backend.acceptScorer(id)),
     post(/^\/api\/tasks\/([^/]+)\/cancel$/, (_req, _url, [id]) => backend.cancel(id)),
     post(/^\/api\/tasks\/([^/]+)\/message$/, async (req, _url, [id]) => {
       const { text } = await readJson(req);
@@ -228,7 +229,9 @@ function projectInput(body: Record<string, unknown>): ProjectInput {
   if ((name !== undefined && typeof name !== "string") || (goal !== undefined && typeof goal !== "string")) {
     throw new HttpError(400, "name and goal must be strings");
   }
-  return { ...(name !== undefined && { name }), ...(goal !== undefined && { goal }) };
+  const scorer = body.scorer === undefined ? undefined : scorerParts(body.scorer);
+  if (typeof scorer === "string") throw new HttpError(400, scorer);
+  return { ...(name !== undefined && { name }), ...(goal !== undefined && { goal }), ...(scorer && { scorer }) };
 }
 
 function tailParam(url: URL): number {
@@ -260,7 +263,7 @@ async function readJson(req: IncomingMessage): Promise<Record<string, unknown>> 
 }
 
 function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
-  const { node, findingIds, title, prompt, manualReview, model, project } = body;
+  const { node, findingIds, title, prompt, manualReview, model, project, kind } = body;
   const valid =
     typeof node === "string" &&
     Array.isArray(findingIds) &&
@@ -269,7 +272,8 @@ function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
     (title === undefined || typeof title === "string") &&
     (prompt === undefined || typeof prompt === "string") &&
     (model === undefined || typeof model === "string") &&
-    (project === undefined || typeof project === "string");
+    (project === undefined || typeof project === "string") &&
+    (kind === undefined || kind === "change" || kind === "scorer" || kind === "plan");
   if (!valid) throw new HttpError(400, "body must be a StartTaskRequest");
   return {
     node,
@@ -279,17 +283,18 @@ function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
     ...(prompt === undefined ? {} : { prompt }),
     ...(model ? { model } : {}),
     ...(project ? { project } : {}),
+    ...(kind ? { kind } : {}),
   };
 }
 
 function workerReport(body: Record<string, unknown>): WorkerReport {
-  const { plan, phase, done, needs_input } = body;
+  const { plan, phase, done, needs_input, items, scorer } = body;
   const valid =
     (plan === undefined || (Array.isArray(plan) && plan.every((item) => typeof item === "string"))) &&
     (phase === undefined || (typeof phase === "string" && PHASES.includes(phase))) &&
     (done === undefined || (Number.isInteger(done) && (done as number) >= 0)) &&
     (needs_input === undefined || typeof needs_input === "string") &&
-    [plan, phase, done, needs_input].some((field) => field !== undefined);
+    [plan, phase, done, needs_input, items, scorer].some((field) => field !== undefined);
   if (!valid) throw new HttpError(400, "body must be a WorkerReport");
   return body as WorkerReport;
 }

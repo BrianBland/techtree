@@ -103,6 +103,20 @@ const scenarios = {
     await report({ done: 0 });
     settle();
   },
+  // Plan task: reports one work item on src/core.
+  async plan(_message, settle) {
+    await report({ plan: ["read"] });
+    await report({ items: [{ node: "src/core", title: "Cache parsed config", detail: "Parse once.", effort: "small" }] });
+    await report({ done: 0 });
+    settle();
+  },
+  // Scorer task: proposes a rubric.
+  async scorer(_message, settle) {
+    await report({ plan: ["draft"] });
+    await report({ scorer: { rubric: "allocation-heavy hot paths" } });
+    await report({ done: 0 });
+    settle();
+  },
   async hang() {
     if (prompts === 1) await report({ plan: ["wait"] });
   },
