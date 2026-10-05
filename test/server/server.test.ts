@@ -214,7 +214,7 @@ test("bad input, unknown routes and backend errors map to JSON status codes", as
     [post("/api/tasks", JSON.stringify({ node: "a", findingIds: [], manualReview: true, model: 7 })), 400],
     [post("/api/tasks/t1/answer", JSON.stringify({ text: 3 })), 400],
     [post("/api/tasks/t1/message", JSON.stringify({})), 400],
-    [post("/api/tasks/t1/open-terminal", JSON.stringify({ mode: "tmux" })), 400],
+    [post("/api/tasks/t1/open-terminal", JSON.stringify({ mode: "screen" })), 400],
     [post("/api/tasks/busy/message", JSON.stringify({ text: "hi" })), 409],
     [post("/api/tasks/missing/open-terminal", JSON.stringify({ mode: "shell" })), 404],
     [post("/api/prs/abc/babysit", JSON.stringify({ on: true })), 404],
