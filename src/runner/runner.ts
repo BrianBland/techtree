@@ -404,7 +404,7 @@ export class TaskRunner {
     if (task.checklist.length > 0 && task.checklist.every((item) => item.done)) {
       const prStage = !task.manualReview || task.phase === "pr";
       if (!prStage) return this.stop(task, worker, "review");
-      const pr = await findPr(task);
+      const pr = (await findPr(task)) ?? prFromText(worker.lastText);
       if (this.workers.get(task.id) !== worker || task.state !== "running") return;
       if (pr !== undefined) {
         task.pr = pr;
@@ -491,6 +491,12 @@ function openPrPrompt(task: Task): string {
     `The change was reviewed and approved. Push branch ${task.branch} to the upstream remote and open a pull request ` +
     "with gh, following the repository's PR template. Never merge. Call techtree_report {phase: \"pr\"} first."
   );
+}
+
+/** PR number from a `…/pull/<n>` URL in the worker's last message, used when `gh` lookups fail. */
+export function prFromText(text: string | undefined): number | undefined {
+  const matches = [...(text ?? "").matchAll(/https:\/\/\S+?\/pull\/(\d+)/g)];
+  return matches.length ? Number(matches[matches.length - 1][1]) : undefined;
 }
 
 async function findPr(task: Task): Promise<number | undefined> {

@@ -364,3 +364,10 @@ test("a slow PR lookup does not block the event loop", async (t) => {
   assert.equal((await h.waitFor(id, (x) => x.state === "pr_open")).pr, 7);
   assert.ok(maxGap < 500, `event loop blocked for ${maxGap}ms`);
 });
+
+test("prFromText takes the last PR URL in the worker's message", { timeout: 5000 }, async () => {
+  const { prFromText } = await import("../../src/runner/runner.ts");
+  assert.equal(prFromText("opened https://github.com/o/r/pull/12 and then https://github.com/o/r/pull/5522."), 5522);
+  assert.equal(prFromText("no link here"), undefined);
+  assert.equal(prFromText(undefined), undefined);
+});
