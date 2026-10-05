@@ -15,6 +15,7 @@ import type {
   Task,
   TaskPhase,
   TerminalMode,
+  Finding,
 } from "../types.ts";
 
 /** Worker progress sent through `techtree_report`; one payload may carry several fields. */
@@ -54,6 +55,8 @@ export interface ProjectInput {
 export interface Backend {
   listProjects(): Promise<Project[]>;
   createProject(input: ProjectInput): Promise<Project>;
+  /** The project's current findings with these ids (unknown ids skipped). */
+  findings(ids: string[], project?: string): Promise<Finding[]>;
   /** Rewrite a goal or rubric with an agent (DESIGN "Refining text"). */
   refine(input: { kind: "goal" | "rubric"; text: string; name?: string; goal?: string }): Promise<{ text: string }>;
   updateProject(id: string, input: ProjectInput): Promise<Project>;

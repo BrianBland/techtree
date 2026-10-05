@@ -154,6 +154,7 @@ function apiRoutes(backend: Backend): Route[] {
     get(/^\/api\/tasks\/([^/]+)\/diff$/, (_req, _url, [id]) => backend.taskDiff(id)),
     get(/^\/api\/source$/, (_req, url) => backend.source(url.searchParams.get("path") ?? "", Number(url.searchParams.get("line")) || undefined)),
     get(/^\/api\/models$/, () => backend.models()),
+    get(/^\/api\/findings$/, (_req, url) => backend.findings((url.searchParams.get("ids") ?? "").split(",").filter(Boolean), projectParam(url))),
     post(/^\/api\/tasks$/, async (req) => backend.startTask(startTaskRequest(await readJson(req)))),
     post(/^\/api\/tasks\/([^/]+)\/answer$/, async (req, _url, [id]) => {
       const { text } = await readJson(req);

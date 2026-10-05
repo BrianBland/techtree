@@ -1,9 +1,10 @@
-import type { ComponentChildren } from "preact";
-import { useEffect, useRef, useState } from "preact/hooks";
+import { createContext, type ComponentChildren } from "preact";
+import { useContext, useEffect, useRef, useState } from "preact/hooks";
 import type { ApiModels, ApiNode, ApiSource, ApiState, ChatEntry, Cta, Finding, NodeId, PrState, ScorerSpec, StartTaskRequest, Suggestion, Task, TerminalMode } from "../types.ts";
 import { isScannable } from "../core/projects.ts";
 import { get, onServerEvent, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
+import { suggestionKey } from "./group.ts";
 import { hasLiveWorker, messageBlocked } from "./task-actions.ts";
 import { sparkline, taskCompletion } from "./visual.ts";
 
@@ -178,6 +179,7 @@ function OwnCta({ cta, state, version, onStart, onError }: { cta: Cta; state: Ap
 function ChildCta({ cta, from, onSelect }: { cta: Cta; from: NodeId; onSelect(id: NodeId): void }) {
   return (
     <li class="row clickable cta-child" onClick={() => onSelect(cta.node)}>
+      {cta.suggestion && <GroupBox suggestion={cta.suggestion} />}
       <div>
         <Reason cta={cta} /> {cta.task?.title ?? cta.pr?.title ?? cta.suggestion?.title}
         <div class="path small">{from === "" ? cta.node : cta.node.slice(from.length + 1)}</div>
@@ -239,9 +241,30 @@ export function attentionKey(state: ApiState): string {
   return `${tasks}|${prs}`;
 }
 
+/** Suggestions checked for "Start together" (DESIGN "Grouping suggestions"); absent = no grouping. */
+export const GroupContext = createContext<{ selected: Suggestion[]; canSelect(s: Suggestion): boolean; toggle(s: Suggestion): void } | null>(null);
+
+function GroupBox({ suggestion }: { suggestion: Suggestion }) {
+  const group = useContext(GroupContext);
+  if (!group) return null;
+  const checked = group.selected.some((s) => suggestionKey(s) === suggestionKey(suggestion));
+  return (
+    <input
+      type="checkbox"
+      class="group-box"
+      title="Group with other suggestions into one task"
+      checked={checked}
+      disabled={!checked && !group.canSelect(suggestion)}
+      onClick={(e) => e.stopPropagation()}
+      onChange={() => group.toggle(suggestion)}
+    />
+  );
+}
+
 export function SuggestionRow({ suggestion: s, onStart }: { suggestion: Suggestion; onStart(): void }) {
   return (
     <div class="row">
+      <GroupBox suggestion={s} />
       <div>
         {linkify(s.title)}
         <div class="muted small">
@@ -604,6 +627,14 @@ export function StartDialog({
 }) {
   const [title, setTitle] = useState(suggestion.title);
   const [prompt, setPrompt] = useState(defaultPrompt(suggestion, findings));
+  useEffect(() => {
+    if (!suggestion.findingIds.length || suggestion.findingIds.every((id) => findings.some((f) => f.id === id))) return;
+    const ids = suggestion.findingIds.map(encodeURIComponent).join(",");
+    get<Finding[]>(`/api/findings?ids=${ids}&project=${encodeURIComponent(project)}`).then(
+      (loaded) => setPrompt((p) => (p === defaultPrompt(suggestion, findings) ? defaultPrompt(suggestion, loaded) : p)),
+      () => {},
+    );
+  }, []);
   const [manualReview, setManualReview] = useState(suggestion.manualReview);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");

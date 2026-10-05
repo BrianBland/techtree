@@ -270,3 +270,7 @@ button.link.danger { color: var(--bad); margin-right: auto; }
 .panel-resizer { flex: none; width: 6px; margin-right: -3px; cursor: col-resize; touch-action: none; background: var(--ink); z-index: 1; }
 .panel-resizer:hover, .panel-resizer:active { background: var(--accent); }
 .refine { display: flex; gap: 8px; align-items: center; margin: -4px 0 8px; }
+.panel-column { width: var(--panel-width, 440px); flex: none; display: flex; flex-direction: column; min-height: 0; }
+.panel-column > .panel { width: auto; flex: 1; min-height: 0; }
+.group-bar { display: flex; gap: 8px; align-items: center; padding: 8px 12px; border-top: 2px solid var(--accent); background: var(--hud); border-left: 3px solid var(--ink); }
+.group-box { margin-right: 8px; flex: none; }

@@ -152,6 +152,11 @@ export class RepoBackend implements Backend {
     return listProjects(this.opts.db);
   }
 
+  async findings(ids: string[], projectId?: string): Promise<Finding[]> {
+    const wanted = new Set(ids);
+    return (await this.view(projectId)).result.findings.filter((f) => wanted.has(f.id));
+  }
+
   async refine(input: { kind: RefineKind; text: string; name?: string; goal?: string }): Promise<{ text: string }> {
     try {
       return { text: await refineText(input, this.opts.config, this.opts.repoRoot) };

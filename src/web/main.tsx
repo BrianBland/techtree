@@ -6,7 +6,8 @@ import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { focusView, layoutTree, siblingOrder, stubId, toggleOverride, type Overrides, type SortKey } from "./layout.ts";
 import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
-import { NodePanel, StartDialog } from "./Panel.tsx";
+import { GroupContext, NodePanel, StartDialog } from "./Panel.tsx";
+import { combineSuggestions, suggestionKey } from "./group.ts";
 import { Overview } from "./Overview.tsx";
 import { PanelResizer, usePanelWidth } from "./PanelResizer.tsx";
 import { ProjectSwitcher } from "./Projects.tsx";
@@ -121,6 +122,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
   const [fitRequest, setFitRequest] = useState(0);
   const [panelWidth, setPanelWidth] = usePanelWidth();
   const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[]; project: string } | null>(null);
+  const [grouped, setGrouped] = useState<Suggestion[]>([]);
   const { tree, scores, metricDefs } = state;
 
   const scoreOf = useCallback((id: NodeId) => scoreValue(scores[id], scoreKey), [scores, scoreKey]);
@@ -254,6 +256,8 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
           onStub={onStub}
         />
         <PanelResizer width={panelWidth} onResize={setPanelWidth} onResizeEnd={() => setFitRequest((n) => n + 1)} />
+        <GroupContext.Provider value={groupValue(grouped, setGrouped, state.project.id)}>
+        <div class="panel-column">
         {selected === null ? (
           <Overview
             state={state}
@@ -276,10 +280,41 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
             onClose={() => setSelected(null)}
           />
         )}
+        {grouped.length > 0 && (
+          <div class="group-bar">
+            {grouped.length} selected
+            <button
+              class="primary"
+              disabled={grouped.length < 2}
+              onClick={() => {
+                setStarting({ suggestion: combineSuggestions(grouped), findings: [], project: grouped[0].project ?? state.project.id });
+                setGrouped([]);
+              }}
+            >
+              Start together
+            </button>
+            <button class="link" onClick={() => setGrouped([])}>
+              Clear
+            </button>
+          </div>
+        )}
+        </div>
+        </GroupContext.Provider>
       </main>
       {starting && <StartDialog {...starting} onClose={() => setStarting(null)} onError={setError} />}
     </div>
   );
+}
+
+/** Grouping state for suggestion checkboxes: one project at a time (DESIGN "Grouping suggestions"). */
+function groupValue(grouped: Suggestion[], setGrouped: (fn: (g: Suggestion[]) => Suggestion[]) => void, current: string) {
+  const projectOf = (s: Suggestion) => s.project ?? current;
+  return {
+    selected: grouped,
+    canSelect: (s: Suggestion) => !grouped.length || projectOf(grouped[0]) === projectOf(s),
+    toggle: (s: Suggestion) =>
+      setGrouped((g) => (g.some((x) => suggestionKey(x) === suggestionKey(s)) ? g.filter((x) => suggestionKey(x) !== suggestionKey(s)) : [...g, { ...s, project: projectOf(s) }])),
+  };
 }
 
 /** The project named by the page's `?project=` parameter ("all" for every project), or Quality. */
