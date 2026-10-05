@@ -126,6 +126,7 @@ export interface MetricScore {
   raw: number; // aggregated value
   value: number; // raw after normalizeBy (what the percentile ranks)
   pct: number | null; // 0..100, direction-adjusted (100 = best); null for neutral metrics
+  inherited?: boolean; // pct taken from the parent because the node is below minLoc
 }
 
 export interface NodeScore {
