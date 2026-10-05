@@ -90,6 +90,7 @@ export interface RepoBackendOptions {
 
 const OVERVIEW_SUGGESTIONS = 8;
 const LIVE_STATES: Task["state"][] = ["queued", "running", "needs_input"];
+const BUSY_TTL_MS = 15_000;
 /** States whose task still claims its findings (DESIGN "Claimed findings"). */
 const CLAIMING_STATES: Task["state"][] = [...LIVE_STATES, "review", "staged", "pr_open"];
 const NO_COVERAGE: ApiOverview["coverage"] = { scannedNodes: 0, totalNodes: 0, scannedLoc: 0, totalLoc: 0 };
@@ -130,6 +131,7 @@ export class RepoBackend implements Backend {
   private readonly projectRuns = new Map<string, ProjectRun>();
   /** Change tasks of plan projects whose finish already triggered a rescore. */
   private readonly resolvedPlanTasks = new Set<string>();
+  private busyCache?: { key: string; at: number; paths: string[] };
   private unscoredView?: { from: ScoreResult; result: ScoreResult };
   private visibleView?: { from: ScoreResult; dismissedKey: string; result: ScoreResult };
   private scoring?: Promise<void>;
@@ -754,14 +756,20 @@ export class RepoBackend implements Backend {
   }
 
   private busyPaths(): string[] {
-    const paths = new Set<string>();
     const worktrees = this.runner()
       .list()
       .flatMap((t) => (t.worktree && LIVE_STATES.includes(t.state) ? [t.worktree] : []));
-    if (worktrees.length) {
-      const base = git(this.opts.repoRoot, "rev-parse", this.opts.config.baseRef).trim();
-      for (const worktree of worktrees) for (const file of git(worktree, "diff", "--name-only", "-z", base).split("\0")) if (file) paths.add(file);
+    const key = worktrees.join("\0");
+    // ponytail: a live task's edits show up in conflicts up to BUSY_TTL_MS late; watch worktrees if that matters.
+    if (this.busyCache?.key !== key || Date.now() - this.busyCache.at > BUSY_TTL_MS) {
+      const changed = new Set<string>();
+      if (worktrees.length) {
+        const base = git(this.opts.repoRoot, "rev-parse", this.opts.config.baseRef).trim();
+        for (const worktree of worktrees) for (const file of git(worktree, "diff", "--name-only", "-z", base).split("\0")) if (file) changed.add(file);
+      }
+      this.busyCache = { key, at: Date.now(), paths: [...changed] };
     }
+    const paths = new Set(this.busyCache.paths);
     for (const pr of this.opts.prs.list()) for (const file of pr.files) paths.add(file);
     return [...paths].sort();
   }

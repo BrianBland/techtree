@@ -539,6 +539,8 @@ test("the project switcher creates a project, switches the view and keeps it in 
   await app.waitFor(() => heading() === "All projects" && app.text().includes("Top suggestions"), "cross-project overview");
   assert.equal(urls.at(-1), "?project=all");
   assert.ok(app.find((n) => n.getAttribute("class") === "project-tag").some((n) => n.textContent === "Quality"), "items are labelled with their project");
+  const tagColors = new Map(app.find((n) => n.getAttribute("class") === "project-tag").map((n) => [n.textContent, n.getAttribute("style")]));
+  assert.match(String(tagColors.get("Quality")), /background/, "project tags use the project's colour");
 
   choose("quality");
   await app.waitFor(() => heading() === "Quality" && app.text().includes("Scan coverage"), "back to Quality");

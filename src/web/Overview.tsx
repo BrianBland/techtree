@@ -3,6 +3,7 @@ import { ALL_PROJECTS, hasScorer, isScannable, isScored } from "../core/projects
 import type { ApiOverview, ApiState, Bundle, NodeId, Project, StartTaskRequest, Suggestion, Task, TaskKind } from "../types.ts";
 import { get, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
+import { projectColor } from "./Projects.tsx";
 import { PrRow, Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
 
 export interface OverviewProps {
@@ -40,7 +41,12 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
   if (!overview) return <aside class="panel muted">Loading…</aside>;
   const nodeName = (id: NodeId) => (id === "" ? state.repo.name : id);
   const projectName = (id = state.project.id) => projects.find((p) => p.id === id)?.name ?? id;
-  const tag = (id?: string) => all && <span class="project-tag">{projectName(id)}</span>;
+  const tag = (id = state.project.id) =>
+    all && (
+      <span class="project-tag" style={{ background: projectColor(projects, id) }}>
+        {projectName(id)}
+      </span>
+    );
   const scored = all || isScored(state.project);
   const custom = !all && !state.project.builtin;
   const { coverage } = overview;

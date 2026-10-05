@@ -15,6 +15,14 @@ export interface ProjectSwitcherProps {
   onError(message: string): void;
 }
 
+const PALETTE = ["#d9a441", "#4fa3d9", "#d95f8e", "#5fbf6a", "#a07ad9", "#e07b39", "#3fbfb0", "#c9c94a"];
+
+/** The colour of project `id`, by its position in `projects` (DESIGN "Project colours"). */
+export function projectColor(projects: Project[], id: string): string {
+  const index = projects.findIndex((p) => p.id === id);
+  return PALETTE[Math.max(index, 0) % PALETTE.length];
+}
+
 /** Header project picker ("All projects", "New project…") with a settings gear for the selected project. */
 export function ProjectSwitcher({ projects, view, onSwitch, onChanged, onError }: ProjectSwitcherProps) {
   const [dialog, setDialog] = useState<"new" | "settings" | null>(null);
@@ -40,7 +48,7 @@ export function ProjectSwitcher({ projects, view, onSwitch, onChanged, onError }
   };
   return (
     <>
-      <select class="project-switcher" value={view} onChange={choose} title="Project">
+      <select class="project-switcher" value={view} onChange={choose} title="Project" style={current ? { borderLeft: `6px solid ${projectColor(projects, current.id)}` } : undefined}>
         {projects.map((p) => (
           <option key={p.id} value={p.id}>
             {p.name}
