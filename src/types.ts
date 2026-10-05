@@ -251,6 +251,7 @@ export type ServerEvent =
   | { type: "task"; task: Task }
   | { type: "pr"; pr: PrState }
   | { type: "pr_removed"; number: number } // merged or closed; drop it from the PR list
+  | { type: "task_removed"; taskId: string } // discarded
   | { type: "log"; taskId: string; line: string }
   | { type: "scores"; snapshot: { sha: string; createdAt: string } }
   | { type: "scan"; node: NodeId; status: "running" | "done" | "failed"; message?: string };

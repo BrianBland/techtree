@@ -129,6 +129,7 @@ function delegate(real: Backend): Backend {
     answer: (id, text) => real.answer(id, text),
     openPr: (id) => real.openPr(id),
     cancel: (id) => real.cancel(id),
+    discard: (id) => real.discard(id),
     report: (id, report) => real.report(id, report),
     setBabysit: (n, on) => real.setBabysit(n, on),
     rescore: () => real.rescore(),

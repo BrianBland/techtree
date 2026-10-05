@@ -1,6 +1,6 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -181,6 +181,28 @@ export class TaskRunner {
     return task;
   }
 
+  /** Throw away a task that should never become a PR: stop it, remove its worktree, local branch, log, session and row. */
+  discard(taskId: string): void {
+    const task = this.require(taskId);
+    if (task.state === "pr_open") throw new Error(`task ${taskId} has an open PR; close it on GitHub first`);
+    const worker = this.workers.get(task.id);
+    if (worker) {
+      this.workers.delete(task.id);
+      clearDialog(worker);
+      worker.child.kill();
+    }
+    this.resumePrompts.delete(task.id);
+    this.checkingOut.delete(task.id);
+    if (task.worktree) tryGit(this.opts.repoRoot, "worktree", "remove", "--force", task.worktree);
+    if (task.branch) tryGit(this.opts.repoRoot, "branch", "-D", task.branch);
+    if (task.logPath) rmSync(task.logPath, { force: true });
+    rmSync(this.sessionDir(task), { recursive: true, force: true });
+    this.tasks.delete(task.id);
+    this.opts.db.prepare("DELETE FROM tasks WHERE id = ?").run(task.id);
+    this.opts.onEvent?.({ type: "task_removed", taskId: task.id });
+    this.pump();
+  }
+
   /** `git diff <baseRef>...HEAD` in the task's worktree. */
   diff(taskId: string): string {
     const task = this.require(taskId);
@@ -279,6 +301,12 @@ export class TaskRunner {
       return;
     }
     this.checkingOut.delete(task.id);
+    if (!this.tasks.has(task.id)) {
+      // Discarded during checkout.
+      tryGit(this.opts.repoRoot, "worktree", "remove", "--force", path);
+      tryGit(this.opts.repoRoot, "branch", "-D", branch);
+      return this.pump();
+    }
     this.useWorktree(task, path, branch);
     if (task.state !== "running" || this.closed) return this.pump();
     this.spawnWorker(task, task.prompt);
@@ -544,6 +572,15 @@ function splitLines(stream: NodeJS.ReadableStream, onLine: (line: string) => voi
 
 function git(cwd: string, ...args: string[]): string {
   return execFileSync("git", args, { cwd, encoding: "utf8", maxBuffer: 64 * 1024 * 1024, stdio: ["ignore", "pipe", "pipe"] });
+}
+
+/** `git`, ignoring failure (e.g. the worktree or branch is already gone). */
+function tryGit(cwd: string, ...args: string[]): void {
+  try {
+    git(cwd, ...args);
+  } catch {
+    // already gone
+  }
 }
 
 /** Kill a previous server's worker, checking its command line so a reused pid is left alone. */

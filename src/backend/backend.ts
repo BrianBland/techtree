@@ -254,6 +254,10 @@ export class RepoBackend implements Backend {
     return this.runnerCall(() => this.runner().openPr(taskId));
   }
 
+  async discard(taskId: string): Promise<void> {
+    return this.runnerCall(() => this.runner().discard(taskId));
+  }
+
   async cancel(taskId: string): Promise<Task> {
     return this.runnerCall(() => this.runner().cancel(taskId));
   }

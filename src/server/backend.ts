@@ -34,6 +34,8 @@ export interface Backend {
   answer(taskId: string, text: string): Promise<Task>;
   openPr(taskId: string): Promise<Task>;
   cancel(taskId: string): Promise<Task>;
+  /** Stop and delete a task, its worktree and local branch (not for `pr_open`). */
+  discard(taskId: string): Promise<void>;
   report(taskId: string, report: WorkerReport): Promise<Task>;
   setBabysit(prNumber: number, on: boolean): Promise<PrState>;
   rescore(): Promise<void>;

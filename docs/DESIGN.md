@@ -295,6 +295,7 @@ A node's `ownCtas` are those anchored at the node; `childCtas` are the top 10 an
   - "Open PR" (`review` → `queued` → `running`, phase `pr`) resumes the same pi session with an instruction to push to the upstream remote and open the PR with `gh`, following the repo's PR template.
   - Otherwise the worker opens the PR itself in one go. Once the PR number is found the task records it, moves to `pr_open` and the child is ended. Nothing ever merges.
 - **Cancel:** stops the child (if any) and marks the task `failed` with error `cancelled`. The worktree is kept.
+- **Discard:** for junk work that should never become a PR. Allowed in every state except `pr_open` (close the PR on GitHub first). Stops the child (if any), force-removes the worktree, deletes the local `techtree/<task>` branch (never a remote branch), deletes the task row, its log and its session, and emits `task_removed`. Its findings become suggestions again.
 - **Babysit tasks:** a task started with `pr: <number>` (runner-only `StartTask` field) adopts that existing PR instead of opening one: its worktree is created detached at `baseRef` and then switched with `gh pr checkout <number> --branch techtree/<task>`, run asynchronously with a 5-minute timeout while the task holds a worker slot (a task cancelled meanwhile never spawns a worker), its prompt is sent as given (the caller includes `/skill:techtree-babysit`), and its PR lookup uses the PR number. `resumeTask(task, prompt)` queues a `pr_open` task that has a worktree to respawn on its session with `prompt`. Babysit itself is described under "PRs".
 - **Recovery:** task state lives in SQLite. RPC runs over the child's stdio, so a new server cannot reattach to an old child; and when the server dies, the child's stdin closes and pi shuts down. On start, for each task persisted as `running`, `needs_input`, or `queued` with a worktree, the runner stops any process still alive at the recorded pid.
   - If the task's pi session file exists, `running` tasks are queued to respawn on that session (`--session-id`) with a short "continue" prompt. `needs_input` tasks keep their question and are queued to respawn on that session when answered; an answer to a lost dialog is sent as a prompt. An answer or "Open PR" still waiting in the queue during a restart is lost: the task resumes with the "continue" prompt, or the PR instruction if it is in the PR stage.
@@ -387,6 +388,7 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question → `Task` |
 | `POST /api/tasks/:id/open-pr` | `review` → `pr_open` → `Task` |
 | `POST /api/tasks/:id/cancel` | stop the child, mark `failed` → `Task` |
+| `POST /api/tasks/:id/discard` | stop the child, delete worktree, local branch and task (not for `pr_open`) → `{ ok: true }` |
 | `POST /api/prs/:number/babysit` | body `{ on: boolean }` → `PrState` |
 | `POST /api/score` | rescore the repo → `{ ok: true }`; completion arrives as a `scores` event |
 | `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree → `{ ok: true }`; progress arrives as `scan` events |

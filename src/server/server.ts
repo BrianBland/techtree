@@ -141,6 +141,10 @@ function apiRoutes(backend: Backend): Route[] {
     }),
     post(/^\/api\/tasks\/([^/]+)\/open-pr$/, (_req, _url, [id]) => backend.openPr(id)),
     post(/^\/api\/tasks\/([^/]+)\/cancel$/, (_req, _url, [id]) => backend.cancel(id)),
+    post(/^\/api\/tasks\/([^/]+)\/discard$/, async (_req, _url, [id]) => {
+      await backend.discard(id);
+      return { ok: true };
+    }),
     post(/^\/api\/tasks\/([^/]+)\/report$/, async (req, _url, [id]) =>
       backend.report(id, workerReport(await readJson(req))),
     ),

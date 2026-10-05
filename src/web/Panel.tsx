@@ -306,11 +306,22 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
             {task.pr ? ` · PR #${task.pr}` : ""}
           </div>
         </div>
-        {["queued", "running", "needs_input", "review"].includes(task.state) && (
-          <button class="link" onClick={() => taskAction(task, "cancel", onError)}>
-            cancel
-          </button>
-        )}
+        <span>
+          {["queued", "running", "needs_input", "review"].includes(task.state) && (
+            <button class="link" onClick={() => taskAction(task, "cancel", onError)}>
+              cancel
+            </button>
+          )}
+          {task.state !== "pr_open" && (
+            <button
+              class="link"
+              title="Delete the worktree, local branch and task without opening a PR"
+              onClick={() => confirm(`Discard "${task.title}"? Its worktree and local branch are deleted.`) && taskAction(task, "discard", onError)}
+            >
+              discard
+            </button>
+          )}
+        </span>
       </div>
       {task.checklist.length > 0 && (
         <ul class="checklist">

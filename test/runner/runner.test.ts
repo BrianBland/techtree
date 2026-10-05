@@ -371,3 +371,21 @@ test("prFromText takes the last PR URL in the worker's message", { timeout: 5000
   assert.equal(prFromText("no link here"), undefined);
   assert.equal(prFromText(undefined), undefined);
 });
+
+test("discard stops the worker and deletes worktree, local branch and task; open PRs are refused", async (t) => {
+  const h = await setup(t, 1);
+  const a = h.runner.start(req("hang"));
+  const b = h.runner.start(req("hang"));
+  const running = await h.waitFor(a.id, (x) => x.checklist.length === 1);
+
+  h.runner.discard(a.id);
+  assert.equal(h.runner.get(a.id), undefined);
+  assert.equal(h.db.prepare("SELECT id FROM tasks WHERE id = ?").get(a.id), undefined);
+  assert.equal(git(h.repo, "worktree", "list").includes(running.worktree!), false);
+  assert.equal(git(h.repo, "branch", "--list", running.branch!).trim(), "");
+  await h.waitFor(b.id, (x) => x.state === "running"); // the freed slot is reused
+
+  const stuck = h.runner.get(b.id)!;
+  stuck.state = "pr_open";
+  assert.throws(() => h.runner.discard(b.id), /open PR/);
+});

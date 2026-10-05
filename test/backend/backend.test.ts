@@ -95,6 +95,16 @@ test("maps unknown ids and wrong task states to HTTP errors", { timeout: 30_000 
   assert.equal(status(await backend.openPr(task.id).catch((e) => e)), 409);
 });
 
+test("discard removes the task and emits task_removed", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  const { backend, events } = await boot(t, repo, cache, tmp);
+  assert.equal(status(await backend.discard("nope").catch((e) => e)), 404);
+  const task = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true });
+  await backend.discard(task.id);
+  assert.ok(events.some((e) => e.type === "task_removed" && e.taskId === task.id));
+  assert.equal((await backend.getState()).tasks.some((x) => x.id === task.id), false);
+});
+
 test("rescore requests during a run queue exactly one more run", { timeout: 30_000 }, async (t) => {
   const { tmp, repo, cache } = fixture(t);
   const { backend, events } = await boot(t, repo, cache, tmp);
