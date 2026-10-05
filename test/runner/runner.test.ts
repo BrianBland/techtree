@@ -44,7 +44,7 @@ async function setup(t: TestContext, workers = 3): Promise<Harness> {
   writeFileSync(join(repo, "README.md"), "hello\n");
   git(repo, "add", "-A");
   git(repo, "commit", "-qm", "init");
-  writeFileSync(join(bin, "gh"), "#!/bin/sh\ncat .fake-pr 2>/dev/null || exit 1\n");
+  writeFileSync(join(bin, "gh"), "#!/bin/sh\nsleep ${FAKE_GH_DELAY:-0}\ncat .fake-pr 2>/dev/null || exit 1\n");
   chmodSync(join(bin, "gh"), 0o755);
   const path = process.env.PATH;
   process.env.PATH = `${bin}:${path}`;
@@ -117,6 +117,29 @@ const req = (scenario: string, manualReview = true): StartTask => ({
 });
 
 const log = (task: Task) => readFileSync(task.logPath!, "utf8");
+
+function persist(h: Harness, id: string, state: Task["state"], extra: Partial<Task> = {}): Task {
+  const now = new Date().toISOString();
+  const task: Task = {
+    id, node: "", title: id, prompt: "", findingIds: [], state, manualReview: true, plannedFrom: 0, plannedTo: 0,
+    checklist: [{ text: "step", done: false }], phase: "edit", logPath: join(h.cache, "tasks", `${id}.log`),
+    createdAt: now, updatedAt: now, ...extra,
+  };
+  h.db.prepare("INSERT INTO tasks (id, node, state, data, updated_at) VALUES (?, ?, ?, ?, ?)")
+    .run(id, "", state, JSON.stringify(task), now);
+  return task;
+}
+
+async function processGone(pid: number): Promise<void> {
+  for (;;) {
+    try {
+      process.kill(pid, 0);
+    } catch {
+      return;
+    }
+    await new Promise((r) => setTimeout(r, 10));
+  }
+}
 
 test("runs at most `workers` tasks and starts queued ones FIFO as slots free", async (t) => {
   const h = await setup(t, 2);
@@ -209,6 +232,9 @@ test("reports are validated against the task", async (t) => {
   await h.waitFor(id, (x) => x.checklist.length === 1);
   assert.throws(() => h.runner.report(id, { done: 1 }), /no checklist item 1/);
   assert.throws(() => h.runner.report(id, { phase: "nap" as never }), /unknown phase/);
+  for (const done of ["__proto__", "length", -1, 0.5])
+    assert.throws(() => h.runner.report(id, { done } as never), /no checklist item/);
+  assert.equal(Object.hasOwn(Array.prototype, "done"), false);
   h.runner.cancel(id);
   assert.throws(() => h.runner.report(id, { done: 0 }), /is failed/);
 });
@@ -219,17 +245,7 @@ test("restart recovery resumes sessions, fails lost workers and leaves settled t
   await h.waitFor(resumable, (x) => x.checklist.length === 1);
   h.runner.close();
 
-  const now = new Date().toISOString();
-  const persisted = (id: string, state: Task["state"], extra: Partial<Task> = {}): Task => {
-    const task: Task = {
-      id, node: "", title: id, prompt: "", findingIds: [], state, manualReview: true, plannedFrom: 0, plannedTo: 0,
-      checklist: [{ text: "step", done: false }], phase: "edit", logPath: join(h.cache, "tasks", `${id}.log`),
-      createdAt: now, updatedAt: now, ...extra,
-    };
-    h.db.prepare("INSERT INTO tasks (id, node, state, data, updated_at) VALUES (?, ?, ?, ?, ?)")
-      .run(id, "", state, JSON.stringify(task), now);
-    return task;
-  };
+  const persisted = (id: string, state: Task["state"], extra: Partial<Task> = {}) => persist(h, id, state, extra);
   const lost = persisted("lost", "running", { pid: 999_999 });
   const review = persisted("rev", "review");
   const prOpen = persisted("pr", "pr_open", { pr: 3 });
@@ -251,7 +267,85 @@ test("restart recovery resumes sessions, fails lost workers and leaves settled t
   assert.deepEqual(runner.get("pr"), prOpen);
 
   assert.equal(runner.get("asking")!.state, "needs_input");
+  assert.throws(() => runner.report("asking", { done: 0 }), /no live worker/);
   runner.answer("asking", "left");
   const answered = await h.waitFor("asking", (x) => x.state === "review");
   assert.match(log(answered), /assistant: resumed: left/);
+});
+
+test("recovery launches queued tasks only after the sweep, so they are not mistaken for lost workers", async (t) => {
+  const h = await setup(t);
+  h.runner.close();
+  persist(h, "lost", "running", { createdAt: "2020-01-01T00:00:00.000Z" });
+  persist(h, "waiting", "queued", { checklist: [], prompt: "scenario:hang", createdAt: "2020-01-02T00:00:00.000Z" });
+  const runner = h.newRunner();
+  runner.recover();
+  assert.equal(runner.get("lost")!.state, "failed");
+  const started = await h.waitFor("waiting", (x) => x.checklist.length === 1);
+  assert.equal(started.state, "running");
+});
+
+test("resumed tasks wait for a worker slot like new ones", async (t) => {
+  const h = await setup(t, 1);
+  const [a, b] = [h.runner.start(req("happy")), h.runner.start(req("happy"))];
+  await h.waitFor(a.id, (x) => x.state === "review");
+  await h.waitFor(b.id, (x) => x.state === "review");
+  h.runner.openPr(a.id);
+  assert.equal(h.runner.openPr(b.id).state, "queued");
+  await h.waitFor(a.id, (x) => x.state === "pr_open");
+  assert.equal((await h.waitFor(b.id, (x) => x.state === "pr_open")).pr, 42);
+});
+
+test("a prompt rejected by pi fails the task with pi's error", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("reject"));
+  const failed = await h.waitFor(id, (x) => x.state === "failed");
+  assert.match(failed.error!, /No API key found/);
+});
+
+test("records from a cancelled worker cannot change the task", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("late"));
+  const { pid } = await h.waitFor(id, (x) => x.checklist.length === 1);
+  h.runner.cancel(id);
+  await processGone(pid!);
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal(h.runner.get(id)!.state, "failed");
+  const row = h.db.prepare("SELECT state FROM tasks WHERE id = ?").get(id) as { state: string };
+  assert.equal(row.state, "failed");
+});
+
+test("a dialog that times out returns the task to running", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("timeout"));
+  await h.waitFor(id, (x) => x.state === "needs_input");
+  const resumed = await h.waitFor(id, (x) => x.state === "running");
+  assert.equal(resumed.question, undefined);
+  assert.equal(resumed.checklist[0].done, false);
+  const done = await h.waitFor(id, (x) => x.state === "review");
+  assert.match(log(done), /assistant: confirmed: false/);
+});
+
+test("an agent that settles with a dialog open has had the dialog resolved by pi", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("expired"));
+  await h.waitFor(id, (x) => x.state === "needs_input");
+  const done = await h.waitFor(id, (x) => x.state === "review");
+  assert.equal(done.question, undefined);
+});
+
+test("a slow PR lookup does not block the event loop", async (t) => {
+  const h = await setup(t);
+  process.env.FAKE_GH_DELAY = "1";
+  t.after(() => delete process.env.FAKE_GH_DELAY);
+  let last = Date.now();
+  let maxGap = 0;
+  const ticker = setInterval(() => {
+    maxGap = Math.max(maxGap, Date.now() - last);
+    last = Date.now();
+  }, 20);
+  t.after(() => clearInterval(ticker));
+  const { id } = h.runner.start(req("auto", false));
+  assert.equal((await h.waitFor(id, (x) => x.state === "pr_open")).pr, 7);
+  assert.ok(maxGap < 500, `event loop blocked for ${maxGap}ms`);
 });

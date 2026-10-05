@@ -1,9 +1,10 @@
-import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { promisify } from "node:util";
 import type { Db } from "../db.ts";
 import type { Config, ServerEvent, StartTaskRequest, Task, TaskPhase } from "../types.ts";
 import type { ReportPayload } from "./report-tool.ts";
@@ -27,6 +28,7 @@ export type StartTask = StartTaskRequest & { plannedFrom: number; plannedTo: num
 interface Dialog {
   id: string;
   method: string;
+  timer?: NodeJS.Timeout;
 }
 
 interface Worker {
@@ -39,9 +41,9 @@ interface Worker {
 }
 
 const PHASES: TaskPhase[] = ["plan", "explore", "edit", "test", "pr"];
-const SETTLED_STATES = new Set(["review", "pr_open", "done", "failed"]);
 
 const CONTINUE_PROMPT = "techtree restarted. Continue the task where you left off.";
+const PR_LOOKUP_TIMEOUT_MS = 60_000;
 const NUDGE_PROMPT =
   "You stopped before the task was finished (checklist incomplete, or no PR found where one is required). " +
   "Continue the task. If you are blocked, call techtree_report with {needs_input: question}.";
@@ -51,8 +53,11 @@ export class TaskRunner {
   private readonly opts: TaskRunnerOptions;
   private readonly tasks = new Map<string, Task>();
   private readonly workers = new Map<string, Worker>();
+  /** First prompt for queued tasks that resume an existing worktree and session. */
+  private readonly resumePrompts = new Map<string, string>();
   private readonly packageRoot: string;
   private closed = false;
+  private recovering = false;
 
   constructor(opts: TaskRunnerOptions) {
     this.opts = opts;
@@ -99,11 +104,14 @@ export class TaskRunner {
   report(taskId: string, payload: ReportPayload): Task {
     const task = this.require(taskId);
     if (task.state !== "running" && task.state !== "needs_input") throw new Error(`task ${taskId} is ${task.state}`);
+    const worker = this.workers.get(taskId);
+    if (!worker) throw new Error(`task ${taskId} has no live worker`);
     const { plan, phase, done, needs_input } = payload;
     if (phase !== undefined && !PHASES.includes(phase)) throw new Error(`unknown phase ${phase}`);
     if (plan !== undefined && !Array.isArray(plan)) throw new Error("plan must be a list of steps");
     const checklist = plan ? plan.map((text) => ({ text: String(text), done: false })) : task.checklist;
-    if (done !== undefined && !checklist[done]) throw new Error(`no checklist item ${done}`);
+    if (done !== undefined && !(Number.isInteger(done) && done >= 0 && done < checklist.length))
+      throw new Error(`no checklist item ${done}`);
     task.checklist = checklist;
     if (phase) task.phase = phase;
     if (done !== undefined) checklist[done].done = true;
@@ -111,8 +119,7 @@ export class TaskRunner {
       task.state = "needs_input";
       task.question = needs_input;
     }
-    const worker = this.workers.get(taskId);
-    if (worker) worker.nudged = false;
+    worker.nudged = false;
     this.log(task, `report: ${JSON.stringify(payload)}`);
     this.save(task);
     return task;
@@ -122,19 +129,18 @@ export class TaskRunner {
   answer(taskId: string, text: string): Task {
     const task = this.require(taskId);
     if (task.state !== "needs_input") throw new Error(`task ${taskId} is not waiting for input`);
-    task.state = "running";
     task.question = undefined;
     this.log(task, `answer: ${text}`);
     const worker = this.workers.get(taskId);
     if (!worker) {
-      this.save(task);
-      this.spawnWorker(task, text);
+      this.resume(task, text);
       return task;
     }
+    task.state = "running";
     worker.nudged = false;
     if (worker.dialog) {
       send(worker, dialogResponse(worker.dialog, text));
-      worker.dialog = undefined;
+      clearDialog(worker);
     } else {
       this.prompt(task, worker, text);
     }
@@ -146,14 +152,8 @@ export class TaskRunner {
   openPr(taskId: string): Task {
     const task = this.require(taskId);
     if (task.state !== "review") throw new Error(`task ${taskId} is ${task.state}, not review`);
-    task.state = "running";
     task.phase = "pr";
-    this.save(task);
-    this.spawnWorker(
-      task,
-      `The change was reviewed and approved. Push branch ${task.branch} to the upstream remote and open a pull request ` +
-        "with gh, following the repository's PR template. Never merge. Call techtree_report {phase: \"pr\"} first.",
-    );
+    this.resume(task, openPrPrompt(task));
     return task;
   }
 
@@ -172,24 +172,27 @@ export class TaskRunner {
 
   /** Resume or fail tasks whose worker belonged to a previous server. Call once on server start. */
   recover(): void {
+    this.recovering = true;
     for (const task of this.tasks.values()) {
-      if (task.state !== "running" && task.state !== "needs_input") continue;
+      const resumable = task.state === "running" || task.state === "needs_input" || (task.state === "queued" && task.worktree);
+      if (!resumable) continue;
       if (task.pid) killOrphanedWorker(task.pid, task.id);
       task.pid = undefined;
-      if (!this.hasSession(task)) {
-        this.fail(task, `worker lost on restart; log: ${task.logPath}`);
-        continue;
-      }
-      this.save(task);
-      if (task.state === "running") this.spawnWorker(task, CONTINUE_PROMPT);
+      if (!this.hasSession(task)) this.fail(task, `worker lost on restart; log: ${task.logPath}`);
+      else if (task.state === "running") this.resume(task, CONTINUE_PROMPT);
+      else this.save(task);
     }
+    this.recovering = false;
     this.pump();
   }
 
   /** Detach from all workers without changing task state; their pi processes exit when stdin closes. */
   close(): void {
     this.closed = true;
-    for (const worker of this.workers.values()) worker.child.stdin?.end();
+    for (const worker of this.workers.values()) {
+      clearDialog(worker);
+      worker.child.stdin?.end();
+    }
     this.workers.clear();
   }
 
@@ -199,8 +202,16 @@ export class TaskRunner {
     return task;
   }
 
+  /** Queue a task that already has a worktree and session; it respawns with `prompt` when a slot frees. */
+  private resume(task: Task, prompt: string): void {
+    task.state = "queued";
+    this.resumePrompts.set(task.id, prompt);
+    this.save(task);
+    this.pump();
+  }
+
   private pump(): void {
-    if (this.closed) return;
+    if (this.closed || this.recovering) return;
     for (const task of this.tasks.values()) {
       if (this.workers.size >= this.opts.config.workers) return;
       if (task.state === "queued") this.launch(task);
@@ -208,6 +219,14 @@ export class TaskRunner {
   }
 
   private launch(task: Task): void {
+    if (task.worktree) {
+      const prompt = this.resumePrompts.get(task.id) ?? (task.phase === "pr" && task.manualReview ? openPrPrompt(task) : CONTINUE_PROMPT);
+      this.resumePrompts.delete(task.id);
+      task.state = "running";
+      this.save(task);
+      this.spawnWorker(task, prompt);
+      return;
+    }
     task.state = "running";
     try {
       this.createWorktree(task);
@@ -267,11 +286,7 @@ export class TaskRunner {
       if (ended) return;
       ended = true;
       if (this.workers.get(task.id) !== worker) return;
-      this.workers.delete(task.id);
-      task.pid = undefined;
-      if (SETTLED_STATES.has(task.state)) this.save(task);
-      else this.fail(task, `worker ${reason}; log: ${task.logPath}`);
-      this.pump();
+      this.fail(task, `worker ${reason}; log: ${task.logPath}`);
     };
     child.on("error", (err) => onEnd(`failed to start: ${err.message}`));
     child.on("exit", (code, signal) => onEnd(`exited (${signal ?? code})`));
@@ -288,6 +303,7 @@ export class TaskRunner {
   }
 
   private onRecord(task: Task, worker: Worker, line: string): void {
+    if (this.workers.get(task.id) !== worker) return;
     let record: RpcRecord;
     try {
       record = JSON.parse(line) as RpcRecord;
@@ -297,23 +313,48 @@ export class TaskRunner {
     }
     const text = describeRpcRecord(record);
     if (text) this.log(task, text);
-    if (record.type === "response" && record.command === "prompt") worker.unacknowledgedPrompts--;
+    if (record.type === "response" && record.command === "prompt") {
+      worker.unacknowledgedPrompts--;
+      if (record.success === false) return this.fail(task, `pi rejected the prompt: ${record.error}`);
+    }
     if (isAssistantMessageEnd(record)) worker.lastText = text ?? "";
     if (record.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(record.method)) {
-      worker.dialog = { id: record.id, method: record.method };
-      task.state = "needs_input";
-      task.question = [record.title, typeof record.message === "string" && record.message, record.options?.join(" / ")].filter(Boolean).join("\n");
-      this.save(task);
+      this.openDialog(task, worker, record);
     }
-    if (record.type === "agent_settled" && task.state === "running" && worker.unacknowledgedPrompts === 0)
-      this.onSettled(task, worker);
+    if (record.type === "agent_settled" && worker.unacknowledgedPrompts === 0) {
+      // A dialog blocks the agent, so settling proves pi already resolved it (e.g. by its timeout).
+      if (worker.dialog) this.dropDialog(task, worker, "dialog resolved without an answer");
+      if (task.state === "running") void this.onSettled(task, worker);
+    }
   }
 
-  private onSettled(task: Task, worker: Worker): void {
+  private openDialog(task: Task, worker: Worker, record: RpcRecord): void {
+    clearDialog(worker);
+    worker.dialog = { id: record.id, method: record.method };
+    if (record.timeout)
+      worker.dialog.timer = setTimeout(() => this.dropDialog(task, worker, "dialog timed out"), record.timeout);
+    task.state = "needs_input";
+    task.question = [record.title, typeof record.message === "string" && record.message, record.options?.join(" / ")]
+      .filter(Boolean)
+      .join("\n");
+    this.save(task);
+  }
+
+  private dropDialog(task: Task, worker: Worker, reason: string): void {
+    clearDialog(worker);
+    if (this.workers.get(task.id) !== worker || task.state !== "needs_input") return;
+    task.state = "running";
+    task.question = undefined;
+    this.log(task, reason);
+    this.save(task);
+  }
+
+  private async onSettled(task: Task, worker: Worker): Promise<void> {
     if (task.checklist.length > 0 && task.checklist.every((item) => item.done)) {
       const prStage = !task.manualReview || task.phase === "pr";
       if (!prStage) return this.stop(task, worker, "review");
-      const pr = this.findPr(task);
+      const pr = await findPr(task);
+      if (this.workers.get(task.id) !== worker || task.state !== "running") return;
       if (pr !== undefined) {
         task.pr = pr;
         return this.stop(task, worker, "pr_open");
@@ -332,22 +373,11 @@ export class TaskRunner {
   private stop(task: Task, worker: Worker, state: "review" | "pr_open"): void {
     task.state = state;
     this.log(task, `state: ${state}`);
+    this.workers.delete(task.id);
+    task.pid = undefined;
     this.save(task);
     worker.child.stdin?.end();
-  }
-
-  private findPr(task: Task): number | undefined {
-    try {
-      const out = execFileSync("gh", ["pr", "view", task.branch!, "--json", "number", "--jq", ".number"], {
-        cwd: task.worktree,
-        encoding: "utf8",
-        stdio: ["ignore", "pipe", "ignore"],
-      });
-      const n = Number(out.trim());
-      return Number.isInteger(n) && n > 0 ? n : undefined;
-    } catch {
-      return undefined;
-    }
+    this.pump();
   }
 
   private fail(task: Task, error: string): void {
@@ -355,9 +385,11 @@ export class TaskRunner {
     task.error = error;
     task.question = undefined;
     this.log(task, `failed: ${error}`);
+    this.resumePrompts.delete(task.id);
     const worker = this.workers.get(task.id);
     if (worker) {
       this.workers.delete(task.id);
+      clearDialog(worker);
       worker.child.kill();
     }
     task.pid = undefined;
@@ -401,6 +433,31 @@ function finishRule(task: Task): string {
     ? "Manual review is on: when the checklist is done, commit on the current branch and stop. Do not push or open a PR."
     : "When the checklist is done, commit, push the branch to the upstream remote and open a PR with gh, " +
         "following the repository's PR template. Never merge.";
+}
+
+function openPrPrompt(task: Task): string {
+  return (
+    `The change was reviewed and approved. Push branch ${task.branch} to the upstream remote and open a pull request ` +
+    "with gh, following the repository's PR template. Never merge. Call techtree_report {phase: \"pr\"} first."
+  );
+}
+
+async function findPr(task: Task): Promise<number | undefined> {
+  try {
+    const { stdout } = await promisify(execFile)("gh", ["pr", "view", task.branch!, "--json", "number", "--jq", ".number"], {
+      cwd: task.worktree,
+      timeout: PR_LOOKUP_TIMEOUT_MS,
+    });
+    const n = Number(stdout.trim());
+    return Number.isInteger(n) && n > 0 ? n : undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+function clearDialog(worker: Worker): void {
+  clearTimeout(worker.dialog?.timer);
+  worker.dialog = undefined;
 }
 
 function dialogResponse(dialog: Dialog, text: string): object {

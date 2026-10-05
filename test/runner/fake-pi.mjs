@@ -29,6 +29,20 @@ const ask = (request) =>
     emit({ type: "extension_ui_request", ...request });
   });
 
+const sleep = (ms) => new Promise((resolve) => setTimeout(resolve, ms));
+async function timedDialog({ advertised, resolvesAfter, workAfter }, settle) {
+  await report({ plan: ["only"] });
+  const response = await Promise.race([
+    ask({ id: "d1", method: "confirm", title: "Proceed?", timeout: advertised }),
+    sleep(resolvesAfter).then(() => ({ confirmed: false })),
+  ]);
+  await sleep(workAfter);
+  say(`confirmed: ${response.confirmed}`);
+  commit();
+  await report({ done: 0 });
+  settle();
+}
+
 const scenarios = {
   async happy(message, settle) {
     if (message.includes("Push branch")) {
@@ -77,6 +91,17 @@ const scenarios = {
   async hang() {
     if (prompts === 1) await report({ plan: ["wait"] });
   },
+  // pi resolves a timed-out dialog itself; the run then keeps working for a while.
+  timeout: (_message, settle) => timedDialog({ advertised: 100, resolvesAfter: 100, workAfter: 300 }, settle),
+  // pi's clock resolves the dialog before the runner's timer would, and the agent settles at once.
+  expired: (_message, settle) => timedDialog({ advertised: 60_000, resolvesAfter: 20, workAfter: 0 }, settle),
+  async late() {
+    process.on("SIGTERM", () => {
+      emit({ type: "extension_ui_request", id: "late", method: "confirm", title: "Still there?" });
+      setTimeout(() => process.exit(0), 50);
+    });
+    await report({ plan: ["linger"] });
+  },
   async crash() {
     await report({ plan: ["boom"] });
     process.exit(3);
@@ -95,11 +120,13 @@ function onCommand(command) {
   if (command.type !== "prompt") return emit({ type: "response", id: command.id, command: command.type, success: false, error: "unsupported" });
   // The asking run's settle crossing the answer on the wire: it must not count as the answered run settling.
   if (scenario === "ask" && prompts === 1) emit({ type: "agent_settled" });
-  emit({ type: "response", id: command.id, command: "prompt", success: true, data: { disposition: "started" } });
   if (!scenario) {
     scenario = /scenario:(\w+)/.exec(command.message)?.[1] ?? "hang";
     writeFileSync(sessionFile, JSON.stringify({ type: "session", id: arg("--session-id"), scenario }) + "\n");
   }
+  if (scenario === "reject")
+    return emit({ type: "response", id: command.id, command: "prompt", success: false, error: "No API key found" });
+  emit({ type: "response", id: command.id, command: "prompt", success: true, data: { disposition: "started" } });
   prompts++;
   emit({ type: "agent_start" });
   scenarios[scenario](command.message, settlerFor(prompts)).catch((err) => {

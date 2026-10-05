@@ -6,6 +6,7 @@ export type RpcRecord = {
   title?: string;
   message?: string | AgentMessage;
   options?: string[];
+  timeout?: number;
   command?: string;
   success?: boolean;
   error?: string;
