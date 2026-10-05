@@ -35,7 +35,7 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
     };
   }, [view, attentionKey(state), version, all && eventTick]);
 
-  const [projectTask, setProjectTask] = useState<{ kind: TaskKind; title: string } | null>(null);
+  const [projectTask, setProjectTask] = useState<{ kind: TaskKind; title: string; project: string } | null>(null);
   const overview = fetched?.view === view ? fetched.overview : null;
   if (!overview) return <aside class="panel muted">Loading…</aside>;
   const nodeName = (id: NodeId) => (id === "" ? state.repo.name : id);
@@ -85,14 +85,29 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
           <h3>{scored ? "Scorer" : "No scorer yet"}</h3>
           {!scored && <p class="small">Draft a scorer to measure progress toward the goal, or plan the work as items to track.</p>}
           <div class="actions">
-            <button onClick={() => setProjectTask({ kind: "scorer", title: scored ? "Refine scorer" : "Draft scorer" })}>
+            <button onClick={() => setProjectTask({ kind: "scorer", title: scored ? "Refine scorer" : "Draft scorer", project: state.project.id })}>
               {scored ? "Refine scorer" : "Draft scorer"}
             </button>
-            {(!scored || state.project.scorer.plan) && <button onClick={() => setProjectTask({ kind: "plan", title: "Plan the work" })}>Plan the work</button>}
+            {(!scored || state.project.scorer.plan) && (
+              <button onClick={() => setProjectTask({ kind: "plan", title: "Plan the work", project: state.project.id })}>Plan the work</button>
+            )}
           </div>
         </section>
       )}
-      {projectTask && <ProjectTaskDialog {...projectTask} project={state.project.id} onClose={() => setProjectTask(null)} onError={onError} />}
+      <Section title="Projects without a scorer" items={all ? projects.filter((p) => !p.builtin && !isScored(p)) : []}>
+        {(p) => (
+          <li key={p.id} class="row">
+            <div>
+              <span class="project-tag">{p.name}</span>
+            </div>
+            <div class="actions">
+              <button onClick={() => setProjectTask({ kind: "scorer", title: "Draft scorer", project: p.id })}>Draft scorer</button>
+              <button onClick={() => setProjectTask({ kind: "plan", title: "Plan the work", project: p.id })}>Plan the work</button>
+            </div>
+          </li>
+        )}
+      </Section>
+      {projectTask && <ProjectTaskDialog {...projectTask} onClose={() => setProjectTask(null)} onError={onError} />}
       <Section title="Top suggestions" items={overview.suggestions}>
         {(s) => (
           <li key={(s.project ?? "") + s.node + s.title}>

@@ -631,6 +631,35 @@ test("switching projects with a node open drops the old project's actions; All p
 
   choose("all");
   await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === "All projects", "the cross-project overview");
+  await app.waitFor(() => app.text().includes("Projects without a scorer"), "Perf listed without a scorer");
+  for (const label of ["Draft scorer", "Plan the work"]) assert.ok(app.find((n) => n.localName === "button" && n.textContent === label).length, label);
+});
+
+test("project settings show a scorer saved meanwhile, and saving a new name keeps it", UI_TIMEOUT, async (t) => {
+  const { app, backend } = await bootUi(t);
+  const perf = await backend.createProject({ name: "Perf" });
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  app.reconnect();
+  const switcher = () => app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as SmokeDriver["root"] & { value: string };
+  await app.waitFor(() => switcher().querySelectorAll((n) => n.localName === "option").some((o) => o.textContent === "Perf"), "Perf in the switcher");
+  switcher().value = perf.id;
+  switcher().dispatch("change");
+  await app.waitFor(() => app.text().includes("Draft scorer"), "Perf's overview");
+  await backend.updateProject(perf.id, { scorer: { rubric: "allocation-heavy hot paths" } }); // e.g. an accepted proposal
+
+  app.find((n) => n.localName === "button" && n.getAttribute("title") === "Project settings")[0].dispatch("click");
+  await app.waitFor(() => app.text().includes("Project settings"), "settings dialog");
+  const dialog = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0];
+  type Field = { value: string; getAttribute(name: string): string | null; dispatch(t: string): void };
+  const [, rubric] = dialog.querySelectorAll((n) => n.localName === "textarea") as unknown as Field[];
+  assert.equal(rubric.value ?? rubric.getAttribute("value"), "allocation-heavy hot paths", "the rubric textarea shows the current scorer");
+  const name = dialog.querySelectorAll((n) => n.localName === "input")[0] as unknown as Field;
+  name.value = "Faster";
+  name.dispatch("input");
+  await new Promise((r) => setTimeout(r, 0));
+  dialog.dispatch("submit");
+  await until(async () => (await backend.listProjects()).find((p) => p.id === perf.id)?.name === "Faster", "the rename");
+  assert.deepEqual((await backend.listProjects()).find((p) => p.id === perf.id)?.scorer, { rubric: "allocation-heavy hot paths" });
 });
 
 test("saving a project's goal shows the new goal", UI_TIMEOUT, async (t) => {

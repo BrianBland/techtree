@@ -62,6 +62,7 @@ function App() {
         setEventTick((n) => n + 1);
         setState((s) => s && { ...s, prs: s.prs.filter((p) => p.number !== event.number) });
       } else if (event.type === "scores") {
+        void loadProjects();
         resync();
       } else if (event.type === "scan") {
         setNotice(`Scan of ${event.node || "repo"}: ${event.status}${event.message ? ` (${event.message})` : ""}`);

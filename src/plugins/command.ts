@@ -43,29 +43,42 @@ function runCommand(argv: string[], ctx: CollectCtx): Promise<string> {
   const timeout = Number(ctx.config.plugins.command?.timeoutMs) || DEFAULT_TIMEOUT_MS;
   const [cmd, ...args] = argv;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: ctx.repoRoot, stdio: ["ignore", "pipe", "pipe"] });
+    // Its own process group, so a timeout also stops the benchmarks a wrapper script started.
+    const child = spawn(cmd, args, { cwd: ctx.repoRoot, stdio: ["ignore", "pipe", "pipe"], detached: true });
     let stdout = "";
     let stderr = "";
     child.stdout.setEncoding("utf8").on("data", (d: string) => (stdout += d));
     child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr += d));
-    let timedOut = false;
+    let settled = false;
     let killTimer: NodeJS.Timeout | undefined;
-    const timer = setTimeout(() => {
-      timedOut = true;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
-    }, timeout);
-    const lastStderr = () => stderr.trim().split("\n").at(-1) ?? "";
-    child.on("error", (err) => {
-      clearTimeout(timer);
-      reject(new Error(`${cmd} could not start: ${err.message}`));
-    });
-    child.on("close", (code, signal) => {
+    const settle = (err: Error | undefined) => {
+      if (settled) return;
+      settled = true;
       clearTimeout(timer);
       clearTimeout(killTimer);
-      if (timedOut) reject(new Error(`${cmd} timed out after ${timeout}ms`));
-      else if (code !== 0) reject(new Error(`${cmd} exited with ${signal ?? code}${lastStderr() ? `: ${lastStderr()}` : ""}`));
+      if (err) reject(err);
       else resolve(stdout);
+    };
+    const killGroup = (signal: NodeJS.Signals) => {
+      try {
+        process.kill(-child.pid!, signal);
+      } catch {
+        // the group is already gone
+      }
+    };
+    const timer = setTimeout(() => {
+      killGroup("SIGTERM");
+      killTimer = setTimeout(() => {
+        killGroup("SIGKILL");
+        settle(new Error(`${cmd} timed out after ${timeout}ms`));
+      }, KILL_GRACE_MS);
+    }, timeout);
+    const lastStderr = () => stderr.trim().split("\n").at(-1) ?? "";
+    child.on("error", (err) => settle(new Error(`${cmd} could not start: ${err.message}`)));
+    child.on("close", (code, signal) => {
+      if (killTimer) return settle(new Error(`${cmd} timed out after ${timeout}ms`));
+      if (code !== 0) return settle(new Error(`${cmd} exited with ${signal ?? code}${lastStderr() ? `: ${lastStderr()}` : ""}`));
+      settle(undefined);
     });
   });
 }

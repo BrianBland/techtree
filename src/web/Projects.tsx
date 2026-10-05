@@ -1,7 +1,7 @@
 import { useState } from "preact/hooks";
 import { ALL_PROJECTS, QUALITY } from "../core/projects.ts";
 import type { Project } from "../types.ts";
-import { send } from "./api.ts";
+import { get, send } from "./api.ts";
 
 const NEW_PROJECT = "__new";
 
@@ -18,7 +18,15 @@ export interface ProjectSwitcherProps {
 /** Header project picker ("All projects", "New project…") with a settings gear for the selected project. */
 export function ProjectSwitcher({ projects, view, onSwitch, onChanged, onError }: ProjectSwitcherProps) {
   const [dialog, setDialog] = useState<"new" | "settings" | null>(null);
+  const [editing, setEditing] = useState<Project | null>(null);
   const current = projects.find((p) => p.id === view);
+  const openSettings = () =>
+    get<Project[]>("/api/projects").then((list) => {
+      const fresh = list.find((p) => p.id === view);
+      if (!fresh) return onError(`no project ${view}`);
+      setEditing(fresh);
+      setDialog("settings");
+    }, (err: Error) => onError(err.message));
   const choose = (e: Event) => {
     const select = e.currentTarget as HTMLSelectElement;
     if (select.value === NEW_PROJECT) {
@@ -41,11 +49,11 @@ export function ProjectSwitcher({ projects, view, onSwitch, onChanged, onError }
         <option value={ALL_PROJECTS}>All projects</option>
         <option value={NEW_PROJECT}>New project…</option>
       </select>
-      <button class="link" title="Project settings" disabled={!current} onClick={() => setDialog("settings")}>
+      <button class="link" title="Project settings" disabled={!current} onClick={openSettings}>
         ⚙
       </button>
       {dialog === "new" && <ProjectDialog onDone={done} onClose={() => setDialog(null)} onError={onError} />}
-      {dialog === "settings" && current && <ProjectDialog project={current} onDone={done} onClose={() => setDialog(null)} onError={onError} />}
+      {dialog === "settings" && editing && <ProjectDialog project={editing} onDone={done} onClose={() => setDialog(null)} onError={onError} />}
     </>
   );
 }
