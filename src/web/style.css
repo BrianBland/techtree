@@ -214,6 +214,16 @@ main { flex: 1; display: flex; min-height: 0; }
 .diff .del { color: #ff8a95; }
 .answer p { margin: 6px 0; }
 .answer textarea { width: 100%; margin: 4px 0; }
+.action-bar { display: flex; flex-wrap: wrap; align-items: center; gap: 4px; margin: 6px 0; font-size: 12px; }
+.action-bar button { padding: 1px 8px; }
+.action-bar button.toggled { border-color: var(--accent); color: var(--accent); }
+.chat { border: 2px solid var(--line); background: var(--ink); padding: 6px 8px; margin: 6px 0; }
+.chat-log { max-height: 260px; overflow: auto; font-size: 12px; white-space: pre-wrap; }
+.chat-entry { margin: 4px 0; }
+.chat-entry.user { color: var(--gold); }
+.chat-entry.tool { font: 11px/1.4 var(--mono); color: var(--muted); }
+.chat form { display: flex; gap: 4px; align-items: flex-end; flex-wrap: wrap; margin-top: 6px; }
+.chat textarea { flex: 1; min-width: 160px; }
 .meter { height: 10px; background: var(--ink); border: 2px solid var(--line); }
 .meter > div { height: 100%; background: repeating-linear-gradient(90deg, var(--accent) 0 6px, transparent 6px 8px); }
 
