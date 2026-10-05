@@ -1,19 +1,45 @@
 #!/usr/bin/env node
-import { suppressSqliteWarning } from "./db.ts";
+import { resolve } from "node:path";
+import { loadConfig } from "./config.ts";
+import { score } from "./core/pipeline.ts";
+import { formatReport } from "./core/report.ts";
+import { recordFindings, saveSnapshot } from "./core/store.ts";
+import { dbCache, openDb, suppressSqliteWarning } from "./db.ts";
+import { cacheDir, repoId, repoRootOf } from "./paths.ts";
+import { defaultPlugins } from "./plugins/index.ts";
+import { llmScanPlugin } from "./plugins/llm-scan.ts";
 
 suppressSqliteWarning();
 
 const USAGE = `usage: techtree <command> [repo]
 
 commands:
-  score [repo]   score a repository headlessly and print a summary`;
+  score [repo]   score a repository headlessly, save a snapshot and print a summary`;
+
+async function scoreCommand(path: string): Promise<number> {
+  const repoRoot = repoRootOf(resolve(path));
+  const db = openDb(cacheDir(repoId(repoRoot)));
+  const started = performance.now();
+  const result = await score({
+    repoRoot,
+    config: loadConfig(repoRoot),
+    plugins: [...defaultPlugins, llmScanPlugin],
+    cache: dbCache(db),
+    log: (msg) => console.error(msg),
+  });
+  saveSnapshot(db, result);
+  recordFindings(db, result.findings, result.createdAt, true);
+  console.log(formatReport(result));
+  const nodes = Object.keys(result.tree.nodes).length;
+  console.error(`scored ${nodes} nodes, ${result.findings.length} findings in ${((performance.now() - started) / 1000).toFixed(1)}s`);
+  return 0;
+}
 
 async function main(argv: string[]): Promise<number> {
-  const [command] = argv;
+  const [command, arg] = argv;
   switch (command) {
     case "score":
-      console.error("score: not implemented yet");
-      return 1;
+      return scoreCommand(arg ?? ".");
     default:
       console.error(USAGE);
       return command ? 1 : 0;
