@@ -3,7 +3,7 @@ import { randomBytes, timingSafeEqual } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { extname, join, normalize, sep } from "node:path";
 import type { AddressInfo } from "node:net";
-import type { StartTaskRequest } from "../types.ts";
+import type { StartTaskRequest, TaskPhase } from "../types.ts";
 import { HttpError, type Backend, type WorkerReport } from "./backend.ts";
 
 export interface ServerOptions {
@@ -25,7 +25,9 @@ export interface RunningServer {
   close(): Promise<void>;
 }
 
-const COOKIE = "techtree_token";
+/** Cookies are not port-scoped, so each server (one per repo) needs its own cookie name. */
+const cookieName = (port: number) => `techtree_token_${port}`;
+const PHASES: readonly string[] = ["plan", "explore", "edit", "test", "pr"] satisfies TaskPhase[];
 const MAX_BODY = 1_000_000;
 const DEFAULT_TAIL = 200;
 const OK = { ok: true };
@@ -63,8 +65,8 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
     if (!isLocalHost(req.headers.host, port)) throw new HttpError(403, "unexpected Host header");
     const url = new URL(req.url ?? "/", `http://127.0.0.1:${port}`);
     const queryToken = url.searchParams.get("token");
-    if (!authorized(req, queryToken, token)) throw new HttpError(401, "missing or invalid token");
-    if (queryToken !== null) res.setHeader("Set-Cookie", `${COOKIE}=${token}; HttpOnly; SameSite=Strict; Path=/`);
+    if (!authorized(req, queryToken, token, cookieName(port))) throw new HttpError(401, "missing or invalid token");
+    if (queryToken !== null) res.setHeader("Set-Cookie", `${cookieName(port)}=${token}; HttpOnly; SameSite=Strict; Path=/`);
 
     if (!url.pathname.startsWith("/api/")) {
       if (queryToken !== null) {
@@ -91,7 +93,13 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
     throw new HttpError(404, `no route for ${req.method} ${url.pathname}`);
   }
 
-  await new Promise<void>((resolve) => server.listen(options.port ?? 0, "127.0.0.1", resolve));
+  await new Promise<void>((resolve, reject) => {
+    server.once("error", reject);
+    server.listen(options.port ?? 0, "127.0.0.1", () => {
+      server.off("error", reject);
+      resolve();
+    });
+  });
   port = (server.address() as AddressInfo).port;
   return {
     url: `http://127.0.0.1:${port}/?token=${token}`,
@@ -127,7 +135,7 @@ function apiRoutes(backend: Backend): Route[] {
     post(/^\/api\/tasks\/([^/]+)\/open-pr$/, (_req, _url, [id]) => backend.openPr(id)),
     post(/^\/api\/tasks\/([^/]+)\/cancel$/, (_req, _url, [id]) => backend.cancel(id)),
     post(/^\/api\/tasks\/([^/]+)\/report$/, async (req, _url, [id]) =>
-      backend.report(id, (await readJson(req)) as WorkerReport),
+      backend.report(id, workerReport(await readJson(req))),
     ),
     post(/^\/api\/prs\/(\d+)\/babysit$/, async (req, _url, [number]) => {
       const { on } = await readJson(req);
@@ -151,10 +159,10 @@ function isLocalHost(host: string | undefined, port: number): boolean {
   return host === `127.0.0.1:${port}` || host === `localhost:${port}`;
 }
 
-function authorized(req: IncomingMessage, queryToken: string | null, token: string): boolean {
+function authorized(req: IncomingMessage, queryToken: string | null, token: string, cookie: string): boolean {
   const bearer = /^Bearer (.+)$/.exec(req.headers.authorization ?? "")?.[1];
-  const cookie = new RegExp(`(?:^|;\\s*)${COOKIE}=([^;]+)`).exec(req.headers.cookie ?? "")?.[1];
-  return [queryToken, bearer, cookie].some((candidate) => candidate != null && sameSecret(candidate, token));
+  const cookieToken = new RegExp(`(?:^|;\\s*)${cookie}=([^;]+)`).exec(req.headers.cookie ?? "")?.[1];
+  return [queryToken, bearer, cookieToken].some((candidate) => candidate != null && sameSecret(candidate, token));
 }
 
 function sameSecret(a: string, b: string): boolean {
@@ -212,6 +220,18 @@ function startTaskRequest(body: Record<string, unknown>): StartTaskRequest {
     (prompt === undefined || typeof prompt === "string");
   if (!valid) throw new HttpError(400, "body must be a StartTaskRequest");
   return { node, findingIds, manualReview, ...(title === undefined ? {} : { title }), ...(prompt === undefined ? {} : { prompt }) };
+}
+
+function workerReport(body: Record<string, unknown>): WorkerReport {
+  const { plan, phase, done, needs_input } = body;
+  const valid =
+    (plan === undefined || (Array.isArray(plan) && plan.every((item) => typeof item === "string"))) &&
+    (phase === undefined || (typeof phase === "string" && PHASES.includes(phase))) &&
+    (done === undefined || (Number.isInteger(done) && (done as number) >= 0)) &&
+    (needs_input === undefined || typeof needs_input === "string") &&
+    [plan, phase, done, needs_input].some((field) => field !== undefined);
+  if (!valid) throw new HttpError(400, "body must be a WorkerReport");
+  return body as WorkerReport;
 }
 
 function streamEvents(req: IncomingMessage, res: ServerResponse, backend: Backend, heartbeatMs: number) {

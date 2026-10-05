@@ -80,7 +80,7 @@ test("binds 127.0.0.1 on a random port and puts the token in the url", () => {
 });
 
 test("api routes reject missing or wrong tokens with a JSON 401", async () => {
-  for (const headers of [{} as Record<string, string>, { authorization: "Bearer nope" }, { cookie: "techtree_token=nope" }]) {
+  for (const headers of [{} as Record<string, string>, { authorization: "Bearer nope" }, { cookie: `techtree_token_${server.port}=nope` }]) {
     const res = await api("/api/state", { headers });
     assert.equal(res.status, 401);
     assert.deepEqual(await res.json(), { error: "missing or invalid token" });
@@ -98,14 +98,32 @@ test("query token sets a strict HttpOnly cookie and page loads redirect to the b
   assert.equal(res.status, 302);
   assert.equal(res.headers.get("location"), "/");
   const cookie = res.headers.get("set-cookie")!;
-  assert.match(cookie, new RegExp(`^techtree_token=${TOKEN};`));
+  assert.match(cookie, new RegExp(`^techtree_token_${server.port}=${TOKEN};`));
   assert.match(cookie, /HttpOnly/);
   assert.match(cookie, /SameSite=Strict/);
 
-  const page = await api("/", { headers: { cookie: `techtree_token=${TOKEN}` } });
+  const page = await api("/", { headers: { cookie: `techtree_token_${server.port}=${TOKEN}` } });
   assert.equal(page.status, 200);
-  const state = await api("/api/state", { headers: { cookie: `techtree_token=${TOKEN}` } });
+  const state = await api("/api/state", { headers: { cookie: `techtree_token_${server.port}=${TOKEN}` } });
   assert.equal(state.status, 200);
+});
+
+test("servers for different repos on the same host keep separate cookies", async () => {
+  const other = await startServer({ backend, staticDir });
+  try {
+    const cookieOf = async (s: RunningServer) =>
+      (await fetch(s.url, { redirect: "manual" })).headers.get("set-cookie")!.split(";")[0];
+    const both = `${await cookieOf(server)}; ${await cookieOf(other)}`;
+    assert.equal((await api("/api/state", { headers: { cookie: both } })).status, 200);
+    const otherState = await fetch(`http://127.0.0.1:${other.port}/api/state`, { headers: { cookie: both } });
+    assert.equal(otherState.status, 200);
+  } finally {
+    await other.close();
+  }
+});
+
+test("starting on an occupied port rejects instead of crashing", async () => {
+  await assert.rejects(startServer({ backend, staticDir, port: server.port }), /EADDRINUSE/);
 });
 
 test("query token is accepted directly on api routes", async () => {
@@ -183,6 +201,13 @@ test("bad input, unknown routes and backend errors map to JSON status codes", as
     [post("/api/prs/1/babysit", JSON.stringify({ on: "yes" })), 400],
     [post("/api/scan", JSON.stringify({})), 400],
     [post("/api/tasks/t1/report", JSON.stringify([1])), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({})), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({ phase: "not-a-phase" })), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({ plan: 42 })), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({ plan: ["a", 1] })), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({ done: -1 })), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({ done: 1.5 })), 400],
+    [post("/api/tasks/t1/report", JSON.stringify({ needs_input: false })), 400],
     [post("/api/scan", JSON.stringify({ node: "x".repeat(1_100_000) })), 413],
   ];
   for (const [pending, status] of cases) {
