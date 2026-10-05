@@ -27,6 +27,8 @@ function App() {
         setState((s) => s && { ...s, tasks: upsert(s.tasks, event.task, (t) => t.id) });
       } else if (event.type === "pr") {
         setState((s) => s && { ...s, prs: upsert(s.prs, event.pr, (p) => p.number) });
+      } else if (event.type === "pr_removed") {
+        setState((s) => s && { ...s, prs: s.prs.filter((p) => p.number !== event.number) });
       } else if (event.type === "scores") {
         resync();
       } else if (event.type === "scan") {

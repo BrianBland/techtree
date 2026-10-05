@@ -11,6 +11,8 @@ import { dbCache, type Db } from "../db.ts";
 import { repoId } from "../paths.ts";
 import { defaultPlugins } from "../plugins/index.ts";
 import { llmScanPlugin, scanCoverage, scanNode } from "../plugins/llm-scan.ts";
+import { Babysitter } from "../prs/babysit.ts";
+import { PrPoller } from "../prs/poller.ts";
 import { TaskRunner } from "../runner/runner.ts";
 import { HttpError, type Backend, type WorkerReport } from "../server/backend.ts";
 import type {
@@ -35,8 +37,8 @@ import type {
 export interface PrSource {
   list(): PrState[];
   setBabysit(number: number, on: boolean): PrState | Promise<PrState>;
-  /** Register a listener for PR changes; returns the unsubscribe function. */
-  onChange(listener: (pr: PrState) => void): () => void;
+  /** Register a listener for `pr` / `pr_removed` events; returns the unsubscribe function. */
+  onEvent(listener: (event: ServerEvent) => void): () => void;
 }
 
 export const noPrs: PrSource = {
@@ -44,7 +46,7 @@ export const noPrs: PrSource = {
   setBabysit: (number) => {
     throw new HttpError(404, `no PR #${number}`);
   },
-  onChange: () => () => {},
+  onEvent: () => () => {},
 };
 
 export interface RepoBackendOptions {
@@ -54,6 +56,8 @@ export interface RepoBackendOptions {
   config: Config;
   plugins?: MetricPlugin[];
   prs?: PrSource;
+  /** Poll GitHub for PRs with `gh` and babysit them once attached (ignored when `prs` is given). */
+  pollPrs?: boolean;
   log?: (msg: string) => void;
 }
 
@@ -72,16 +76,17 @@ export class RepoBackend implements Backend {
   private readonly unsubscribePrs: () => void;
   private taskRunner?: TaskRunner;
   private result?: ScoreResult;
+  private stopPrPolling?: () => void;
   private derived?: { result: ScoreResult; busyKey: string; suggestions: Suggestion[]; coverage?: ApiOverview["coverage"] };
   private scoring?: Promise<void>;
   private rescoreQueued = false;
   private scoreError?: string;
 
   constructor(opts: RepoBackendOptions) {
-    this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, log: (msg) => console.error(msg), ...opts };
+    this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, pollPrs: false, log: (msg) => console.error(msg), ...opts };
     this.cache = dbCache(opts.db);
     this.result = this.cache.get<ScoreResult>(...RESULT_KEY);
-    this.unsubscribePrs = this.opts.prs.onChange((pr) => this.emit({ type: "pr", pr }));
+    this.unsubscribePrs = this.opts.prs.onEvent((event) => this.emit(event));
   }
 
   /**
@@ -92,7 +97,24 @@ export class RepoBackend implements Backend {
     const { db, config, repoRoot, cacheDir } = this.opts;
     this.taskRunner = new TaskRunner({ db, config, repoRoot, cacheDir, ...server, onEvent: (e) => this.emit(e) });
     this.taskRunner.recover();
+    if (this.opts.pollPrs && this.opts.prs === noPrs) this.startPrPolling(this.taskRunner);
     if (!this.result || this.result.sha !== git(repoRoot, "rev-parse", "HEAD").trim()) void this.rescore();
+  }
+
+  private startPrPolling(runner: TaskRunner): void {
+    const poller: PrPoller = new PrPoller({
+      db: this.opts.db,
+      repoRoot: this.opts.repoRoot,
+      tree: () => this.result?.tree,
+      tasks: () => runner.list(),
+      onEvent: (event) => this.emit(event),
+      onUpdate: (prev, next) => babysitter.onUpdate(prev, next),
+      onRemove: (pr) => babysitter.onRemove(pr),
+    });
+    const babysitter = new Babysitter({ poller, runner });
+    this.opts.prs = { list: () => poller.list(), setBabysit: (n, on) => babysitter.setBabysit(n, on), onEvent: () => () => {} };
+    this.stopPrPolling = () => poller.stop();
+    poller.start();
   }
 
   /** Whether anything should keep the server alive: SSE clients, live or queued tasks, scoring or scans. */
@@ -113,6 +135,7 @@ export class RepoBackend implements Backend {
   /** Detach from task workers and stop running scans, resolving once their children have exited. */
   async close(): Promise<void> {
     this.unsubscribePrs();
+    this.stopPrPolling?.();
     this.taskRunner?.close();
     this.stopScans.abort(new Error("techtree server stopped"));
     await Promise.all(this.scanning.values());

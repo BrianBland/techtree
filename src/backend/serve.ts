@@ -27,7 +27,7 @@ export async function serve(repoRoot: string, opts: { port?: number } = {}): Pro
     return;
   }
   const idleMs = Number(process.env.TECHTREE_IDLE_MS) || DEFAULT_IDLE_MS;
-  const backend = new RepoBackend({ db: openDb(dir), repoRoot, cacheDir: dir, config: loadConfig(repoRoot) });
+  const backend = new RepoBackend({ db: openDb(dir), repoRoot, cacheDir: dir, config: loadConfig(repoRoot), pollPrs: true });
   let lastRequest = Date.now();
   const version = packageVersion();
   const token = randomBytes(32).toString("hex");
