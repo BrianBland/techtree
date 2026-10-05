@@ -119,9 +119,13 @@ function pr(number: number, node: string, title: string): PrState {
 /** Every `Backend` method of `real`, so a test can override a few. */
 function delegate(real: Backend): Backend {
   return {
-    getState: () => real.getState(),
-    getNode: (id) => real.getNode(id),
-    getOverview: () => real.getOverview(),
+    listProjects: () => real.listProjects(),
+    createProject: (input) => real.createProject(input),
+    updateProject: (id, input) => real.updateProject(id, input),
+    deleteProject: (id) => real.deleteProject(id),
+    getState: (project) => real.getState(project),
+    getNode: (id, project) => real.getNode(id, project),
+    getOverview: (project) => real.getOverview(project),
     taskLog: (id, tail) => real.taskLog(id, tail),
     taskDiff: (id) => real.taskDiff(id),
     models: () => real.models(),
@@ -136,8 +140,8 @@ function delegate(real: Backend): Backend {
     source: (path, line) => real.source(path, line),
     report: (id, report) => real.report(id, report),
     setBabysit: (n, on) => real.setBabysit(n, on),
-    rescore: () => real.rescore(),
-    scan: (node) => real.scan(node),
+    rescore: (project) => real.rescore(project),
+    scan: (node, project) => real.scan(node, project),
     subscribe: (listener) => real.subscribe(listener),
   };
 }

@@ -5,6 +5,7 @@ import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
+import { QUALITY } from "../core/projects.ts";
 import type { Db } from "../db.ts";
 import type { ChatEntry, Config, ServerEvent, StartTaskRequest, Task, TaskPhase, TaskState } from "../types.ts";
 import type { ReportPayload } from "./report-tool.ts";
@@ -28,6 +29,8 @@ export type StartTask = StartTaskRequest & {
   plannedTo: number;
   /** Adopt this existing PR (babysit): check it out instead of branching, send the prompt as given. */
   pr?: number;
+  /** Project context put before the prompt (DESIGN "Projects"). */
+  brief?: string;
 };
 
 interface Dialog {
@@ -79,7 +82,7 @@ export class TaskRunner {
     this.opts = opts;
     this.packageRoot = opts.packageRoot ?? findPackageRoot();
     const rows = opts.db.prepare("SELECT data FROM tasks").all() as { data: string }[];
-    const loaded = rows.map((r) => JSON.parse(r.data) as Task).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
+    const loaded = rows.map((r) => ({ project: QUALITY, ...(JSON.parse(r.data) as Omit<Task, "project">) }) as Task).sort((a, b) => a.createdAt.localeCompare(b.createdAt));
     for (const task of loaded) this.tasks.set(task.id, task);
   }
 
@@ -97,9 +100,10 @@ export class TaskRunner {
     const title = req.title ?? `Improve ${req.node || "the repository root"}`;
     const task: Task = {
       id,
+      project: req.project ?? QUALITY,
       node: req.node,
       title,
-      prompt: req.prompt ?? defaultPrompt(title, req),
+      prompt: [req.brief, req.prompt ?? defaultPrompt(title, req)].filter(Boolean).join("\n\n"),
       findingIds: req.findingIds,
       state: "queued",
       ...(req.pr !== undefined && { pr: req.pr }),
@@ -564,10 +568,10 @@ export class TaskRunner {
     this.tasks.set(task.id, task);
     this.opts.db
       .prepare(
-        "INSERT INTO tasks (id, node, state, data, updated_at) VALUES (?, ?, ?, ?, ?) " +
+        "INSERT INTO tasks (id, node, state, data, updated_at, project) VALUES (?, ?, ?, ?, ?, ?) " +
           "ON CONFLICT (id) DO UPDATE SET state = excluded.state, data = excluded.data, updated_at = excluded.updated_at",
       )
-      .run(task.id, task.node, task.state, JSON.stringify(task), task.updatedAt);
+      .run(task.id, task.node, task.state, JSON.stringify(task), task.updatedAt, task.project);
     this.opts.onEvent?.({ type: "task", task });
   }
 

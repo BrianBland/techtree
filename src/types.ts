@@ -82,6 +82,7 @@ export interface ChecklistItem {
 
 export interface Task {
   id: string;
+  project: string; // Project.id
   node: NodeId;
   title: string;
   prompt: string;
@@ -125,6 +126,26 @@ export interface PrState {
   head?: string; // head commit sha
   reviewCount?: number; // submitted reviews by others that are not approvals
   babysitStatus?: string; // last babysit outcome, e.g. "observe-only: CI failing"
+  project?: string; // its task's project, else "quality"; set on listed PRs and `pr` events
+}
+
+// ---- Projects (DESIGN "Projects") ----
+
+/** How a project is scored. Only `plugins` is implemented; the rest is declared for lane 2. */
+export interface ScorerSpec {
+  plugins?: string[]; // metric plugin ids
+  rubric?: string;
+  command?: string[];
+  plan?: boolean;
+}
+
+export interface Project {
+  id: string;
+  name: string;
+  goal?: string;
+  scorer: ScorerSpec;
+  createdAt: string;
+  builtin?: boolean;
 }
 
 // ---- Scoring output ----
@@ -168,6 +189,7 @@ export interface Suggestion {
   node: NodeId;
   title: string;
   source?: string; // the findings' source; suggestion lists are diversified by it
+  project?: string; // set in the cross-project overview
   findingIds: string[];
   impact: Impact;
   effort: Effort;
@@ -196,6 +218,7 @@ export interface Config {
 
 export interface ApiState {
   repo: { root: string; id: string; name: string };
+  project: Project;
   snapshot: { sha: string; createdAt: string } | null;
   tree: Tree;
   metricDefs: MetricDef[];
@@ -249,6 +272,7 @@ export interface StartTaskRequest {
   prompt?: string;
   manualReview: boolean;
   model?: string; // "provider/id"; omitted = pi's default
+  project?: string; // default "quality"
 }
 
 export interface ApiModels {

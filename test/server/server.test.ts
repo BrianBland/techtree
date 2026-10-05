@@ -24,6 +24,10 @@ function record(name: string, ...fixed: unknown[]) {
 }
 
 const backend = {
+  listProjects: record("listProjects"),
+  createProject: record("createProject"),
+  updateProject: record("updateProject"),
+  deleteProject: record("deleteProject", undefined),
   getState: record("getState"),
   getNode: record("getNode"),
   getOverview: record("getOverview"),
@@ -155,10 +159,15 @@ test("mutating routes require JSON and a same-origin Origin", async () => {
 
 test("routes delegate to the matching backend method", async () => {
   const cases: [string, string, unknown, [string, ...unknown[]], unknown][] = [
-    ["GET", "/api/state", undefined, ["getState"], { ok: "getState" }],
-    ["GET", "/api/node?id=crates%2Fa", undefined, ["getNode", "crates/a"], { ok: "getNode" }],
-    ["GET", "/api/node?id=", undefined, ["getNode", ""], { ok: "getNode" }],
-    ["GET", "/api/overview", undefined, ["getOverview"], { ok: "getOverview" }],
+    ["GET", "/api/projects", undefined, ["listProjects"], { ok: "listProjects" }],
+    ["POST", "/api/projects", { name: "Perf", goal: "fast" }, ["createProject", { name: "Perf", goal: "fast" }], { ok: "createProject" }],
+    ["PATCH", "/api/projects/perf", { goal: "" }, ["updateProject", "perf", { goal: "" }], { ok: "updateProject" }],
+    ["DELETE", "/api/projects/perf", undefined, ["deleteProject", "perf"], { ok: true }],
+    ["GET", "/api/state", undefined, ["getState", "quality"], { ok: "getState" }],
+    ["GET", "/api/state?project=perf", undefined, ["getState", "perf"], { ok: "getState" }],
+    ["GET", "/api/node?id=crates%2Fa&project=perf", undefined, ["getNode", "crates/a", "perf"], { ok: "getNode" }],
+    ["GET", "/api/node?id=", undefined, ["getNode", "", "quality"], { ok: "getNode" }],
+    ["GET", "/api/overview?project=all", undefined, ["getOverview", "all"], { ok: "getOverview" }],
     ["GET", "/api/tasks/t1/log?tail=5", undefined, ["taskLog", "t1", 5], "line 1\nline 2"],
     ["GET", "/api/tasks/t1/log", undefined, ["taskLog", "t1", 200], "line 1\nline 2"],
     ["GET", "/api/tasks/t1/diff", undefined, ["taskDiff", "t1"], "diff --git a b"],
@@ -166,8 +175,8 @@ test("routes delegate to the matching backend method", async () => {
     [
       "POST",
       "/api/tasks",
-      { node: "a", findingIds: [], manualReview: false, model: "p/m" },
-      ["startTask", { node: "a", findingIds: [], manualReview: false, model: "p/m" }],
+      { node: "a", findingIds: [], manualReview: false, model: "p/m", project: "perf" },
+      ["startTask", { node: "a", findingIds: [], manualReview: false, model: "p/m", project: "perf" }],
       { ok: "startTask" },
     ],
     [
@@ -185,12 +194,12 @@ test("routes delegate to the matching backend method", async () => {
     ["POST", "/api/tasks/t1/open-terminal", { mode: "agent" }, ["openTerminal", "t1", "agent"], { ok: true }],
     ["POST", "/api/tasks/t1/report", { done: 2 }, ["report", "t1", { done: 2 }], { ok: "report" }],
     ["POST", "/api/prs/42/babysit", { on: true }, ["setBabysit", 42, true], { ok: "setBabysit" }],
-    ["POST", "/api/score", undefined, ["rescore"], { ok: true }],
-    ["POST", "/api/scan", { node: "crates" }, ["scan", "crates"], { ok: true }],
+    ["POST", "/api/score", undefined, ["rescore", "quality"], { ok: true }],
+    ["POST", "/api/scan?project=perf", { node: "crates" }, ["scan", "crates", "perf"], { ok: true }],
   ];
   for (const [method, path, body, call, expected] of cases) {
     calls.length = 0;
-    const res = await api(path, { method, headers: method === "POST" ? json : auth, body: body === undefined ? undefined : JSON.stringify(body) });
+    const res = await api(path, { method, headers: method === "GET" ? auth : json, body: body === undefined ? undefined : JSON.stringify(body) });
     assert.equal(res.status, 200, `${method} ${path}`);
     assert.deepEqual(calls, [call], `${method} ${path}`);
     const result = typeof expected === "string" ? await res.text() : await res.json();

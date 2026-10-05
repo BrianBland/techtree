@@ -121,7 +121,7 @@ const log = (task: Task) => readFileSync(task.logPath!, "utf8");
 function persist(h: Harness, id: string, state: Task["state"], extra: Partial<Task> = {}): Task {
   const now = new Date().toISOString();
   const task: Task = {
-    id, node: "", title: id, prompt: "", findingIds: [], state, manualReview: true, plannedFrom: 0, plannedTo: 0,
+    id, project: "quality", node: "", title: id, prompt: "", findingIds: [], state, manualReview: true, plannedFrom: 0, plannedTo: 0,
     checklist: [{ text: "step", done: false }], phase: "edit", logPath: join(h.cache, "tasks", `${id}.log`),
     createdAt: now, updatedAt: now, ...extra,
   };

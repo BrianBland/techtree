@@ -47,7 +47,7 @@ class FakeRunner implements BabysitRunner {
 
 function makeTask(over: Partial<Task>): Task {
   return {
-    id: "t", node: "", title: "t", prompt: "", findingIds: [], state: "pr_open", manualReview: false, plannedFrom: 0,
+    id: "t", project: "quality", node: "", title: "t", prompt: "", findingIds: [], state: "pr_open", manualReview: false, plannedFrom: 0,
     plannedTo: 0, checklist: [], phase: "pr", createdAt: "2025-01-01T00:00:00Z", updatedAt: "2025-01-01T00:00:00Z", ...over,
   };
 }

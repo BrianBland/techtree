@@ -7,6 +7,7 @@ import type {
   ChatEntry,
   NodeId,
   PrState,
+  Project,
   ServerEvent,
   StartTaskRequest,
   Task,
@@ -22,14 +23,26 @@ export interface WorkerReport {
   needs_input?: string;
 }
 
+export interface ProjectInput {
+  name?: string;
+  goal?: string;
+}
+
 /**
  * Everything the HTTP API can do, one method per route (see docs/DESIGN.md, "HTTP API").
  * Methods throw `HttpError` for client errors (unknown id → 404, wrong task state → 409).
+ * A `project` argument defaults to "quality" (DESIGN "Projects").
  */
 export interface Backend {
-  getState(): Promise<ApiState>;
-  getNode(id: NodeId): Promise<ApiNode>;
-  getOverview(): Promise<ApiOverview>;
+  listProjects(): Promise<Project[]>;
+  createProject(input: ProjectInput): Promise<Project>;
+  updateProject(id: string, input: ProjectInput): Promise<Project>;
+  /** Delete a custom project, discarding its tasks and deleting its rows. */
+  deleteProject(id: string): Promise<void>;
+  getState(project?: string): Promise<ApiState>;
+  getNode(id: NodeId, project?: string): Promise<ApiNode>;
+  /** `project` "all" gives the cross-project overview. */
+  getOverview(project?: string): Promise<ApiOverview>;
   taskLog(taskId: string, tail: number): Promise<string>;
   taskDiff(taskId: string): Promise<string>;
   /** Lines around `line` of repo file `path` at the scored commit. */
@@ -48,8 +61,8 @@ export interface Backend {
   discard(taskId: string): Promise<void>;
   report(taskId: string, report: WorkerReport): Promise<Task>;
   setBabysit(prNumber: number, on: boolean): Promise<PrState>;
-  rescore(): Promise<void>;
-  scan(node: NodeId): Promise<void>;
+  rescore(project?: string): Promise<void>;
+  scan(node: NodeId, project?: string): Promise<void>;
   /** Register a listener for live events; returns the unsubscribe function. */
   subscribe(listener: (event: ServerEvent) => void): () => void;
 }

@@ -1,14 +1,19 @@
 import { join } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import { createRequire } from "node:module";
+import { QUALITY, QUALITY_PROJECT } from "./core/projects.ts";
 import type { Cache } from "./types.ts";
 
 export type Db = DatabaseSyncType;
 
-const SCHEMA_VERSION = 1;
+const SCHEMA_VERSION = 2;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+CREATE TABLE IF NOT EXISTS projects (
+  id TEXT PRIMARY KEY,
+  data TEXT NOT NULL -- JSON Project
+);
 CREATE TABLE IF NOT EXISTS snapshots (
   id INTEGER PRIMARY KEY AUTOINCREMENT,
   sha TEXT NOT NULL,
@@ -60,8 +65,20 @@ export function openDb(dirOrMemory: string): Db {
   const db = new DatabaseSync(dirOrMemory === ":memory:" ? ":memory:" : join(dirOrMemory, "techtree.db"));
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   db.exec(SCHEMA);
-  db.prepare("INSERT OR IGNORE INTO meta (key, value) VALUES ('schema_version', ?)").run(String(SCHEMA_VERSION));
+  for (const table of PROJECT_SCOPED) addProjectColumn(db, table);
+  db.prepare("INSERT OR IGNORE INTO projects (id, data) VALUES (?, ?)").run(QUALITY, JSON.stringify(QUALITY_PROJECT));
+  db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(
+    String(SCHEMA_VERSION),
+  );
   return db;
+}
+
+/** Tables whose rows belong to one project (DESIGN "Projects"); older databases gain the column. */
+const PROJECT_SCOPED = ["snapshots", "findings", "tasks"];
+
+function addProjectColumn(db: Db, table: string): void {
+  const columns = db.prepare(`PRAGMA table_info(${table})`).all() as { name: string }[];
+  if (!columns.some((c) => c.name === "project")) db.exec(`ALTER TABLE ${table} ADD COLUMN project TEXT NOT NULL DEFAULT '${QUALITY}'`);
 }
 
 export function dbCache(db: Db): Cache {

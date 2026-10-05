@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { diversify, nodeCtas, rankCtas } from "../../src/core/cta.ts";
+import { diversify, interleave, nodeCtas, rankCtas } from "../../src/core/cta.ts";
 import type { PrState, Suggestion, Task } from "../../src/types.ts";
 
 const task = (node: string, state: Task["state"]) => ({ id: node + state, node, state }) as Task;
@@ -48,4 +48,8 @@ test("childCtas are diversified among the node's descendants", () => {
     src("x/a", 10, "unwrap"), src("x/b", 9, "unwrap"), src("y", 8.5, "duplication"), src("x/c", 8, "unwrap"), src("x/d", 1, "test-smell"),
   ]);
   assert.deepEqual(nodeCtas("x", ranked).childCtas.map((c) => c.node), ["x/a", "x/b", "x/d", "x/c"]);
+});
+
+test("interleave takes the first of each list, then the second of each, and so on", () => {
+  assert.deepEqual(interleave([["q1", "q2", "q3"], [], ["p1"], ["f1", "f2"]]), ["q1", "p1", "f1", "q2", "f2", "q3"]);
 });
