@@ -536,7 +536,12 @@ export class TaskRunner {
 
   private async onSettled(task: Task, worker: Worker): Promise<void> {
     if (checklistDone(task)) {
-      if (task.pr === undefined && !this.hasNetDiff(task)) return this.stop(task, worker, "done", worker.lastText);
+      if (task.pr === undefined) {
+        const promptsSent = worker.promptsSent;
+        const changed = await this.hasNetDiff(task);
+        if (this.workers.get(task.id) !== worker || task.state !== "running" || worker.promptsSent !== promptsSent) return;
+        if (!changed) return this.stop(task, worker, "done", worker.lastText);
+      }
       const prStage = !task.manualReview || task.phase === "pr" || task.pr !== undefined;
       if (!prStage) return this.stop(task, worker, "review");
       const promptsSent = worker.promptsSent;
@@ -607,8 +612,9 @@ export class TaskRunner {
     });
   }
 
-  private hasNetDiff(task: Task): boolean {
-    return git(task.worktree!, "diff", "--name-only", `${this.baseSha()}...HEAD`).trim() !== "";
+  private async hasNetDiff(task: Task): Promise<boolean> {
+    const { stdout } = await promisify(execFile)("git", ["diff", "--name-only", `${this.baseSha()}...HEAD`], { cwd: task.worktree, maxBuffer: 64 * 1024 * 1024 });
+    return stdout.trim() !== "";
   }
 
   private baseSha(): string {
