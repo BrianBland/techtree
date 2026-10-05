@@ -326,6 +326,7 @@ The precise rules the scorer implements:
   3. the top suggested tasks by priority, favouring low conflict and diversified by source
   4. a scan-coverage summary
   5. the **Staged** section (`ApiOverview.stagedTasks`, scoped like `attentionTasks`; see "Staging and combined PRs")
+  6. **In progress**: queued and running tasks of every kind (`ApiOverview.activeTasks`, scoped like `attentionTasks`), each with its node and checklist progress; selecting one opens its node, where the task card has the log, diff and chat. Scorer and plan tasks belong to the repo root, so without this they'd only be visible on the root node.
 
 **Task actions.** Every task row (in "This node" and under "Tasks") has one action bar; each action shows only in the states listed:
 

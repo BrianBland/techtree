@@ -72,6 +72,23 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
           </li>
         )}
       </Section>
+      <Section title="In progress" items={overview.activeTasks}>
+        {(task) => {
+          const done = task.checklist.filter((c) => c.done).length;
+          return (
+            <li key={task.id} class="row clickable" onClick={() => onSelect(task.node, task.project)}>
+              <div>
+                {tag(task.project)}
+                {task.title}
+                <div class="muted small">
+                  <span class={`state ${task.state}`}>{task.state}</span>
+                  {task.checklist.length > 0 && ` · ${done}/${task.checklist.length} steps`} · {nodeName(task.node)}
+                </div>
+              </div>
+            </li>
+          );
+        }}
+      </Section>
       {stagedByProject(overview.stagedTasks).map(([project, tasks]) => (
         <StagedSection key={project} title={all ? `Staged · ${projectName(project)}` : "Staged"} project={project} tasks={tasks} nodeName={nodeName} onError={onError} />
       ))}

@@ -285,6 +285,7 @@ export interface Cta {
 export interface ApiOverview {
   attentionTasks: Task[]; // needs_input or review
   stagedTasks: Task[]; // staged, in staging order
+  activeTasks: Task[]; // queued or running, any kind
   flaggedPrs: PrState[]; // failing, stuck or stale
   suggestions: Suggestion[];
   coverage: { scannedNodes: number; totalNodes: number; scannedLoc: number; totalLoc: number };

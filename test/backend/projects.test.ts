@@ -82,6 +82,16 @@ test("projects: tasks, findings and scores are scoped to their project; the tree
   assert.equal(await status(backend.deleteProject(perf.id)), 409, "a project with a live task is kept");
 });
 
+test("projects: overviews list a project's queued and running tasks under activeTasks", { timeout: 30_000 }, async (t) => {
+  const backend = await boot(t);
+  const perf = await backend.createProject({ name: "Perf" });
+  const task = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true, project: perf.id });
+  await until(async () => (await backend.getState(perf.id)).tasks.find((x) => x.state === "running"), "task to run");
+  assert.deepEqual((await backend.getOverview(perf.id)).activeTasks.map((x) => x.id), [task.id]);
+  assert.deepEqual((await backend.getOverview("all")).activeTasks.map((x) => x.id), [task.id]);
+  assert.deepEqual((await backend.getOverview()).activeTasks, []);
+});
+
 test("projects: the cross-project overview lists every project's attention items first, then labelled suggestions", { timeout: 30_000 }, async (t) => {
   const backend = await boot(t);
   const perf = await backend.createProject({ name: "Perf" });

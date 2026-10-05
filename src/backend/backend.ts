@@ -386,6 +386,7 @@ export class RepoBackend implements Backend {
       stagedTasks: this.tasks(scope)
         .filter((t) => t.state === "staged")
         .sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? "")),
+      activeTasks: this.tasks(scope).filter((t) => t.state === "queued" || t.state === "running"),
       flaggedPrs: this.prs(scope).filter((p) => p.ci === "fail" || p.stuck || p.stale),
       suggestions: suggestions.slice(0, OVERVIEW_SUGGESTIONS),
       coverage: this.coverage(view),
@@ -849,7 +850,9 @@ function scorerPrompt(project: Project, result: ScoreResult, config: Config, scr
     `Current scores: root composite ${quality === null || quality === undefined ? "none" : quality.toFixed(1)}; metrics: ${metrics.join(", ") || "none"}.`,
     `Current findings: ${[...bySource].map(([source, n]) => `${n} ${source}`).join(", ") || "none"}.${top.length ? `\n${top.join("\n")}` : ""}`,
     `A scorer combines: rubric (text telling an LLM scan of each file what to look for), command (argv run in the repo root, printing JSON ` +
-      `{metrics: [{key, label, direction, unit?, aggregate?}], values: {"<path>": {"<key>": number}}, findings?: [{node or file, line?, title, detail, severity, effort?}]}, ` +
+      `{metrics: [{key, label, direction: "lower_better"|"higher_better"|"neutral", unit?, aggregate?: "sum" (default)|"max"|"mean_by_loc"}], ` +
+      `values: {"<repo-relative file or directory>": {"<key>": number}} (a file's values count toward its directories), ` +
+      `findings?: [{node or file, line?, title, detail, severity: "low"|"medium"|"high", effort?: "trivial"|"small"|"medium"|"large"}]}, ` +
       `timeout ${Number(config.plugins.command?.timeoutMs) || 600000} ms) and plan (score progress on work items from plan tasks).`,
     `Write any scripts for the command in ${scriptsDir} (never in the repository) and test them.`,
     "Propose the scorer with techtree_report {scorer: {rubric?, command?, plan?}}; the user reviews it and may reply to iterate.",
