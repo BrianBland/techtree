@@ -50,10 +50,22 @@ export function TreeView(props: TreeViewProps) {
     world.current?.setAttribute("transform", `translate(${next.x},${next.y}) scale(${next.k})`);
   };
 
+  const fitted = useRef(false);
   useEffect(() => {
     const el = svg.current;
-    if (el) apply(fitView(layout.bounds, el.clientWidth, el.clientHeight));
+    if (el && el.clientWidth > 0) {
+      apply(fitView(layout.bounds, el.clientWidth, el.clientHeight));
+      fitted.current = true;
+    }
   }, [fitRequest]);
+
+  // The first real layout (after data loads and the SVG has a size) is fitted once automatically.
+  useEffect(() => {
+    const el = svg.current;
+    if (fitted.current || !el || el.clientWidth === 0) return;
+    apply(fitView(layout.bounds, el.clientWidth, el.clientHeight));
+    fitted.current = true;
+  }, [layout]);
 
   useEffect(() => {
     const el = svg.current!;

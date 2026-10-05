@@ -22,7 +22,7 @@ export function formatReport(result: ScoreResult, opts: ReportOptions = {}): str
   for (const def of result.metricDefs) {
     if (def.direction === "neutral") continue;
     const ranked = Object.values(result.scores)
-      .filter((s) => s.metrics[def.key]?.pct != null && !s.metrics[def.key].inherited)
+      .filter((s) => s.metrics[def.key]?.pct != null)
       .sort((a, b) => pctOf(b, def.key) - pctOf(a, def.key) || a.node.localeCompare(b.node));
     if (ranked.length === 0) continue;
     const top = ranked.slice(0, perEnd);

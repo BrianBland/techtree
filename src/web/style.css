@@ -86,7 +86,7 @@ main { flex: 1; display: flex; min-height: 0; }
 .tree:active { cursor: grabbing; }
 .edges path { fill: none; stroke: #3d4780; stroke-linecap: square; stroke-linejoin: miter; transition: d 0.35s ease; }
 
-.node { cursor: pointer; transition: transform 0.35s ease; animation: appear 0.3s ease-out; }
+.node { cursor: pointer; transition: transform 0.35s ease; }
 .node .frame { fill: var(--ink); }
 .node .gem { fill: var(--gold); }
 .node .bevel-light { fill: rgba(255, 255, 255, 0.35); }
@@ -130,7 +130,6 @@ main { flex: 1; display: flex; min-height: 0; }
 .badge.findings rect { fill: #2a2f55; }
 .badge.findings text { fill: var(--text); }
 
-@keyframes appear { from { opacity: 0; } }
 @keyframes alarm { 0%, 100% { opacity: 1; } 50% { opacity: 0.15; } }
 @keyframes shimmer { 0%, 70%, 100% { opacity: 0; } 85% { opacity: 0.22; } }
 @keyframes flash { 0% { opacity: 0.85; } 100% { opacity: 0; } }

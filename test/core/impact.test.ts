@@ -62,7 +62,7 @@ test("one lint matters more to a small node than to a big node of the same densi
   assert.ok(big.node > 0);
 });
 
-test("a fix in a node below minLoc shows up through the parent it inherits from", () => {
+test("a fix in a node below minLoc is reported at its nearest scored ancestor", () => {
   const m = model();
   const impact = findingImpact(m, finding("f", "many/tiny", { lint_warnings: -1 }));
   const viaParent = findingImpact(m, finding("g", "many", { lint_warnings: -1 }));

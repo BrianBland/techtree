@@ -59,7 +59,7 @@ test("percentile is an interpolated mid-rank among the other peers", () => {
   assert.equal(percentile([1, 3], 4), 100);
 });
 
-test("ranks peers of the same kind, flips lower_better, nulls neutral, and inherits below minLoc", () => {
+test("ranks peers of the same kind, flips lower_better, nulls neutral, and leaves nodes below minLoc unscored", () => {
   const t = treeFromFiles("/repo", ["a/f", "b/f", "c/f", "c/tiny/f", "k/f"]);
   t.nodes.k.kind = "crate";
   const m = buildModel(
@@ -78,14 +78,14 @@ test("ranks peers of the same kind, flips lower_better, nulls neutral, and inher
   assert.equal(pct("a"), pct("b"), "ties are fair");
   assert.ok(pct("a")! > pct("c")!, "fewer lints rank higher");
   assert.equal(pct("k"), 50, "a crate is not ranked against dirs");
-  assert.equal(pct("c/tiny"), pct("c"), "tiny node inherits its parent's pct");
-  assert.equal(m.scores["c/tiny"].metrics.lint_warnings.inherited, true);
+  assert.equal(pct("c/tiny"), null, "tiny node is unscored");
+  assert.equal(m.scores["c/tiny"].quality, null);
   assert.equal(m.scores.a.metrics.loc.pct, null, "neutral metrics have no pct");
 });
 
 test("every node is ranked when no plugin defines loc", () => {
   const m = buildModel(tree(), [TEST_RATIO], { "a/x": { test_ratio: 0.1 }, b: { test_ratio: 0.9 } }, config());
-  assert.equal(m.scores.b.metrics.test_ratio.inherited, undefined);
+  assert.notEqual(m.scores.b.metrics.test_ratio.pct, null);
   assert.ok(m.scores.b.metrics.test_ratio.pct! > m.scores["a/x"].metrics.test_ratio.pct!);
 });
 

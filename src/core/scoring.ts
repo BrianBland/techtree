@@ -99,7 +99,9 @@ export function whatIf(m: Model, effects: MetricValues, focus: NodeId): Impact {
     const after = scores.get(id)?.quality;
     return before == null || after == null ? 0 : after - before;
   };
-  return { node: delta(focus), root: delta("") };
+  let scored: NodeId | null = focus;
+  while (scored !== null && m.scores[scored]?.quality == null) scored = m.tree.nodes[scored]?.parent ?? null;
+  return { node: scored === null ? 0 : delta(scored), root: delta("") };
 }
 
 /**
@@ -241,7 +243,7 @@ function scoreNode(
           : percentile(peers, value, old);
       metrics[def.key] = { raw, value, pct: directed(def, pct) };
     } else {
-      metrics[def.key] = { raw, value, pct: parent?.metrics[def.key]?.pct ?? null, inherited: true };
+      metrics[def.key] = { raw, value, pct: null };
     }
   }
   return { node: id, quality: composite(metrics, m.config.weights), metrics };
