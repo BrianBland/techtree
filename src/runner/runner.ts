@@ -23,7 +23,12 @@ export interface TaskRunnerOptions {
   packageRoot?: string;
 }
 
-export type StartTask = StartTaskRequest & { plannedFrom: number; plannedTo: number };
+export type StartTask = StartTaskRequest & {
+  plannedFrom: number;
+  plannedTo: number;
+  /** Adopt this existing PR (babysit): check it out instead of branching, send the prompt as given. */
+  pr?: number;
+};
 
 interface Dialog {
   id: string;
@@ -86,6 +91,7 @@ export class TaskRunner {
       prompt: req.prompt ?? defaultPrompt(title, req),
       findingIds: req.findingIds,
       state: "queued",
+      ...(req.pr !== undefined && { pr: req.pr }),
       manualReview: req.manualReview,
       plannedFrom: req.plannedFrom,
       plannedTo: req.plannedTo,
@@ -154,6 +160,14 @@ export class TaskRunner {
     if (task.state !== "review") throw new Error(`task ${taskId} is ${task.state}, not review`);
     task.phase = "pr";
     this.resume(task, openPrPrompt(task));
+    return task;
+  }
+
+  /** Respawn a `pr_open` task on its session with `prompt` (babysit), through the queue. */
+  resumeTask(taskId: string, prompt: string): Task {
+    const task = this.require(taskId);
+    if (task.state !== "pr_open" || !task.worktree) throw new Error(`task ${taskId} is ${task.state}, not pr_open with a worktree`);
+    this.resume(task, prompt);
     return task;
   }
 
@@ -235,7 +249,7 @@ export class TaskRunner {
       return;
     }
     this.save(task);
-    this.spawnWorker(task, `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}`);
+    this.spawnWorker(task, task.pr === undefined ? `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}` : task.prompt);
   }
 
   private createWorktree(task: Task): void {
@@ -245,7 +259,12 @@ export class TaskRunner {
       .replaceAll("{task}", task.id);
     const branch = `techtree/${task.id}`;
     mkdirSync(dirname(path), { recursive: true });
-    git(this.opts.repoRoot, "worktree", "add", "-b", branch, path, this.opts.config.baseRef);
+    if (task.pr === undefined) {
+      git(this.opts.repoRoot, "worktree", "add", "-b", branch, path, this.opts.config.baseRef);
+    } else {
+      git(this.opts.repoRoot, "worktree", "add", "--detach", path, this.opts.config.baseRef);
+      execFileSync("gh", ["pr", "checkout", String(task.pr), "--branch", branch], { cwd: path, stdio: ["ignore", "pipe", "pipe"] });
+    }
     task.worktree = path;
     task.branch = branch;
     this.log(task, `worktree ${path} on ${branch}`);
@@ -270,6 +289,7 @@ export class TaskRunner {
       "--session-id", task.id,
       "-e", join(this.packageRoot, "extensions"),
       "--skill", join(this.packageRoot, "skills", "techtree-worker"),
+      "--skill", join(this.packageRoot, "skills", "techtree-babysit"),
     ];
     const child = spawn(command, args, {
       cwd: task.worktree,
@@ -444,7 +464,7 @@ function openPrPrompt(task: Task): string {
 
 async function findPr(task: Task): Promise<number | undefined> {
   try {
-    const { stdout } = await promisify(execFile)("gh", ["pr", "view", task.branch!, "--json", "number", "--jq", ".number"], {
+    const { stdout } = await promisify(execFile)("gh", ["pr", "view", String(task.pr ?? task.branch), "--json", "number", "--jq", ".number"], {
       cwd: task.worktree,
       timeout: PR_LOOKUP_TIMEOUT_MS,
     });
