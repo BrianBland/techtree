@@ -1,14 +1,14 @@
 import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { randomBytes } from "node:crypto";
-import { appendFileSync, existsSync, mkdirSync, readdirSync, rmSync } from "node:fs";
+import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import type { Db } from "../db.ts";
-import type { Config, ServerEvent, StartTaskRequest, Task, TaskPhase } from "../types.ts";
+import type { ChatEntry, Config, ServerEvent, StartTaskRequest, Task, TaskPhase, TaskState } from "../types.ts";
 import type { ReportPayload } from "./report-tool.ts";
-import { describeRpcRecord, isAssistantMessageEnd, type RpcRecord } from "./rpc-log.ts";
+import { assistantText, describeRpcRecord, isAssistantMessageEnd, toolCall, type RpcRecord } from "./rpc-log.ts";
 
 export interface TaskRunnerOptions {
   db: Db;
@@ -46,6 +46,8 @@ interface Worker {
 }
 
 const PHASES: TaskPhase[] = ["plan", "explore", "edit", "test", "pr"];
+const LIVE_STATES: TaskState[] = ["queued", "running", "needs_input"];
+const RESUMABLE_BY_MESSAGE: TaskState[] = ["review", "failed", "pr_open"];
 
 const CONTINUE_PROMPT = "techtree restarted. Continue the task where you left off.";
 const PR_LOOKUP_TIMEOUT_MS = 60_000;
@@ -150,6 +152,7 @@ export class TaskRunner {
     worker.nudged = false;
     if (worker.dialog) {
       send(worker, dialogResponse(worker.dialog, text));
+      this.chatEntry(task, "user", text);
       clearDialog(worker);
     } else {
       this.prompt(task, worker, text);
@@ -175,9 +178,59 @@ export class TaskRunner {
     return task;
   }
 
+  /**
+   * Message the task's agent from the chat pane: steer a live worker, answer a question, or resume
+   * a `review`, `failed` or `pr_open` task on its session with `text` as the prompt.
+   */
+  message(taskId: string, text: string): Task {
+    const task = this.require(taskId);
+    if (task.state === "needs_input") return this.answer(taskId, text);
+    const worker = this.workers.get(taskId);
+    if (task.state === "running" && worker) {
+      worker.nudged = false;
+      this.prompt(task, worker, text, "steer");
+      return task;
+    }
+    if (!RESUMABLE_BY_MESSAGE.includes(task.state))
+      throw new Error(`task ${taskId} is ${task.state}${task.state === "running" ? " and its worker has not started yet" : ""}`);
+    if (!task.worktree) throw new Error(`task ${taskId} has no worktree`);
+    if (!this.hasSession(task)) throw new Error(`task ${taskId} has no pi session`);
+    task.error = undefined;
+    this.resume(task, text);
+    return task;
+  }
+
+  /** The task's chat transcript, oldest first. */
+  chat(taskId: string): ChatEntry[] {
+    let text: string;
+    try {
+      text = readFileSync(this.chatPath(this.require(taskId)), "utf8");
+    } catch {
+      return [];
+    }
+    return text.split("\n").filter(Boolean).map((line) => JSON.parse(line) as ChatEntry);
+  }
+
+  /** Argv for interactive pi on the task's session; refused while a worker owns that session. */
+  agentCommand(taskId: string): string[] {
+    const task = this.require(taskId);
+    if (LIVE_STATES.includes(task.state)) throw new Error(`task ${taskId} has a live worker; cancel it first`);
+    return [...this.opts.config.piCommand, ...this.sessionArgs(task)];
+  }
+
+  /** Stop the task's run. A run on an existing PR (babysit, fix) returns to `pr_open`; any other task fails with `cancelled`. */
   cancel(taskId: string): Task {
     const task = this.require(taskId);
-    this.fail(task, "cancelled");
+    if (task.pr === undefined) {
+      this.fail(task, "cancelled");
+      return task;
+    }
+    this.stopWorker(task);
+    task.state = "pr_open";
+    task.question = undefined;
+    this.log(task, "cancelled; back to pr_open");
+    this.save(task);
+    this.pump();
     return task;
   }
 
@@ -185,17 +238,12 @@ export class TaskRunner {
   discard(taskId: string): void {
     const task = this.require(taskId);
     if (task.state === "pr_open") throw new Error(`task ${taskId} has an open PR; close it on GitHub first`);
-    const worker = this.workers.get(task.id);
-    if (worker) {
-      this.workers.delete(task.id);
-      clearDialog(worker);
-      worker.child.kill();
-    }
-    this.resumePrompts.delete(task.id);
+    this.stopWorker(task);
     this.checkingOut.delete(task.id);
     if (task.worktree) tryGit(this.opts.repoRoot, "worktree", "remove", "--force", task.worktree);
     if (task.branch) tryGit(this.opts.repoRoot, "branch", "-D", task.branch);
     if (task.logPath) rmSync(task.logPath, { force: true });
+    rmSync(this.chatPath(task), { force: true });
     rmSync(this.sessionDir(task), { recursive: true, force: true });
     this.tasks.delete(task.id);
     this.opts.db.prepare("DELETE FROM tasks WHERE id = ?").run(task.id);
@@ -322,6 +370,14 @@ export class TaskRunner {
     return join(this.opts.cacheDir, "sessions", task.id);
   }
 
+  private sessionArgs(task: Task): string[] {
+    return ["--session-dir", this.sessionDir(task), "--session-id", task.id, ...(task.model ? ["--model", task.model] : [])];
+  }
+
+  private chatPath(task: Task): string {
+    return join(this.opts.cacheDir, "tasks", `${task.id}.chat.jsonl`);
+  }
+
   private hasSession(task: Task): boolean {
     const dir = this.sessionDir(task);
     return existsSync(dir) && readdirSync(dir).some((f) => f.endsWith(".jsonl"));
@@ -333,12 +389,10 @@ export class TaskRunner {
     const args = [
       ...prefix,
       "--mode", "rpc",
-      "--session-dir", this.sessionDir(task),
-      "--session-id", task.id,
       "-e", join(this.packageRoot, "extensions"),
       "--skill", join(this.packageRoot, "skills", "techtree-worker"),
       "--skill", join(this.packageRoot, "skills", "techtree-babysit"),
-      ...(task.model ? ["--model", task.model] : []),
+      ...this.sessionArgs(task),
     ];
     const child = spawn(command, args, {
       cwd: task.worktree,
@@ -365,10 +419,11 @@ export class TaskRunner {
     this.prompt(task, worker, message);
   }
 
-  private prompt(task: Task, worker: Worker, message: string): void {
+  private prompt(task: Task, worker: Worker, message: string, streamingBehavior: "followUp" | "steer" = "followUp"): void {
     this.log(task, `prompt: ${message}`);
+    this.chatEntry(task, "user", message);
     worker.unacknowledgedPrompts++;
-    send(worker, { type: "prompt", message, streamingBehavior: "followUp" });
+    send(worker, { type: "prompt", message, streamingBehavior });
   }
 
   private onRecord(task: Task, worker: Worker, line: string): void {
@@ -386,7 +441,11 @@ export class TaskRunner {
       worker.unacknowledgedPrompts--;
       if (record.success === false) return this.fail(task, `pi rejected the prompt: ${record.error}`);
     }
-    if (isAssistantMessageEnd(record)) worker.lastText = text ?? "";
+    if (isAssistantMessageEnd(record)) {
+      worker.lastText = assistantText(record.message);
+      if (worker.lastText) this.chatEntry(task, "assistant", worker.lastText);
+    }
+    if (record.type === "tool_execution_start") this.chatEntry(task, "tool", toolCall(record));
     if (record.type === "extension_ui_request" && ["select", "confirm", "input", "editor"].includes(record.method)) {
       this.openDialog(task, worker, record);
     }
@@ -454,6 +513,13 @@ export class TaskRunner {
     task.error = error;
     task.question = undefined;
     this.log(task, `failed: ${error}`);
+    this.stopWorker(task);
+    this.save(task);
+    this.pump();
+  }
+
+  /** Kill the task's worker (if any) and drop its pending resume prompt; the task's state is the caller's to set. */
+  private stopWorker(task: Task): void {
     this.resumePrompts.delete(task.id);
     const worker = this.workers.get(task.id);
     if (worker) {
@@ -462,8 +528,6 @@ export class TaskRunner {
       worker.child.kill();
     }
     task.pid = undefined;
-    this.save(task);
-    this.pump();
   }
 
   private baseSha(): string {
@@ -480,6 +544,13 @@ export class TaskRunner {
       )
       .run(task.id, task.node, task.state, JSON.stringify(task), task.updatedAt);
     this.opts.onEvent?.({ type: "task", task });
+  }
+
+  private chatEntry(task: Task, role: ChatEntry["role"], text: string): void {
+    const entry: ChatEntry = { role, text, at: new Date().toISOString() };
+    mkdirSync(dirname(this.chatPath(task)), { recursive: true });
+    appendFileSync(this.chatPath(task), JSON.stringify(entry) + "\n");
+    this.opts.onEvent?.({ type: "chat", taskId: task.id, entry });
   }
 
   private log(task: Task, text: string): void {

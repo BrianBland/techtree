@@ -95,7 +95,7 @@ const scenarios = {
   },
   // Replies to every later message; one containing "finish" completes the checklist.
   async chat(message, settle) {
-    if (prompts === 1) return report({ plan: ["reply"] });
+    if (prompts === 1 && !resumed) return report({ plan: ["reply"] });
     emit({ type: "tool_execution_start", toolName: "read", args: { path: "README.md" } });
     say(`heard: ${message}`);
     if (!message.includes("finish")) return;

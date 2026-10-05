@@ -282,7 +282,7 @@ test("open in terminal runs the configured template detached in the worktree; ag
   const reviewed = await until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.state === "review")), "review");
 
   await backend.openTerminal(task.id, "agent");
-  const [cwd, command] = await until(() => existsSync(out) && (JSON.parse(readFileSync(out, "utf8")) as string[]), "terminal to run");
+  const [cwd, command] = await until(() => (existsSync(out) ? (JSON.parse(readFileSync(out, "utf8")) as string[]) : undefined), "terminal to run");
   assert.equal(cwd, reviewed.worktree);
   assert.ok(command.startsWith(`'${process.execPath}' '${FAKE_PI}' '--session-dir'`), command);
   assert.ok(command.endsWith(`'--session-id' '${task.id}'`), command);

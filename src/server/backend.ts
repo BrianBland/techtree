@@ -4,12 +4,14 @@ import type {
   ApiOverview,
   ApiSource,
   ApiState,
+  ChatEntry,
   NodeId,
   PrState,
   ServerEvent,
   StartTaskRequest,
   Task,
   TaskPhase,
+  TerminalMode,
 } from "../types.ts";
 
 /** Worker progress sent through `techtree_report`; exactly one field is expected per call. */
@@ -37,6 +39,11 @@ export interface Backend {
   answer(taskId: string, text: string): Promise<Task>;
   openPr(taskId: string): Promise<Task>;
   cancel(taskId: string): Promise<Task>;
+  /** Message the task's agent; routed by task state (steer, answer or resume). */
+  message(taskId: string, text: string): Promise<Task>;
+  chat(taskId: string): Promise<ChatEntry[]>;
+  /** Open a terminal window in the task's worktree (a shell, or interactive pi on its session). */
+  openTerminal(taskId: string, mode: TerminalMode): Promise<void>;
   /** Stop and delete a task, its worktree and local branch (not for `pr_open`). */
   discard(taskId: string): Promise<void>;
   report(taskId: string, report: WorkerReport): Promise<Task>;

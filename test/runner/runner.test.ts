@@ -424,7 +424,7 @@ test("a message resumes a review task on its session, which returns to review", 
   h.runner.message(id, "finish up");
   await h.waitFor(id, (x) => x.state === "review");
 
-  assert.equal(h.runner.message(id, "also finish the docs").state, "queued");
+  assert.equal(h.runner.message(id, "also finish the docs").state, "running", "resumed at once while a slot is free");
   const again = await h.waitFor(id, (x) => x.state === "review" && h.runner.chat(id).some((e) => e.text === "heard: also finish the docs"));
   assert.match(log(again), /prompt: also finish the docs/);
 });
