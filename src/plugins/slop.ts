@@ -1,5 +1,5 @@
 import type { CollectCtx, Effort, Finding, MetricPlugin, MetricValues, NodeId } from "../types.ts";
-import { lexRust, matchingBrace, TEST_ATTR } from "./rust.ts";
+import { lexRust, matchingBrace, rustTestCode, TEST_ATTR, type RustTestCode } from "./rust.ts";
 import { findingId, nodeOfFile, readSource, treeFiles } from "./util/source.ts";
 
 const CODE_FILE = /\.(rs|ts|tsx|js|jsx|mjs|cjs|go|java|kt|swift|c|h|cc|cpp|hpp|cs|scala|sol)$/;
@@ -32,7 +32,7 @@ function lineIndex(text: string): (offset: number) => number {
 const WINDOW = 10;
 const MIN_WINDOW_CHARS = 250;
 const MIN_TEST_BLOCK = 20;
-const TEST_PATH = /(^|\/)(tests?|__tests__|test_utils|testing)\/|[._](test|spec)s?\.\w+$|(^|\/)(tests?|test_utils|testing)\.rs$/;
+const TEST_PATH = /(^|\/)(tests?|__tests__|test_utils|testing|fixtures|mocks?)\/|[._](test|spec)s?\.\w+$/;
 const NOT_SIGNIFICANT = /^(?:(?:pub(?:\([^)]*\))?\s+)?(?:use\s|mod\s+\w+\s*;)|import\s|extern\s+crate\s|package\s|#!?\[)/;
 
 interface SignificantLine {
@@ -50,8 +50,7 @@ interface Block {
 interface DupInput {
   file: string;
   lines: SignificantLine[];
-  /** First line of test code (Infinity when none). */
-  testFrom: number;
+  isTestLine(line: number): boolean;
 }
 
 /** The file text with comments blanked (newlines kept) but literals intact, so different data never matches. */
@@ -108,7 +107,7 @@ function findDuplicates(files: DupInput[]): { blocks: Block[]; dupLines: number[
 
   const started = keys.map((ks) => new Uint8Array(ks.length));
   const blocks: Block[] = [];
-  files.forEach(({ file, lines, testFrom }, f) => {
+  files.forEach(({ file, lines, isTestLine }, f) => {
     for (let p = 0; p < keys[f].length; p++) {
       if (started[f][p]) continue;
       const others = partners(f, p);
@@ -121,7 +120,7 @@ function findDuplicates(files: DupInput[]): { blocks: Block[]; dupLines: number[
         file,
         lines: lines.slice(p, p + len + WINDOW - 1),
         others: others.map(([h, r]) => ({ file: files[h].file, line: files[h].lines[r].line })),
-        inTest: lines[p].line >= testFrom,
+        inTest: isTestLine(lines[p].line),
       });
     }
   });
@@ -453,10 +452,15 @@ interface Analysis {
   blocks: Block[];
 }
 
-function testFrom(src: SourceFile): number {
-  if (TEST_PATH.test(src.file)) return 1;
-  const cfgTest = src.file.endsWith(".rs") ? src.code.indexOf("#[cfg(test)]") : -1;
-  return cfgTest < 0 ? Infinity : src.lineOf(cfgTest);
+/** Whether a 1-based line of `src` is test code (DESIGN "Test code"; Rust uses the rust plugin's rules). */
+function testLines(src: SourceFile, rust: RustTestCode): (line: number) => boolean {
+  if (!src.file.endsWith(".rs")) {
+    const test = TEST_PATH.test(src.file);
+    return () => test;
+  }
+  if (rust.testFiles.has(src.file)) return () => true;
+  const ranges = (rust.regions.get(src.file) ?? []).map(([start, end]) => [src.lineOf(start), src.lineOf(end - 1)]);
+  return (line) => ranges.some(([from, to]) => line >= from && line <= to);
 }
 
 function analyze(ctx: CollectCtx): Analysis {
@@ -465,7 +469,10 @@ function analyze(ctx: CollectCtx): Analysis {
     const text = readSource(ctx.repoRoot, file);
     if (text !== undefined) sources.push({ file, text, ...lexRust(text), lineOf: lineIndex(text) });
   }
-  const { blocks, dupLines } = findDuplicates(sources.map((s) => ({ file: s.file, lines: significantLines(withoutComments(s)), testFrom: testFrom(s) })));
+  const rust = rustTestCode(ctx.tree, new Map(sources.filter((s) => s.file.endsWith(".rs")).map((s) => [s.file, s])));
+  const { blocks, dupLines } = findDuplicates(
+    sources.map((s) => ({ file: s.file, lines: significantLines(withoutComments(s)), isTestLine: testLines(s, rust) })),
+  );
   const files = sources.map((src, i) => ({
     file: src.file,
     dupLines: dupLines[i],

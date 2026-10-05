@@ -49,7 +49,7 @@ test("three copies give one finding listing the others; trivial lines do not mak
 
 test("windows of short lines never match; test-code blocks under 20 lines count but are not reported", async () => {
   const getters = Array.from({ length: 12 }, (_, i) => `fn g${i}(&self) -> u8 { self.f${i} }`).join("\n");
-  const testMod = (name: string) => `fn ${name}() {}\n#[cfg(test)]\nmod tests {\n${block(15)}\n}\n`;
+  const testMod = (name: string) => `fn ${name}() {}\n#[cfg(all(test, unix))]\nmod tests {\n${block(15)}\n}\n`;
   const { values, findings } = await run({
     "a.rs": getters, "b.rs": getters,
     "c.rs": testMod("c"), "d.rs": testMod("d"),

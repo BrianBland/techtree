@@ -321,3 +321,62 @@ test("test gaps are reported with low confidence, and only for crates other crat
   assert.deepEqual((await rustPlugin.findings!(ctx)).filter((f) => f.source === "test-gap"), []);
   assert.equal((await rustPlugin.collect(ctx)).src.pub_fn_count, 1, "test_ratio still counts the untested fn");
 });
+
+const UNWRAPPING = "pub fn f(r: Result<u8, ()>) -> u8 { r.unwrap() }\n";
+
+test("test-only cfg predicates on any item mark test code; other predicates do not", async () => {
+  const root = fixture({
+    "Cargo.toml": `[package]\nname = "jwt"\n`,
+    "src/secret.rs": [
+      "pub fn real(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[cfg(all(test, unix))]",
+      "mod tests { fn a(r: Result<u8, ()>) { r.unwrap(); } }",
+      "#[cfg(any(test, feature = \"test-utils\"))]",
+      "pub fn helper(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[cfg(feature = \"test-utils\")]",
+      "#[allow(dead_code)]",
+      "impl Thing { pub fn make(r: Result<u8, ()>) -> u8 { r.expect(\"x\") } }",
+      "#[cfg(feature = \"testing\")]",
+      "static S: u8 = parse().unwrap();",
+      "#[cfg(not(test))]",
+      "pub fn prod(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[cfg(any(test, unix))]",
+      "pub fn either(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[tokio::test]",
+      "async fn loose() { x().unwrap(); }",
+      "",
+    ].join("\n"),
+    "src/lib.rs": "#[cfg(all(test, feature = \"x\"))]\nmod helpers;\n",
+    "src/helpers.rs": UNWRAPPING,
+    "src/inner.rs": "#![cfg(test)]\n" + UNWRAPPING,
+  });
+  const ctx = makeCtx(annotated(root));
+  const values = await rustPlugin.collect(ctx);
+  assert.equal(values.src.unwrap_density, 3, "real, prod and either");
+  assert.equal(values.src.pub_fn_count, 3);
+  const unwraps = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "unwrap");
+  assert.deepEqual(unwraps.map((f) => [f.file, f.metricEffects.unwrap_density]), [["src/secret.rs", -3]]);
+});
+
+test("test-support files and crates are test code: no unwrap or test-gap findings", async () => {
+  const supportFiles = ["src/test_utils/mod.rs", "src/testing.rs", "src/test_helpers.rs", "src/fixtures.rs", "src/mocks/a.rs", "src/mock.rs",
+    "src/tests.rs", "src/test_rollup_config.rs", "src/foo_test.rs", "src/foo_tests.rs", "src/fixtures/b.rs", "src/test_helpers/c.rs"];
+  const root = fixture({
+    "Cargo.toml": `[workspace]\nmembers = ["crates/*", "crates/infra/*", "actions/*"]\n`,
+    "crates/core/Cargo.toml": `[package]\nname = "core"\n`,
+    ...Object.fromEntries(supportFiles.map((f) => [`crates/core/${f}`, UNWRAPPING])),
+    "crates/test-utils/Cargo.toml": `[package]\nname = "base-test-utils"\n`,
+    "crates/test-utils/src/lib.rs": UNWRAPPING,
+    "crates/infra/challenger-e2e/Cargo.toml": `[package]\nname = "base-challenger-e2e"\n`,
+    "crates/infra/challenger-e2e/src/lib.rs": UNWRAPPING,
+    "crates/infra/load-tests/Cargo.toml": `[package]\nname = "base-load-tests"\n`,
+    "crates/infra/load-tests/src/lib.rs": UNWRAPPING,
+    "actions/harness/Cargo.toml": `[package]\nname = "base-action-harness"\n`,
+    "actions/harness/src/lib.rs": UNWRAPPING,
+    "crates/app/Cargo.toml": `[package]\nname = "app"\n\n[dependencies]\ncore = { path = "../core" }\nbase-test-utils = { path = "../test-utils" }\nbase-action-harness = { path = "../../actions/harness" }\nbase-challenger-e2e = { path = "../infra/challenger-e2e" }\nbase-load-tests = { path = "../infra/load-tests" }\n`,
+    "crates/app/src/lib.rs": UNWRAPPING,
+  });
+  const ctx = makeCtx(annotated(root));
+  const findings = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "unwrap" || f.source === "test-gap");
+  assert.deepEqual(findings.map((f) => [f.source, f.file]), [["unwrap", "crates/app/src/lib.rs"]]);
+});

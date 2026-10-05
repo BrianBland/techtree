@@ -50,7 +50,6 @@ interface RustOptions {
 }
 
 export const TEST_ATTR = /#\[\s*(?:(?:[\w:]+::)?test|rstest)\b[^\]]*\]/g;
-const CFG_TEST_MOD = /#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])/g;
 const IGNORE_ATTR = /#\[\s*ignore\b/g;
 const FN = /\bfn\s+[A-Za-z_]\w*/g;
 const PUB_FN = /\bpub\s+(?:const\s+|async\s+|unsafe\s+|extern\s+(?:"[^"]*"\s+)?)*fn\s+([A-Za-z_]\w*)/g;
@@ -150,33 +149,148 @@ export function matchingBrace(code: string, open: number): number {
   return code.length;
 }
 
-function testRegions(code: string): [number, number][] {
-  const regions: [number, number][] = [];
-  for (const re of [TEST_ATTR, CFG_TEST_MOD]) {
-    for (const m of code.matchAll(re)) {
-      if (m[2] === ";") continue;
-      const open = code.indexOf("{", m.index);
-      if (open >= 0) regions.push([m.index, matchingBrace(code, open)]);
+const CFG_ATTR = /#(!?)\[\s*cfg\s*\(/g;
+const TEST_FEATURES = new Set(["test-utils", "test_utils", "testing", "test-helpers", "test-support"]);
+const TEST_DIRS = new Set(["tests", "test_utils", "testing", "test_helpers", "fixtures", "mock", "mocks"]);
+const TEST_FILE = /^(?:tests|test_utils|testing|test_helpers|fixtures|mocks?|test_\w+|\w+_tests?)\.rs$/;
+const TEST_SUPPORT_SEGMENT = /^(?:tests?|testing|testsuite|harness|e2e|fixtures|mocks?)$/;
+
+/** Whether a `cfg` predicate (the text inside `cfg(…)`) holds only in test or test-support builds. */
+export function testOnlyCfg(predicate: string): boolean {
+  const tokens = predicate.match(/[A-Za-z_]\w*|"[^"]*"|[(),=]/g) ?? [];
+  let i = 0;
+  const parse = (): boolean => {
+    const name = tokens[i++];
+    if (tokens[i] === "=") {
+      i++;
+      return name === "feature" && TEST_FEATURES.has(tokens[i++]?.slice(1, -1) ?? "");
     }
-  }
-  return regions;
+    if (tokens[i] !== "(") return name === "test";
+    i++;
+    const args: boolean[] = [];
+    while (i < tokens.length && tokens[i] !== ")") {
+      args.push(parse());
+      if (tokens[i] === ",") i++;
+    }
+    i++;
+    if (name === "all") return args.some(Boolean);
+    return name === "any" && args.length > 0 && args.every(Boolean);
+  };
+  return parse();
 }
 
-/** Files that an out-of-line `#[cfg(test)] mod name;` in `file` points at. */
-function outOfLineTestModules(file: string, code: string): string[] {
-  const dir = posix.dirname(file);
-  const base = posix.basename(file, ".rs");
-  const modDir = ["lib", "main", "mod"].includes(base) ? dir : posix.join(dir, base);
-  const found: string[] = [];
-  for (const m of code.matchAll(CFG_TEST_MOD)) {
-    if (m[2] === ";") found.push(posix.join(modDir, `${m[1]}.rs`), posix.join(modDir, m[1], "mod.rs"));
+/** Offset just past the bracket closing the one at `open` (`(` or `[`), or the end of `code`. */
+function closingBracket(code: string, open: number): number {
+  const [o, c] = code[open] === "[" ? ["[", "]"] : ["(", ")"];
+  let depth = 0;
+  for (let j = open; j < code.length; j++) {
+    if (code[j] === o) depth++;
+    else if (code[j] === c && --depth === 0) return j + 1;
+  }
+  return code.length;
+}
+
+/** End of the item starting at `start`: past its `;` or its matching `}`, whichever comes first at bracket depth 0. */
+function itemEnd(code: string, start: number): number {
+  let depth = 0;
+  for (let j = start; j < code.length; j++) {
+    const c = code[j];
+    if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") depth--;
+    else if (depth === 0 && c === ";") return j + 1;
+    else if (depth === 0 && c === "{") return matchingBrace(code, j);
+  }
+  return code.length;
+}
+
+interface TestRegions {
+  /** The file is test-only (inner `#![cfg(test)]`). */
+  wholeFile: boolean;
+  regions: [number, number][];
+  /** Names of out-of-line test-only modules (`#[cfg(test)] mod name;`). */
+  modules: string[];
+}
+
+/**
+ * Test regions of a Rust file: items under a test-only `cfg` and test fns. `code` is the stripped
+ * source (see `stripRust`) and `src` the original, read at the same offsets for `cfg` predicates.
+ */
+export function testRegions(code: string, src: string): TestRegions {
+  const found: TestRegions = { wholeFile: false, regions: [], modules: [] };
+  for (const m of code.matchAll(CFG_ATTR)) {
+    const open = m.index + m[0].length - 1;
+    if (!testOnlyCfg(src.slice(open + 1, closingBracket(code, open) - 1))) continue;
+    if (m[1] === "!") {
+      found.wholeFile = true;
+      continue;
+    }
+    let start = closingBracket(code, code.indexOf("[", m.index));
+    for (;;) {
+      start += code.slice(start).search(/\S|$/);
+      if (code[start] !== "#") break;
+      start = closingBracket(code, code.indexOf("[", start));
+    }
+    const end = itemEnd(code, start);
+    found.regions.push([m.index, end]);
+    const mod = /^(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;$/.exec(code.slice(start, end));
+    if (mod) found.modules.push(mod[1]);
+  }
+  const nextFn = /\bfn\b/g;
+  for (const m of code.matchAll(TEST_ATTR)) {
+    nextFn.lastIndex = m.index;
+    const fn = nextFn.exec(code);
+    if (fn) found.regions.push([m.index, itemEnd(code, fn.index)]);
   }
   return found;
 }
 
-function fileKind(file: string, testModules: Set<string>): FileKind {
+/** Files that the out-of-line test-only `modules` declared in `file` point at. */
+function testModuleFiles(file: string, modules: string[]): string[] {
+  const dir = posix.dirname(file);
+  const base = posix.basename(file, ".rs");
+  const modDir = ["lib", "main", "mod"].includes(base) ? dir : posix.join(dir, base);
+  return modules.flatMap((m) => [posix.join(modDir, `${m}.rs`), posix.join(modDir, m, "mod.rs")]);
+}
+
+/** Whether a path names a test or test-support file by convention (directory or file name). */
+export function isTestPath(file: string): boolean {
   const segments = file.split("/");
-  if (segments.includes("tests") || testModules.has(file)) return "test";
+  return segments.slice(0, -1).some((s) => TEST_DIRS.has(s)) || TEST_FILE.test(segments.at(-1)!);
+}
+
+/** Whether a crate (directory `node`, package `name`) exists to support tests: harnesses, e2e suites, test utils. */
+export function isTestSupportCrate(node: NodeId, name: string): boolean {
+  return [node, name].some((text) => {
+    const words = text.toLowerCase().split(/[/_-]/);
+    return words.some((w, i) => TEST_SUPPORT_SEGMENT.test(w) || (w === "test" && /^(utils|helpers)$/.test(words[i + 1] ?? "")) || (w === "load" && words[i + 1]?.startsWith("test")));
+  });
+}
+
+export interface RustTestCode {
+  /** Files that are test code as a whole. */
+  testFiles: Set<string>;
+  /** Test regions of the other files, as offsets. */
+  regions: Map<string, [number, number][]>;
+}
+
+/** Classify the test code of Rust `sources` (path → original and stripped text) in `tree` (DESIGN "Test code"). */
+export function rustTestCode(tree: Tree, sources: Map<string, { text: string; code: string }>): RustTestCode {
+  const supportFiles = new Set(cratesOf(tree).crates.filter((c) => isTestSupportCrate(c.node, c.name)).flatMap((c) => c.files));
+  const testFiles = new Set<string>();
+  const regions = new Map<string, [number, number][]>();
+  for (const [file, { text, code }] of sources) {
+    const found = testRegions(code, text);
+    if (found.wholeFile || isTestPath(file) || supportFiles.has(file)) testFiles.add(file);
+    regions.set(file, found.regions);
+    for (const module of testModuleFiles(file, found.modules)) testFiles.add(module);
+  }
+  for (const file of testFiles) regions.delete(file);
+  return { testFiles, regions };
+}
+
+function fileKind(file: string, test: RustTestCode): FileKind {
+  const segments = file.split("/");
+  if (test.testFiles.has(file)) return "test";
   if (segments.includes("benches") || segments.includes("examples")) return "aux";
   return "src";
 }
@@ -187,8 +301,8 @@ function lineAt(code: string, index: number): number {
   return line;
 }
 
-function analyzeFile(file: string, code: string, kind: FileKind): FileStats {
-  const regions = kind === "test" ? [[0, code.length] as [number, number]] : testRegions(code);
+function analyzeFile(file: string, code: string, kind: FileKind, testRegions: [number, number][]): FileStats {
+  const regions = kind === "test" ? [[0, code.length] as [number, number]] : testRegions;
   const mask = code.split("");
   let testCode = "";
   for (const [from, to] of regions) {
@@ -459,14 +573,14 @@ function testTimes(repoRoot: string): Map<string, number> {
 }
 
 async function analyze(ctx: CollectCtx): Promise<Analysis> {
-  const sources = new Map<string, string>();
+  const sources = new Map<string, { text: string; code: string }>();
   for (const file of treeFiles(ctx.tree)) {
     if (!file.endsWith(".rs")) continue;
     const text = readSource(ctx.repoRoot, file);
-    if (text !== undefined) sources.set(file, stripRust(text));
+    if (text !== undefined) sources.set(file, { text, code: stripRust(text) });
   }
-  const testModules = new Set([...sources].flatMap(([file, code]) => outOfLineTestModules(file, code)));
-  const files = [...sources].map(([file, code]) => analyzeFile(file, code, fileKind(file, testModules)));
+  const test = rustTestCode(ctx.tree, sources);
+  const files = [...sources].map(([file, { code }]) => analyzeFile(file, code, fileKind(file, test), test.regions.get(file) ?? []));
   const { crates, crateOf } = cratesOf(ctx.tree);
   return { files, crates, crateOf, lints: await runClippy(ctx, crates) };
 }
