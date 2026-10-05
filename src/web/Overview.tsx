@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import type { ApiOverview, ApiState, NodeId, Suggestion } from "../types.ts";
 import { get } from "./api.ts";
-import { PrRow, Section, SuggestionRow, fmt } from "./Panel.tsx";
+import { PrRow, Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
 
 export interface OverviewProps {
   state: ApiState;
@@ -14,11 +14,10 @@ export interface OverviewProps {
 
 export function Overview({ state, version, onSelect, onStart, onError }: OverviewProps) {
   const [overview, setOverview] = useState<ApiOverview | null>(null);
-  const changeKey = state.tasks.map((t) => t.id + t.state).join() + state.prs.map((p) => [p.number, p.ci, p.babysit, p.stale, p.stuck].join(":")).join();
 
   useEffect(() => {
     get<ApiOverview>("/api/overview").then(setOverview, (e: Error) => onError(e.message));
-  }, [changeKey, version]);
+  }, [attentionKey(state), version]);
 
   if (!overview) return <aside class="panel muted">Loading…</aside>;
   const nodeName = (id: NodeId) => (id === "" ? state.repo.name : id);

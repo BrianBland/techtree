@@ -1,14 +1,13 @@
 import { render } from "preact";
-import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
+import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks";
 import type { ApiState, Finding, NodeId, Suggestion } from "../types.ts";
 import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { initialExpanded, layoutTree, siblingOrder, toggled, type SortKey } from "./layout.ts";
-import { ramp, sqrtScale } from "./visual.ts";
+import { hotNodes } from "../core/hot.ts";
+import { COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
 import { NodePanel, StartDialog } from "./Panel.tsx";
 import { Overview } from "./Overview.tsx";
-
-const COMPOSITE = "quality";
 
 function App() {
   const [state, setState] = useState<ApiState | null>(null);
@@ -61,19 +60,16 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[] } | null>(null);
   const { tree, scores, metricDefs } = state;
 
-  const scoreOf = useCallback(
-    (id: NodeId) => (scoreKey === COMPOSITE ? scores[id]?.quality : scores[id]?.metrics[scoreKey]?.pct) ?? null,
-    [scores, scoreKey],
-  );
+  const scoreOf = useCallback((id: NodeId) => scoreValue(scores[id], scoreKey), [scores, scoreKey]);
   const weightOf = useCallback((id: NodeId) => scores[id]?.metrics[weightKey]?.raw ?? 0, [scores, weightKey]);
   const maxWeight = useMemo(() => weightOf(""), [weightOf]);
   const radius = useMemo(() => {
-    const scale = sqrtScale(maxWeight, 3, 22);
-    return (id: NodeId) => scale(weightOf(id));
+    const side = tileSize(maxWeight);
+    return (id: NodeId) => side(weightOf(id)) / 2;
   }, [weightOf, maxWeight]);
   const edgeWidth = useMemo(() => {
-    const scale = sqrtScale(maxWeight, 1, 14);
-    return (id: NodeId) => scale(weightOf(id));
+    const scale = sqrtScale(maxWeight, 2, 8);
+    return (id: NodeId) => Math.round(scale(weightOf(id)));
   }, [weightOf, maxWeight]);
 
   const sortBasis = sortKey === "score" ? scoreOf : sortKey === "weight" ? weightOf : null;
@@ -81,10 +77,18 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const [expanded, setExpanded] = useState(() => initialExpanded(tree, order));
   const layout = useMemo(() => layoutTree({ tree, expanded, radius, order }), [tree, expanded, radius, order]);
 
-  const fill = useMemo(() => {
-    const color = ramp(Object.keys(tree.nodes).map(scoreOf));
-    return (id: NodeId) => color(scoreOf(id));
-  }, [tree, scoreOf]);
+  const statKeys = useMemo(() => statMetrics(metricDefs, state.weights), [metricDefs, state.weights]);
+  const hot = useMemo(() => hotNodes(tree, scores), [tree, scores]);
+  const look = useMemo(
+    () => tileLooks({ scores, scoreKey, statKeys, hot, findingCounts: state.findingCounts }),
+    [scores, scoreKey, statKeys, hot, state.findingCounts],
+  );
+  const previousScores = useRef(scores);
+  const deltas = useMemo(() => {
+    const changed = scoreDeltas(previousScores.current, scores, scoreKey);
+    previousScores.current = scores;
+    return changed;
+  }, [scores]);
   const compositeColor = useMemo(() => {
     const color = ramp(Object.values(scores).map((s) => s.quality));
     return (score: number) => color(score);
@@ -150,7 +154,8 @@ function Main({ state, version, error, notice, setError }: MainProps) {
         <TreeView
           tree={tree}
           layout={layout}
-          fill={fill}
+          look={look}
+          deltas={deltas}
           edgeWidth={edgeWidth}
           compositeColor={compositeColor}
           tasks={state.tasks}
@@ -168,6 +173,7 @@ function Main({ state, version, error, notice, setError }: MainProps) {
             state={state}
             version={version}
             onStart={(suggestion, findings) => setStarting({ suggestion, findings })}
+            onSelect={select}
             onError={setError}
             onClose={() => setSelected(null)}
           />
