@@ -1,12 +1,20 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { build } from "esbuild";
-import type { Backend } from "../../src/server/backend.ts";
-import type { ServerEvent } from "../../src/types.ts";
+import { RepoBackend, type PrSource } from "../../src/backend/backend.ts";
+import { mergeConfig } from "../../src/config.ts";
+import { openDb, suppressSqliteWarning } from "../../src/db.ts";
+import { HttpError, type Backend } from "../../src/server/backend.ts";
+import { startServer } from "../../src/server/server.ts";
+import type { PrState, ServerEvent, Task } from "../../src/types.ts";
+import { FAKE_PI, TODO_FILE, fixture, until } from "../backend/helpers.ts";
+import type { SmokeDriver } from "./app-smoke.tsx";
+
+suppressSqliteWarning();
 
 /** Bundle a TSX entry (Node cannot strip JSX) and import it. */
 async function importTsx<T>(entry: string): Promise<T> {
@@ -29,7 +37,7 @@ async function importTsx<T>(entry: string): Promise<T> {
   }
 }
 
-test("switching score, weight or sort re-renders ~1000 visible nodes in under 200 ms", async (t) => {
+test("switching score, weight or sort re-renders ~1000 visible nodes in under 200 ms", { timeout: 30_000 }, async (t) => {
   const { bench } = await importTsx<typeof import("./render-bench.tsx")>("./render-bench.tsx");
   const timings = bench(1000);
   t.diagnostic(JSON.stringify(Object.fromEntries(Object.entries(timings).map(([k, v]) => [k, Math.round(v * 10) / 10]))));
@@ -39,7 +47,7 @@ test("switching score, weight or sort re-renders ~1000 visible nodes in under 20
   assert.ok(timings.switchSort < 200, `sort switch ${timings.switchSort} ms`);
 });
 
-test("decorated sibling tiles never paint over each other", async () => {
+test("decorated sibling tiles never paint over each other", { timeout: 30_000 }, async () => {
   const { decoratedSiblingBoxes } = await importTsx<typeof import("./tile-boxes.tsx")>("./tile-boxes.tsx");
   const boxes = decoratedSiblingBoxes(3).filter((b) => b.node !== "repo");
   const extent = (node: string) => {
@@ -53,174 +61,243 @@ test("decorated sibling tiles never paint over each other", async () => {
   assert.ok(b.bottom + 1 < c.top - 1, `n1 ${JSON.stringify(b)} overlaps n2 ${JSON.stringify(c)}`);
 });
 
-test("the UI boots against the server and mock backend, opens nodes and answers questions", async () => {
-  const { startServer } = await import("../../src/server/server.ts");
-  const { createMockBackend } = await import("../../src/server/mock.ts");
-  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
-  const backend = createMockBackend({ tickMs: 0 });
-  const server = await startServer({ backend, staticDir: tmpdir() });
-  const app = await bootApp(`http://127.0.0.1:${server.port}`, server.token);
-  const byClass = (cls: string) => app.find((n) => n.getAttribute("class") === cls);
-  try {
-    await app.waitFor(() => app.text().includes("Needs you") && app.text().includes("Scan coverage"), "overview");
-    const glyphs = app.find((n) => /^node( |$)/.test(n.getAttribute("class") ?? ""));
-    assert.ok(glyphs.length > 20 && glyphs.length <= 150, `${glyphs.length} nodes shown initially`);
+const TODOS = "fn a() {}\n// TODO one\n// TODO two\n// TODO three\n";
+const ASKING_NODE = TODO_FILE.slice(0, TODO_FILE.lastIndexOf("/"));
+const RUNNING_NODE = "src/util";
+const UI_TIMEOUT = { timeout: 60_000 };
 
-    const state = await backend.getState();
-    const asking = state.tasks.find((t) => t.state === "needs_input")!;
-    const item = byClass("row clickable").find((n) => n.textContent.includes(asking.question!))!;
-    item.dispatch("click");
-    await app.waitFor(() => app.text().includes("Composite") && byClass("answer").length === 1, "node panel with question");
+/** In-test PR source: the listed PRs, plus a way to merge one as the poller would announce it. */
+function fakePrs(prs: PrState[]): PrSource & { merge(number: number): void } {
+  const listeners = new Set<(event: ServerEvent) => void>();
+  return {
+    list: () => prs,
+    setBabysit: (number) => prs.find((p) => p.number === number)!,
+    onEvent(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+    merge(number) {
+      prs = prs.filter((p) => p.number !== number);
+      listeners.forEach((l) => l({ type: "pr_removed", number }));
+    },
+  };
+}
 
-    const textarea = app.find((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
-    textarea.value = "keep the old error type";
-    textarea.dispatch("input");
-    const submit = app.find((n) => n.localName === "button" && n.textContent === "Answer")[0];
-    await app.waitFor(() => submit.getAttribute("disabled") === null, "answer button to enable");
-    byClass("answer")[0].dispatch("submit");
-    await app.waitFor(() => byClass("answer").length === 0, "answered task to resume");
-    assert.equal((await backend.getState()).tasks.find((t) => t.id === asking.id)!.state, "running");
-    assert.match(await backend.taskLog(asking.id, 5), /answer: keep the old error type/);
+function pr(number: number, node: string, title: string): PrState {
+  return {
+    number,
+    url: `https://example.com/pr/${number}`,
+    title,
+    author: "dev",
+    node,
+    files: [],
+    ci: "pass",
+    review: "",
+    updatedAt: new Date().toISOString(),
+    babysit: false,
+    stale: false,
+    stuck: false,
+  };
+}
 
-    const before = state.tasks.length;
-    const startButtons = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
-    await app.waitFor(() => startButtons().length > 0, "suggestions with Start buttons");
-    const start = startButtons()[0];
-    start.dispatch("click");
-    await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
-    byClass("dialog")[0].dispatch("submit");
-    await app.waitFor(() => byClass("dialog").length === 0, "dialog to close");
-    assert.equal((await backend.getState()).tasks.length, before + 1);
-  } finally {
-    app.close();
+/** Every `Backend` method of `real`, so a test can override a few. */
+function delegate(real: Backend): Backend {
+  return {
+    getState: () => real.getState(),
+    getNode: (id) => real.getNode(id),
+    getOverview: () => real.getOverview(),
+    taskLog: (id, tail) => real.taskLog(id, tail),
+    taskDiff: (id) => real.taskDiff(id),
+    startTask: (req) => real.startTask(req),
+    answer: (id, text) => real.answer(id, text),
+    openPr: (id) => real.openPr(id),
+    cancel: (id) => real.cancel(id),
+    report: (id, report) => real.report(id, report),
+    setBabysit: (n, on) => real.setBabysit(n, on),
+    rescore: () => real.rescore(),
+    scan: (node) => real.scan(node),
+    subscribe: (listener) => real.subscribe(listener),
+  };
+}
+
+interface Ui {
+  backend: RepoBackend;
+  prs: ReturnType<typeof fakePrs>;
+  app: SmokeDriver;
+  /** A task under `ASKING_NODE` waiting for an answer. */
+  asking: Task;
+  /** A task under `RUNNING_NODE` still working. */
+  running: Task;
+  byClass(cls: string): ReturnType<SmokeDriver["find"]>;
+}
+
+/**
+ * Boot the real UI against the real server and `RepoBackend` over a scored fixture repo, with
+ * fake pi workers: one task asking a question, one running, and one open PR on `RUNNING_NODE`.
+ * `serve` can wrap the backend the server talks to.
+ */
+async function bootUi(t: TestContext, serve: (real: RepoBackend) => Backend = (real) => real): Promise<Ui> {
+  const { tmp, repo, cache } = fixture(t, { "src/net/lib.rs": TODOS });
+  mkdirSync(cache, { recursive: true });
+  const prs = fakePrs([pr(7, RUNNING_NODE, "Tidy the util helpers")]);
+  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand: [process.execPath, FAKE_PI] });
+  const backend = new RepoBackend({ db: openDb(cache), repoRoot: repo, cacheDir: cache, config, prs, log: () => {} });
+  const server = await startServer({ backend: serve(backend), staticDir: tmp, token: "tok" });
+  backend.attach({ url: `http://127.0.0.1:${server.port}`, token: "tok" });
+  t.after(async () => {
+    await backend.close();
     await server.close();
-  }
+  });
+  await backend.idle();
+
+  const started = (node: string, scenario: string) =>
+    backend.startTask({ node, findingIds: [], prompt: `Work on ${node}. scenario:${scenario}`, manualReview: true });
+  const settled = (id: string, state: Task["state"]) =>
+    until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === id && x.state === state)), `task ${id} ${state}`);
+  const asking = await settled((await started(ASKING_NODE, "ask")).id, "needs_input");
+  const running = await settled((await started(RUNNING_NODE, "hang")).id, "running");
+
+  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
+  const app = await bootApp(`http://127.0.0.1:${server.port}`, "tok");
+  t.after(() => app.close());
+  return { backend, prs, app, asking, running, byClass: (cls) => app.find((n) => n.getAttribute("class") === cls) };
+}
+
+async function answerInPanel({ app, byClass }: Ui, text: string) {
+  const textarea = app.find((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  textarea.value = text;
+  textarea.dispatch("input");
+  const submit = app.find((n) => n.localName === "button" && n.textContent === "Answer")[0];
+  await app.waitFor(() => submit.getAttribute("disabled") === null, "answer button to enable");
+  byClass("answer")[0].dispatch("submit");
+  return textarea;
+}
+
+test("the UI boots against the server and repo backend, opens nodes and answers questions", UI_TIMEOUT, async (t) => {
+  const ui = await bootUi(t);
+  const { app, backend, asking, byClass } = ui;
+  await app.waitFor(() => app.text().includes("Needs you") && app.text().includes("Scan coverage"), "overview");
+  const state = await backend.getState();
+  const glyphs = app.find((n) => /^node( |$)/.test(n.getAttribute("class") ?? ""));
+  assert.equal(glyphs.length, Object.keys(state.tree.nodes).length, "a small tree is shown fully expanded");
+
+  const item = byClass("row clickable").find((n) => n.textContent.includes(asking.question!))!;
+  item.dispatch("click");
+  await app.waitFor(() => app.text().includes("Composite") && byClass("answer").length === 1, "node panel with question");
+
+  await answerInPanel(ui, "keep the old error type");
+  await app.waitFor(() => byClass("answer").length === 0, "answered task to resume");
+  assert.notEqual((await backend.getState()).tasks.find((x) => x.id === asking.id)!.state, "needs_input");
+  assert.match(await backend.taskLog(asking.id, 50), /answer: keep the old error type/);
+
+  const before = state.tasks.length;
+  const startButtons = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
+  await app.waitFor(() => startButtons().length > 0, "suggestions with Start buttons");
+  startButtons()[0].dispatch("click");
+  await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
+  byClass("dialog")[0].dispatch("submit");
+  await app.waitFor(() => byClass("dialog").length === 0, "dialog to close");
+  assert.equal((await backend.getState()).tasks.length, before + 1);
 });
 
-test("the node panel lists its own calls to action, then its children's, which select their node", async () => {
-  const { startServer } = await import("../../src/server/server.ts");
-  const { createMockBackend } = await import("../../src/server/mock.ts");
-  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
-  const backend = createMockBackend({ tickMs: 0 });
-  const server = await startServer({ backend, staticDir: tmpdir() });
-  const app = await bootApp(`http://127.0.0.1:${server.port}`, server.token);
-  const byClass = (cls: string) => app.find((n) => n.getAttribute("class") === cls);
-  try {
-    const state = await backend.getState();
-    await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
-    app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
-    await app.waitFor(() => byClass("row clickable cta-child").length > 0, "children's calls to action");
+test("the node panel lists its own calls to action, then its children's, which select their node", UI_TIMEOUT, async (t) => {
+  const { app, backend, byClass } = await bootUi(t);
+  const state = await backend.getState();
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
+  await app.waitFor(() => byClass("row clickable cta-child").length > 0, "children's calls to action");
 
-    const { childCtas } = await backend.getNode("");
-    const rows = byClass("row clickable cta-child");
-    assert.equal(rows.length, childCtas.length);
-    assert.ok(rows.length <= 10);
-    const text = byClass("panel")[0].textContent;
-    assert.ok(text.indexOf("This node") < text.indexOf("From children"), "own section first");
-    assert.ok(text.indexOf("From children") < text.indexOf("Composite"), "calls to action before the breakdown");
-    assert.ok(rows[0].textContent.includes(childCtas[0].reason) && rows[0].textContent.includes(childCtas[0].node));
+  const { childCtas } = await backend.getNode("");
+  const rows = byClass("row clickable cta-child");
+  assert.equal(rows.length, childCtas.length);
+  assert.ok(rows.length <= 10);
+  const text = byClass("panel")[0].textContent;
+  assert.ok(text.indexOf("This node") < text.indexOf("From children"), "own section first");
+  assert.ok(text.indexOf("From children") < text.indexOf("Composite"), "calls to action before the breakdown");
+  assert.ok(rows[0].textContent.includes(childCtas[0].reason) && rows[0].textContent.includes(childCtas[0].node));
 
-    rows[0].dispatch("click");
-    const child = state.tree.nodes[childCtas[0].node];
-    await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === child.name, "child node panel");
-    const title = childCtas[0].task?.title ?? childCtas[0].pr?.title ?? childCtas[0].suggestion!.title;
-    await app.waitFor(() => {
-      const own = app.find((n) => n.getAttribute("class") === "ctas")[0];
-      return own?.textContent.includes(title) ?? false;
-    }, "the call to action under This node");
-  } finally {
-    app.close();
-    await server.close();
-  }
+  rows[0].dispatch("click");
+  const child = state.tree.nodes[childCtas[0].node];
+  await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === child.name, "child node panel");
+  const title = childCtas[0].task?.title ?? childCtas[0].pr?.title ?? childCtas[0].suggestion!.title;
+  await app.waitFor(() => {
+    const own = app.find((n) => n.getAttribute("class") === "ctas")[0];
+    return own?.textContent.includes(title) ?? false;
+  }, "the call to action under This node");
 });
 
-test("children's calls to action follow descendant task changes while the panel is open", async () => {
-  const { startServer } = await import("../../src/server/server.ts");
-  const { createMockBackend } = await import("../../src/server/mock.ts");
-  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
-  const backend = createMockBackend({ tickMs: 0 });
-  const server = await startServer({ backend, staticDir: tmpdir() });
-  const app = await bootApp(`http://127.0.0.1:${server.port}`, server.token);
+test("children's calls to action follow descendant task changes while the panel is open", UI_TIMEOUT, async (t) => {
+  const { app, backend, running } = await bootUi(t);
   const asking = () =>
     app.find((n) => n.getAttribute("class") === "row clickable cta-child" && n.textContent.includes("needs input")).length;
-  try {
-    const state = await backend.getState();
-    await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
-    app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
-    await app.waitFor(() => asking() > 0, "root panel with a question from a descendant");
-    const before = asking();
+  const state = await backend.getState();
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
+  await app.waitFor(() => asking() > 0, "root panel with a question from a descendant");
+  const before = asking();
 
-    const running = state.tasks.find((t) => t.state === "running" && t.node !== "")!;
-    await backend.report(running.id, { needs_input: "Which error type?" });
-    await app.waitFor(() => asking() === before + 1, "new question listed under From children");
+  await backend.report(running.id, { needs_input: "Which error type?" });
+  await app.waitFor(() => asking() === before + 1, "new question listed under From children");
 
-    await backend.answer(running.id, "the old one");
-    await app.waitFor(() => asking() === before, "answered question removed from From children");
-  } finally {
-    app.close();
-    await server.close();
-  }
+  await backend.answer(running.id, "the old one");
+  await app.waitFor(() => asking() === before, "answered question removed from From children");
 });
 
-test("the UI resyncs after reconnects and never acts on stale or failed data", async () => {
-  const { startServer } = await import("../../src/server/server.ts");
-  const { createMockBackend } = await import("../../src/server/mock.ts");
-  const { HttpError } = await import("../../src/server/backend.ts");
-  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
-  const mock = createMockBackend({ tickMs: 0 });
+test("a merged or closed PR disappears from the open node panel", UI_TIMEOUT, async (t) => {
+  const { app, backend, prs } = await bootUi(t);
+  const [open] = prs.list();
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const name = (await backend.getState()).tree.nodes[open.node].name;
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === name)[0].dispatch("click");
+  const prBadges = () => app.find((n) => (n.getAttribute("class") ?? "").startsWith("badge pr")).length;
+  await app.waitFor(() => app.text().includes(open.title) && prBadges() === 1, "panel listing the PR and its tree badge");
+
+  prs.merge(open.number);
+  await app.waitFor(() => !app.text().includes(open.title), "PR dropped from the panel");
+  assert.equal(prBadges(), 0, "PR badge dropped from the tree");
+});
+
+test("the UI resyncs after reconnects and never acts on stale or failed data", UI_TIMEOUT, async (t) => {
   const calls = { getState: 0, getOverview: 0 };
   const fail = { answer: false, rootNode: false };
   const listeners = new Set<(e: ServerEvent) => void>();
-  const backend: Backend = {
-    ...mock,
-    getState: () => (calls.getState++, mock.getState()),
-    getOverview: () => (calls.getOverview++, mock.getOverview()),
-    getNode: (id) => (fail.rootNode && id === "" ? Promise.reject(new HttpError(500, "boom")) : mock.getNode(id)),
-    answer: (id, text) => (fail.answer ? Promise.reject(new HttpError(409, "wrong state")) : mock.answer(id, text)),
+  const ui = await bootUi(t, (real) => ({
+    ...delegate(real),
+    getState: () => (calls.getState++, real.getState()),
+    getOverview: () => (calls.getOverview++, real.getOverview()),
+    getNode: (id) => (fail.rootNode && id === "" ? Promise.reject(new HttpError(500, "boom")) : real.getNode(id)),
+    answer: (id, text) => (fail.answer ? Promise.reject(new HttpError(409, "wrong state")) : real.answer(id, text)),
     subscribe(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
     },
-  };
-  const server = await startServer({ backend, staticDir: tmpdir() });
-  const app = await bootApp(`http://127.0.0.1:${server.port}`, server.token);
-  const byClass = (cls: string) => app.find((n) => n.getAttribute("class") === cls);
-  try {
-    await app.waitFor(() => app.text().includes("Scan coverage") && listeners.size === 1, "overview and event stream");
-    const state = await mock.getState();
+  }));
+  const { app, backend, asking, byClass } = ui;
+  await app.waitFor(() => app.text().includes("Scan coverage") && listeners.size === 1, "overview and event stream");
+  const state = await backend.getState();
 
-    const healthy = state.prs.find((p) => !p.stale && !p.stuck && p.ci !== "fail")!;
-    const overviews = calls.getOverview;
-    listeners.forEach((l) => l({ type: "pr", pr: { ...healthy, stale: true } }));
-    await app.waitFor(() => calls.getOverview > overviews, "overview refetch when a PR turns stale");
+  const [healthy] = state.prs;
+  const overviews = calls.getOverview;
+  listeners.forEach((l) => l({ type: "pr", pr: { ...healthy, stale: true } }));
+  await app.waitFor(() => calls.getOverview > overviews, "overview refetch when a PR turns stale");
 
-    const states = calls.getState;
-    app.reconnect();
-    await app.waitFor(() => calls.getState > states, "state refetch after reconnect");
+  const states = calls.getState;
+  app.reconnect();
+  await app.waitFor(() => calls.getState > states, "state refetch after reconnect");
 
-    const asking = state.tasks.find((t) => t.state === "needs_input")!;
-    byClass("row clickable").find((n) => n.textContent.includes(asking.question!))!.dispatch("click");
-    await app.waitFor(() => byClass("answer").length === 1 && app.text().includes("This node"), "panel with question");
-    fail.answer = true;
-    const textarea = app.find((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
-    textarea.value = "keep the old error type";
-    textarea.dispatch("input");
-    const submit = app.find((n) => n.localName === "button" && n.textContent === "Answer")[0];
-    await app.waitFor(() => submit.getAttribute("disabled") === null, "answer button to enable");
-    byClass("answer")[0].dispatch("submit");
-    await app.waitFor(() => app.text().includes("wrong state"), "error shown");
-    await new Promise((r) => setTimeout(r, 20));
-    assert.equal(textarea.value, "keep the old error type");
+  byClass("row clickable").find((n) => n.textContent.includes(asking.question!))!.dispatch("click");
+  await app.waitFor(() => byClass("answer").length === 1 && app.text().includes("This node"), "panel with question");
+  fail.answer = true;
+  const textarea = await answerInPanel(ui, "keep the old error type");
+  await app.waitFor(() => app.text().includes("wrong state"), "error shown");
+  await new Promise((r) => setTimeout(r, 20));
+  assert.equal(textarea.value, "keep the old error type");
 
-    fail.rootNode = true;
-    const rootLabel = app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0];
-    rootLabel.dispatch("click");
-    await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === state.repo.name, "root panel");
-    await app.waitFor(() => app.text().includes("internal error"), "root detail failure shown");
-    assert.ok(!app.text().includes("This node"), "previous node's calls to action still shown");
-    assert.equal(app.find((n) => n.localName === "button" && n.textContent === "Start").length, 0);
-  } finally {
-    app.close();
-    await server.close();
-  }
+  fail.rootNode = true;
+  const rootLabel = app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0];
+  rootLabel.dispatch("click");
+  await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === state.repo.name, "root panel");
+  await app.waitFor(() => app.text().includes("internal error"), "root detail failure shown");
+  assert.ok(!app.text().includes("This node"), "previous node's calls to action still shown");
+  assert.equal(app.find((n) => n.localName === "button" && n.textContent === "Start").length, 0);
 });
