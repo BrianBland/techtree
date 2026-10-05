@@ -855,7 +855,7 @@ function scorerPrompt(project: Project, result: ScoreResult, config: Config, scr
     `A scorer combines: rubric (text telling an LLM scan of each file what to look for), command (argv run in the repo root, printing JSON ` +
       `{metrics: [{key, label, direction: "lower_better"|"higher_better"|"neutral", unit?, aggregate?: "sum" (default)|"max"|"mean_by_loc"}], ` +
       `values: {"<repo-relative file or directory>": {"<key>": number}} (a file's values count toward its directories), ` +
-      `findings?: [{node or file, line?, title, detail, severity: "low"|"medium"|"high", effort?: "trivial"|"small"|"medium"|"large"}]}, ` +
+      `findings?: [{node or file, line?, title, detail, severity: "low"|"medium"|"high", effort?: "trivial"|"small"|"medium"|"large", metricEffects?: {"<key>": expected change if fixed, e.g. -12}}]} (without metricEffects a finding is credited an even share of its path's lower_better values), ` +
       `timeout ${Number(config.plugins.command?.timeoutMs) || 600000} ms) and plan (score progress on work items from plan tasks).`,
     `Write any scripts for the command in ${scriptsDir} (never in the repository) and test them.`,
     "Propose the scorer with techtree_report {scorer: {rubric?, command?, plan?}}; the user reviews it and may reply to iterate.",
