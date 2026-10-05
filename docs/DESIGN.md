@@ -117,11 +117,24 @@ The v1 plugins are listed below.
 
 ## Agents
 
-- **Start:** the runner creates a worktree at `~/code/worktrees/<repo>/techtree-<task>` (configurable template) and spawns `pi --mode rpc` there. It sends the task prompt and loads the `techtree-worker` skill.
-- **Worker protocol:** the skill requires a checklist up front through the `techtree_report` tool (`{plan}`), then `{phase}` and `{done:i}` updates. When stuck, the worker calls `{needs_input: question}`, which pauses the task. The runner also reads RPC events to detect when the worker is idle, waiting on a dialog, or has exited.
-- **Finish:** with `manualReview`, the worker commits and stops in `review`; the UI shows the diff with an "Open PR" button. Otherwise the worker opens the PR itself, following the repo's PR template and pushing to the upstream remote.
+- **Start:** the runner creates a worktree at `~/code/worktrees/<repo>/techtree-<task>` (`worktreeTemplate`: `{home}`, `{repo}` = repo dir name, `{task}` = task id) on a new branch `techtree/<task>` from `baseRef`, with `git worktree add`; the main checkout's working tree is never touched. It spawns `piCommand --mode rpc --session-dir <cache>/sessions/<task> --session-id <task> -e <package>/extensions --skill <package>/skills/techtree-worker` there, with `TECHTREE_URL`, `TECHTREE_TOKEN` and `TECHTREE_TASK` in the environment, and sends the task prompt as `/skill:techtree-worker <prompt>` plus the finish rule for the task's `manualReview` setting.
+- **Queue:** at most `workers` tasks have a live child (`running` or `needs_input`); further tasks stay `queued` and start in creation order as slots free up. Resuming an existing task (an answer after restart, "Open PR", recovery) starts its child immediately, even if that briefly exceeds the limit.
+- **Worker protocol:** the skill requires a checklist up front through the `techtree_report` tool (`{plan}`), then `{phase}` and `{done:i}` updates. When stuck, the worker calls `{needs_input: question}`, which pauses the task. `techtree_report` POSTs the payload to `$TECHTREE_URL/api/tasks/$TECHTREE_TASK/report?token=$TECHTREE_TOKEN`; one payload may carry several fields. Reports for tasks without a live worker, unknown phases, or out-of-range `done` indexes are rejected.
+- **RPC events:** every event worth reading (assistant messages, tool calls, retries, dialogs, errors, stderr, state changes) becomes a timestamped line in `<cache>/tasks/<task>.log` and a `log` server event; every task change is persisted to SQLite and emitted as a `task` event.
+  - An extension dialog (`select`, `confirm`, `input`, `editor`) moves the task to `needs_input` with the dialog text as the question. The answer is sent back as the dialog response: `confirm` is true when the answer starts with y/yes/ok/true/allow, other dialogs get the text as their value.
+  - An answer to a reported `needs_input` question is sent as a follow-up prompt. Either way the task returns to `running`.
+  - When the agent settles (`agent_settled`) while `running` and the task is not finished, the runner nudges once; if it settles unfinished again, the task moves to `needs_input`. Any report or answer re-arms the nudge.
+  - If the child exits while the task is `queued`, `running` or `needs_input`, the task becomes `failed` with the exit code and log path.
+- **Finish:** a task is finished when its checklist is non-empty and fully ticked and, in the PR stage, `gh pr view <branch> --json number` finds the PR. The PR stage is every task without `manualReview`, and a `manualReview` task after "Open PR".
+  - With `manualReview`, the worker commits and stops; the runner moves the task to `review` and ends the child. The diff is `git diff <baseRef>...HEAD` in the worktree, where `baseRef` is resolved in the main checkout. The UI shows it with an "Open PR" button.
+  - "Open PR" (`review` → `running`, phase `pr`) resumes the same pi session with an instruction to push to the upstream remote and open the PR with `gh`, following the repo's PR template.
+  - Otherwise the worker opens the PR itself in one go. Once the PR number is found the task records it, moves to `pr_open` and the child is ended. Nothing ever merges.
+- **Cancel:** stops the child (if any) and marks the task `failed` with error `cancelled`. The worktree is kept.
 - **Babysit:** on PR events (CI failure, new review thread, conflict), the poller resumes the task's pi session or starts a `techtree-babysit` child with that context. It stops at ready-to-merge, merged, closed, or after 3 failed fix attempts. It never merges.
-- **Recovery:** task state lives in SQLite, so a server restart reattaches to live child processes by pid, or marks those tasks failed with a link to their log.
+- **Recovery:** task state lives in SQLite. RPC runs over the child's stdio, so a new server cannot reattach to an old child; and when the server dies, the child's stdin closes and pi shuts down. On start, for each task persisted as `running` or `needs_input`, the runner stops any process still alive at the recorded pid.
+  - If the task's pi session file exists, `running` tasks are respawned on that session (`--session-id`) with a short "continue" prompt. `needs_input` tasks keep their question and respawn on that session when answered; an answer to a lost dialog is sent as a prompt.
+  - Without a session file the task is marked `failed`, with the log path in `error`.
+  - `queued` tasks start as slots allow. `review`, `pr_open`, `done` and `failed` tasks are left untouched.
 
 ## Configuration
 
