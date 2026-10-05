@@ -1,7 +1,7 @@
 import { render } from "preact";
 import { useCallback, useEffect, useMemo, useState } from "preact/hooks";
 import type { ApiState, Finding, NodeId, Suggestion } from "../types.ts";
-import { get, onServerEvent, post } from "./api.ts";
+import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { initialExpanded, layoutTree, siblingOrder, toggled, type SortKey } from "./layout.ts";
 import { ramp, sqrtScale } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
@@ -18,19 +18,26 @@ function App() {
 
   const load = () => get<ApiState>("/api/state").then(setState, (e: Error) => setError(e.message));
 
+  const resync = () => void load().then(() => setVersion((v) => v + 1));
+
   useEffect(() => {
     void load();
-    return onServerEvent((event) => {
+    const stopReconnect = onReconnect(resync);
+    const stopEvents = onServerEvent((event) => {
       if (event.type === "task") {
         setState((s) => s && { ...s, tasks: upsert(s.tasks, event.task, (t) => t.id) });
       } else if (event.type === "pr") {
         setState((s) => s && { ...s, prs: upsert(s.prs, event.pr, (p) => p.number) });
       } else if (event.type === "scores") {
-        void load().then(() => setVersion((v) => v + 1));
+        resync();
       } else if (event.type === "scan") {
         setNotice(`Scan of ${event.node || "repo"}: ${event.status}${event.message ? ` (${event.message})` : ""}`);
       }
     });
+    return () => {
+      stopReconnect();
+      stopEvents();
+    };
   }, []);
 
   if (!state) return <div class="loading">{error ?? "Loading…"}</div>;
@@ -154,7 +161,7 @@ function Main({ state, version, error, notice, setError }: MainProps) {
           onToggle={onToggle}
         />
         {selected === null ? (
-          <Overview state={state} onSelect={select} onStart={(s) => setStarting({ suggestion: s, findings: [] })} onError={setError} />
+          <Overview state={state} version={version} onSelect={select} onStart={(s) => setStarting({ suggestion: s, findings: [] })} onError={setError} />
         ) : (
           <NodePanel
             id={selected}

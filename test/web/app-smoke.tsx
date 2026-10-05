@@ -5,6 +5,8 @@ export interface SmokeDriver {
   text(): string;
   find(predicate: (n: FakeNode) => boolean): FakeNode[];
   waitFor(predicate: () => boolean, what: string): Promise<void>;
+  /** Simulate the event stream dropping and reconnecting (fires `onopen` again). */
+  reconnect(): void;
   close(): void;
 }
 
@@ -25,10 +27,14 @@ export async function bootApp(baseUrl: string, token: string): Promise<SmokeDriv
       headers: { ...(init.headers as Record<string, string>), authorization: `Bearer ${token}` },
     });
 
+  let stream: StreamingEventSource | undefined;
   class StreamingEventSource {
+    onopen: (() => void) | null = null;
     onmessage: ((message: { data: string }) => void) | null = null;
     constructor(path: string) {
+      stream = this;
       void authed(path).then(async (res) => {
+        this.onopen?.();
         let buffer = "";
         for await (const chunk of res.body!.pipeThrough(new TextDecoderStream())) {
           buffer += chunk;
@@ -58,6 +64,9 @@ export async function bootApp(baseUrl: string, token: string): Promise<SmokeDriv
         await new Promise((r) => setTimeout(r, 10));
       }
       throw new Error(`timed out waiting for ${what}; page text: ${text().slice(0, 400)}`);
+    },
+    reconnect() {
+      stream?.onopen?.();
     },
     close() {
       abort.abort();

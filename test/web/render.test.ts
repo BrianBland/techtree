@@ -5,6 +5,8 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
 import { build } from "esbuild";
+import type { Backend } from "../../src/server/backend.ts";
+import type { ServerEvent } from "../../src/types.ts";
 
 /** Bundle a TSX entry (Node cannot strip JSX) and import it. */
 async function importTsx<T>(entry: string): Promise<T> {
@@ -73,6 +75,69 @@ test("the UI boots against the server and mock backend, opens nodes and answers 
     byClass("dialog")[0].dispatch("submit");
     await app.waitFor(() => byClass("dialog").length === 0, "dialog to close");
     assert.equal((await backend.getState()).tasks.length, before + 1);
+  } finally {
+    app.close();
+    await server.close();
+  }
+});
+
+test("the UI resyncs after reconnects and never acts on stale or failed data", async () => {
+  const { startServer } = await import("../../src/server/server.ts");
+  const { createMockBackend } = await import("../../src/server/mock.ts");
+  const { HttpError } = await import("../../src/server/backend.ts");
+  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
+  const mock = createMockBackend({ tickMs: 0 });
+  const calls = { getState: 0, getOverview: 0 };
+  const fail = { answer: false, rootNode: false };
+  const listeners = new Set<(e: ServerEvent) => void>();
+  const backend: Backend = {
+    ...mock,
+    getState: () => (calls.getState++, mock.getState()),
+    getOverview: () => (calls.getOverview++, mock.getOverview()),
+    getNode: (id) => (fail.rootNode && id === "" ? Promise.reject(new HttpError(500, "boom")) : mock.getNode(id)),
+    answer: (id, text) => (fail.answer ? Promise.reject(new HttpError(409, "wrong state")) : mock.answer(id, text)),
+    subscribe(listener) {
+      listeners.add(listener);
+      return () => listeners.delete(listener);
+    },
+  };
+  const server = await startServer({ backend, staticDir: tmpdir() });
+  const app = await bootApp(`http://127.0.0.1:${server.port}`, server.token);
+  const byClass = (cls: string) => app.find((n) => n.getAttribute("class") === cls);
+  try {
+    await app.waitFor(() => app.text().includes("Scan coverage") && listeners.size === 1, "overview and event stream");
+    const state = await mock.getState();
+
+    const healthy = state.prs.find((p) => !p.stale && !p.stuck && p.ci !== "fail")!;
+    const overviews = calls.getOverview;
+    listeners.forEach((l) => l({ type: "pr", pr: { ...healthy, stale: true } }));
+    await app.waitFor(() => calls.getOverview > overviews, "overview refetch when a PR turns stale");
+
+    const states = calls.getState;
+    app.reconnect();
+    await app.waitFor(() => calls.getState > states, "state refetch after reconnect");
+
+    const asking = state.tasks.find((t) => t.state === "needs_input")!;
+    byClass("row clickable").find((n) => n.textContent.includes(asking.question!))!.dispatch("click");
+    await app.waitFor(() => byClass("answer").length === 1 && app.text().includes("Suggested tasks"), "panel with question");
+    fail.answer = true;
+    const textarea = app.find((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+    textarea.value = "keep the old error type";
+    textarea.dispatch("input");
+    const submit = app.find((n) => n.localName === "button" && n.textContent === "Answer")[0];
+    await app.waitFor(() => submit.getAttribute("disabled") === null, "answer button to enable");
+    byClass("answer")[0].dispatch("submit");
+    await app.waitFor(() => app.text().includes("wrong state"), "error shown");
+    await new Promise((r) => setTimeout(r, 20));
+    assert.equal(textarea.value, "keep the old error type");
+
+    fail.rootNode = true;
+    const rootLabel = app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0];
+    rootLabel.dispatch("click");
+    await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === state.repo.name, "root panel");
+    await app.waitFor(() => app.text().includes("internal error"), "root detail failure shown");
+    assert.ok(!app.text().includes("Suggested tasks"), "previous node's suggestions still shown");
+    assert.equal(app.find((n) => n.localName === "button" && n.textContent === "Start").length, 0);
   } finally {
     app.close();
     await server.close();

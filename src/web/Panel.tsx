@@ -9,7 +9,7 @@ const LOG_TAIL = 200;
 export interface NodePanelProps {
   id: NodeId;
   state: ApiState;
-  /** Bumped when the backend reports new scores, so node details are refetched. */
+  /** Bumped when scores change or the event stream reconnects, so details are refetched. */
   version: number;
   onStart(suggestion: Suggestion, findings: Finding[]): void;
   onError(message: string): void;
@@ -17,7 +17,8 @@ export interface NodePanelProps {
 }
 
 export function NodePanel({ id, state, version, onStart, onError, onClose }: NodePanelProps) {
-  const [detail, setDetail] = useState<ApiNode | null>(null);
+  const [fetched, setFetched] = useState<{ id: NodeId; detail: ApiNode } | null>(null);
+  const detail = fetched?.id === id ? fetched.detail : null;
   const node = state.tree.nodes[id];
   const tasks = state.tasks.filter((t) => t.node === id);
   const prs = state.prs.filter((p) => p.node === id);
@@ -25,7 +26,7 @@ export function NodePanel({ id, state, version, onStart, onError, onClose }: Nod
 
   useEffect(() => {
     let live = true;
-    get<ApiNode>(`/api/node?id=${encodeURIComponent(id)}`).then((d) => live && setDetail(d), (e: Error) => onError(e.message));
+    get<ApiNode>(`/api/node?id=${encodeURIComponent(id)}`).then((d) => live && setFetched({ id, detail: d }), (e: Error) => onError(e.message));
     return () => {
       live = false;
     };
@@ -55,7 +56,7 @@ export function NodePanel({ id, state, version, onStart, onError, onClose }: Nod
         {(pr) => <PrRow key={pr.number} pr={pr} onError={onError} />}
       </Section>
       <Section title="Tasks" items={tasks}>
-        {(task) => <TaskCard key={task.id} task={task} onError={onError} />}
+        {(task) => <TaskCard key={task.id} task={task} version={version} onError={onError} />}
       </Section>
     </aside>
   );
@@ -153,7 +154,7 @@ export function PrRow({ pr, onError }: { pr: PrState; onError(message: string): 
   );
 }
 
-export function TaskCard({ task, onError }: { task: Task; onError(message: string): void }) {
+export function TaskCard({ task, version, onError }: { task: Task; version: number; onError(message: string): void }) {
   const [log, setLog] = useState<string[]>([]);
   const [diff, setDiff] = useState<string | null>(null);
   const [answer, setAnswer] = useState("");
@@ -171,7 +172,7 @@ export function TaskCard({ task, onError }: { task: Task; onError(message: strin
       live = false;
       unsubscribe();
     };
-  }, [task.id, showLog]);
+  }, [task.id, showLog, version]);
 
   useEffect(() => {
     logEl.current?.scrollTo(0, logEl.current.scrollHeight);
@@ -181,7 +182,15 @@ export function TaskCard({ task, onError }: { task: Task; onError(message: strin
     if (task.state === "review") get<string>(`/api/tasks/${task.id}/diff`).then(setDiff, (e: Error) => onError(e.message));
   }, [task.id, task.state]);
 
-  const act = (path: string, body?: unknown) => post(`/api/tasks/${task.id}/${path}`, body).catch((e: Error) => onError(e.message));
+  /** Resolves to whether the request succeeded; failures are reported through `onError`. */
+  const act = (path: string, body?: unknown) =>
+    post(`/api/tasks/${task.id}/${path}`, body).then(
+      () => true,
+      (e: Error) => {
+        onError(e.message);
+        return false;
+      },
+    );
 
   return (
     <li class="task">
@@ -216,7 +225,7 @@ export function TaskCard({ task, onError }: { task: Task; onError(message: strin
           class="answer"
           onSubmit={(e) => {
             e.preventDefault();
-            void act("answer", { text: answer }).then(() => setAnswer(""));
+            void act("answer", { text: answer }).then((ok) => ok && setAnswer(""));
           }}
         >
           <p>{task.question}</p>
