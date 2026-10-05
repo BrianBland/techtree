@@ -172,6 +172,7 @@ test("bad input, unknown routes and backend errors map to JSON status codes", as
     [api("/api/nope", { headers: auth }), 404],
     [api("/api/node", { headers: auth }), 400],
     [api("/api/tasks/t1/log?tail=abc", { headers: auth }), 400],
+    [api("/api/tasks/%E0%A4%A/log", { headers: auth }), 400],
     [api("/api/node?id=missing", { headers: auth }), 404],
     [post("/api/tasks/busy/open-pr", ""), 409],
     [post("/api/tasks/boom/cancel", ""), 500],

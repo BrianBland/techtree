@@ -53,7 +53,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
 
   const server = createServer((req, res) => {
     handle(req, res).catch((err: unknown) => {
-      const status = err instanceof HttpError ? err.status : 500;
+      const status = err instanceof HttpError ? err.status : err instanceof URIError ? 400 : 500;
       if (status === 500) console.error("techtree server:", err);
       sendJson(res, status, { error: status === 500 ? "internal error" : (err as Error).message });
     });
