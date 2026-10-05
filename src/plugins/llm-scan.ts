@@ -11,6 +11,8 @@ export const SEVERITY_WEIGHT: Record<Severity, number> = { low: 1, medium: 3, hi
 const KIND = "llm-scan";
 const SEVERITIES = Object.keys(SEVERITY_WEIGHT);
 const EFFORTS: Effort[] = ["trivial", "small", "medium", "large"];
+/** How long a stopped pi child gets to exit after SIGTERM before SIGKILL. */
+const KILL_GRACE_MS = 1000;
 const DEFAULTS = { concurrency: 2, maxFiles: 200, batchFiles: 20, batchBytes: 60_000, timeoutMs: 600_000 };
 
 export interface ScanProgress {
@@ -131,12 +133,13 @@ function chunk(files: SourceFile[], o: typeof DEFAULTS): SourceFile[][] {
   let bytes = 0;
   for (const f of files) {
     const last = batches.at(-1);
-    if (last && last.length < o.batchFiles && bytes + f.text.length <= o.batchBytes) {
+    const size = Buffer.byteLength(f.text);
+    if (last && last.length < o.batchFiles && bytes + size <= o.batchBytes) {
       last.push(f);
-      bytes += f.text.length;
+      bytes += size;
     } else {
       batches.push([f]);
-      bytes = f.text.length;
+      bytes = size;
     }
   }
   return batches;
@@ -156,14 +159,36 @@ function runPi(ctx: CollectCtx, skillDir: string, batch: SourceFile[], timeout: 
   const [cmd, ...prefix] = ctx.config.piCommand;
   const args = [...prefix, "-p", "--no-session", "--tools", "read,grep,find,ls", "--skill", skillDir, prompt(batch)];
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, args, { cwd: ctx.repoRoot, stdio: ["ignore", "pipe", "pipe"], timeout, signal });
+    const child = spawn(cmd, args, { cwd: ctx.repoRoot, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    child.stdout.on("data", (d) => (stdout += d));
-    child.stderr.on("data", (d) => (stderr += d));
-    child.on("error", reject);
+    child.stdout.setEncoding("utf8").on("data", (d: string) => (stdout += d));
+    child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr += d));
+    let stopReason: unknown;
+    let killTimer: NodeJS.Timeout | undefined;
+    const stop = (reason: unknown) => {
+      if (stopReason !== undefined) return;
+      stopReason = reason;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+    };
+    const timer = setTimeout(() => stop(new Error(`pi timed out after ${timeout}ms`)), timeout);
+    const onAbort = () => stop(signal!.reason);
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (signal?.aborted) onAbort();
+    const cleanup = () => {
+      clearTimeout(timer);
+      clearTimeout(killTimer);
+      signal?.removeEventListener("abort", onAbort);
+    };
+    child.on("error", (err) => {
+      cleanup();
+      reject(err);
+    });
     child.on("close", (code, killedBy) => {
-      if (code === 0) resolve(stdout);
+      cleanup();
+      if (stopReason !== undefined) reject(stopReason);
+      else if (code === 0) resolve(stdout);
       else reject(new Error(`pi exited with ${killedBy ?? code}: ${stderr.trim().slice(-500)}`));
     });
   });
@@ -174,6 +199,7 @@ function parseFindings(output: string, batch: SourceFile[]): ScanItem[] {
   const parsed = parseJsonArray(output);
   if (!parsed) throw new Error(`no JSON array in output: ${output.trim().slice(0, 200)}`);
   const paths = new Set(batch.map((f) => f.path));
+  const seen = new Set<string>();
   return parsed.flatMap((raw): ScanItem[] => {
     if (typeof raw !== "object" || raw === null) return [];
     const r = raw as Record<string, unknown>;
@@ -187,6 +213,9 @@ function parseFindings(output: string, batch: SourceFile[]): ScanItem[] {
       EFFORTS.includes(r.effort as Effort) &&
       (r.line === undefined || (Number.isInteger(r.line) && (r.line as number) > 0));
     if (!valid) return [];
+    const identity = JSON.stringify([r.file, (r.title as string).trim()]);
+    if (seen.has(identity)) return [];
+    seen.add(identity);
     const fix = typeof r.suggestedFix === "string" && r.suggestedFix.trim() ? `\n\nSuggested fix: ${r.suggestedFix.trim()}` : "";
     const effects = typeof r.metricEffects === "object" && r.metricEffects !== null ? r.metricEffects : {};
     return [
@@ -274,19 +303,16 @@ export const llmScanPlugin: MetricPlugin = {
     return values;
   },
   async findings(ctx): Promise<Finding[]> {
-    const byId = new Map<string, Finding>();
-    for (const [node, entries] of scannedNodeEntries(ctx)) {
-      for (const { metricEffects, ...item } of entries.flatMap((e) => e.findings)) {
-        const id = sha256(JSON.stringify([KIND, item.file, item.title])).slice(0, 16);
-        byId.set(id, {
+    return scannedNodeEntries(ctx).flatMap(([node, entries]) =>
+      entries
+        .flatMap((e) => e.findings)
+        .map(({ metricEffects, ...item }) => ({
           ...item,
-          id,
+          id: sha256(JSON.stringify([KIND, item.file, item.title])).slice(0, 16),
           node,
           source: KIND,
           metricEffects: { ...metricEffects, review_debt: -SEVERITY_WEIGHT[item.severity] },
-        });
-      }
-    }
-    return [...byId.values()];
+        })),
+    );
   },
 };

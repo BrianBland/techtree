@@ -32,26 +32,55 @@ interface Fixture {
   root: string;
   ctx: CollectCtx;
   spawns(): string[][];
+  lastPid(): number;
 }
+
+interface FakePi {
+  stdout: string;
+  code?: number;
+  delayMs?: number;
+  /** Write stdout as two chunks split at this byte offset. */
+  splitAt?: number;
+  /** "ignore": survive SIGTERM; "succeed": print `[]` and exit 0 on SIGTERM. */
+  onTerm?: "ignore" | "succeed";
+}
+
+const isAlive = (pid: number) => {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch {
+    return false;
+  }
+};
 
 /**
  * Temp repo with `src/a.ts` (3 lines), `src/b.ts` (2 lines), `lib/c.ts` (4 lines) and a fake pi
- * that logs its argv and prints `stdout` (exit `code`, after `delayMs`).
+ * that logs its argv and pid, then prints `stdout` (exit `code`, after `delayMs`).
  */
-function fixture(fake: { stdout: string; code?: number; delayMs?: number }, plugin: Record<string, unknown> = {}): Fixture {
+function fixture(fake: FakePi, plugin: Record<string, unknown> = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), "techtree-llm-scan-"));
   mkdirSync(join(root, "src"));
   mkdirSync(join(root, "lib"));
   writeFileSync(join(root, A), "const xs = [];\nxs[5];\nexport {};\n");
   writeFileSync(join(root, B), "export function f() {}\n// end\n");
   writeFileSync(join(root, "lib/c.ts"), "1\n2\n3\n4\n");
-  const log = join(root, "..", `${root.split("/").pop()}-spawns.jsonl`);
-  const script = join(root, "..", `${root.split("/").pop()}-fake-pi.mjs`);
+  const prefix = join(root, "..", root.split("/").pop()!);
+  const log = `${prefix}-spawns.jsonl`;
+  const pidFile = `${prefix}-pid`;
+  const script = `${prefix}-fake-pi.mjs`;
+  const splitAt = fake.splitAt ?? 0;
   writeFileSync(
     script,
-    `import { appendFileSync } from "node:fs";
+    `import { appendFileSync, writeFileSync } from "node:fs";
 appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
-setTimeout(() => { process.stdout.write(${JSON.stringify(fake.stdout)}); process.exit(${fake.code ?? 0}); }, ${fake.delayMs ?? 0});
+writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
+if (${JSON.stringify(fake.onTerm)} === "ignore") process.on("SIGTERM", () => {});
+if (${JSON.stringify(fake.onTerm)} === "succeed") process.on("SIGTERM", () => process.stdout.write("[]", () => process.exit(0)));
+const out = Buffer.from(${JSON.stringify(fake.stdout)});
+setTimeout(() => process.stdout.write(out.subarray(0, ${splitAt}), () =>
+  setTimeout(() => process.stdout.write(out.subarray(${splitAt}), () => process.exit(${fake.code ?? 0})), ${splitAt ? 50 : 0})
+), ${fake.delayMs ?? 0});
 `,
   );
   const tree: Tree = {
@@ -71,7 +100,7 @@ setTimeout(() => { process.stdout.write(${JSON.stringify(fake.stdout)}); process
           .split("\n")
           .map((l) => JSON.parse(l) as string[])
       : [];
-  return { root, ctx, spawns };
+  return { root, ctx, spawns, lastPid: () => Number(readFileSync(pidFile, "utf8")) };
 }
 
 test("scan spawns pi with the skill in print mode and stores parsed findings", async () => {
@@ -172,13 +201,52 @@ test("at most `concurrency` pi children run at once", async () => {
   assert.ok(elapsed >= 400, `3 batches at concurrency 2 need two rounds (took ${elapsed}ms)`);
 });
 
-test("aborting kills running children and rejects", async () => {
-  const fx = fixture({ stdout: "[]", delayMs: 10_000 }, { batchFiles: 1, concurrency: 1 });
+test("aborting kills running children, even ones ignoring SIGTERM, and rejects", async () => {
+  const fx = fixture({ stdout: "[]", delayMs: 10_000, onTerm: "ignore" }, { batchFiles: 1, concurrency: 1 });
   const abort = new AbortController();
   const scan = scanNode("", fx.ctx, { signal: abort.signal });
   setTimeout(() => abort.abort(), 300);
   const started = Date.now();
   await assert.rejects(scan);
   assert.ok(Date.now() - started < 5000);
+  assert.equal(isAlive(fx.lastPid()), false);
   assert.ok(fx.spawns().length <= 1, "pending batches are skipped");
+});
+
+test("a timed-out batch fails and its child is gone, even if it exits 0 or ignores SIGTERM", async () => {
+  for (const onTerm of ["succeed", "ignore"] as const) {
+    const fx = fixture({ stdout: JSON.stringify(GOOD), delayMs: 10_000, onTerm }, { timeoutMs: 200 });
+    const result = await scanNode("src", fx.ctx);
+    assert.equal(result.failed, 1, onTerm);
+    assert.equal(isAlive(fx.lastPid()), false, onTerm);
+    assert.deepEqual(await llmScanPlugin.collect(fx.ctx), {}, onTerm);
+  }
+});
+
+test("multibyte output split across stdout chunks is decoded intact", async () => {
+  const file = "src/中.ts";
+  const stdout = JSON.stringify([{ ...GOOD[0], file }]);
+  const fx = fixture({ stdout, splitAt: Buffer.from(stdout).indexOf(Buffer.from("中")) + 1 });
+  writeFileSync(join(fx.root, file), "x\n");
+  fx.ctx.tree.nodes.src.files.push(file);
+  await scanNode("src", fx.ctx);
+  assert.equal((await llmScanPlugin.collect(fx.ctx)).src.review_debt, 9);
+});
+
+test("batchBytes caps UTF-8 bytes, not characters", async () => {
+  const fx = fixture({ stdout: "[]" }, { batchBytes: 40_000 });
+  fx.ctx.tree.nodes[""].children.push("big");
+  fx.ctx.tree.nodes.big = { id: "big", name: "big", kind: "dir", parent: "", children: [], files: ["big/x.ts", "big/y.ts"] };
+  mkdirSync(join(fx.root, "big"));
+  for (const f of ["big/x.ts", "big/y.ts"]) writeFileSync(join(fx.root, f), "中".repeat(10_000));
+  const result = await scanNode("big", fx.ctx);
+  assert.equal(result.total, 2);
+});
+
+test("items repeating a file and title are one finding, counted once in review_debt", async () => {
+  const fx = fixture({ stdout: JSON.stringify([GOOD[0], { ...GOOD[0], line: 3, detail: "Again." }]) });
+  const result = await scanNode("src", fx.ctx);
+  assert.equal(result.findings, 1);
+  assert.equal((await llmScanPlugin.findings!(fx.ctx)).length, 1);
+  assert.equal((await llmScanPlugin.collect(fx.ctx)).src.review_debt, 9);
 });
