@@ -335,7 +335,7 @@ export class TaskRunner {
       "--mode", "rpc",
       "--session-dir", this.sessionDir(task),
       "--session-id", task.id,
-      "-e", join(this.packageRoot, "extensions"),
+      ...(this.opts.config.piLoadsExtension ? [] : ["-e", join(this.packageRoot, "extensions")]),
       "--skill", join(this.packageRoot, "skills", "techtree-worker"),
       "--skill", join(this.packageRoot, "skills", "techtree-babysit"),
       ...(task.model ? ["--model", task.model] : []),

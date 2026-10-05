@@ -355,7 +355,7 @@ flowchart TD
 
 ## Configuration
 
-`.techtree.yaml` at the repo root, merged over defaults. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
+Layers, later winning: defaults, the user config (`$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`), then `.techtree.yaml` at the repo root. `weights` and `plugins` merge per key. `piCommand`, `piLoadsExtension` and `worktreeTemplate` choose what techtree executes and where it writes, so they are read from the user config only; a repo file setting them is ignored with a warning. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
 
 ```yaml
 weights: { }          # metric key → composite weight (defaults in src/config.ts)
@@ -363,7 +363,8 @@ minLoc: 200           # smaller nodes are unscored
 workers: 3
 worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}"
 baseRef: HEAD         # ref task worktrees branch from
-piCommand: [pi]       # argv prefix for pi children; env TECHTREE_PI (one executable path, may contain spaces) overrides the default
+piCommand: [pi]       # user config only. argv prefix for pi children; env TECHTREE_PI (one executable path, may contain spaces) overrides the default
+piLoadsExtension: false # user config only. true when pi already loads techtree's extension (installed in pi's extensions dir); workers then get no `-e` flag, for hosts that reject it
 defaultModel: ""      # provider/model prefilled in the start dialog; empty = last used, else pi's default
 ignore: [target, node_modules, .git]
 plugins:              # per-plugin options, e.g.

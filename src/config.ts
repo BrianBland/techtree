@@ -1,4 +1,5 @@
 import { readFileSync } from "node:fs";
+import { homedir } from "node:os";
 import { join } from "node:path";
 import type { Config } from "./types.ts";
 
@@ -27,25 +28,53 @@ export const DEFAULT_CONFIG: Config = {
   plugins: {},
 };
 
-/** Load `.techtree.yaml` from the repo root and merge it over the defaults. */
-export function loadConfig(repoRoot: string): Config {
-  let text: string;
-  try {
-    text = readFileSync(join(repoRoot, ".techtree.yaml"), "utf8");
-  } catch {
-    return structuredClone(DEFAULT_CONFIG);
-  }
-  return mergeConfig(parseYaml(text) as Partial<Config>);
+/** Keys only the user config may set: they choose what techtree executes, so a cloned repo must not. */
+export const USER_ONLY_KEYS = ["piCommand", "piLoadsExtension", "worktreeTemplate"] as const;
+
+/** The user config: `$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`. */
+export function userConfigPath(): string {
+  return process.env.TECHTREE_CONFIG || join(process.env.XDG_CONFIG_HOME || join(homedir(), ".config"), "techtree", "config.yaml");
 }
 
-export function mergeConfig(user: Partial<Config>): Config {
-  const base = structuredClone(DEFAULT_CONFIG);
-  return {
-    ...base,
-    ...user,
-    weights: { ...base.weights, ...(user.weights ?? {}) },
-    plugins: { ...base.plugins, ...(user.plugins ?? {}) },
-  };
+/** Defaults, then the user config, then the repo's `.techtree.yaml` (minus `USER_ONLY_KEYS`). */
+export function loadConfig(repoRoot: string): Config {
+  const user = readYaml(userConfigPath());
+  const repo = readYaml(join(repoRoot, ".techtree.yaml"));
+  for (const key of USER_ONLY_KEYS) {
+    if (key in repo) {
+      process.emitWarning(`techtree: ignoring ${key} in ${repoRoot}/.techtree.yaml; set it in ${userConfigPath()}`);
+      delete repo[key];
+    }
+  }
+  return mergeConfig(user, repo);
+}
+
+function readYaml(path: string): Partial<Config> {
+  let text: string;
+  try {
+    text = readFileSync(path, "utf8");
+  } catch {
+    return {};
+  }
+  try {
+    return (parseYaml(text) ?? {}) as Partial<Config>;
+  } catch (err) {
+    throw new Error(`${path}: ${(err as Error).message}`);
+  }
+}
+
+/** Merge config layers over the defaults, later layers winning; `weights` and `plugins` merge per key. */
+export function mergeConfig(...layers: Partial<Config>[]): Config {
+  let out = structuredClone(DEFAULT_CONFIG);
+  for (const layer of layers) {
+    out = {
+      ...out,
+      ...layer,
+      weights: { ...out.weights, ...(layer.weights ?? {}) },
+      plugins: { ...out.plugins, ...(layer.plugins ?? {}) },
+    };
+  }
+  return out;
 }
 
 type Yaml = string | number | boolean | null | Yaml[] | { [k: string]: Yaml };
