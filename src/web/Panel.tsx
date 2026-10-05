@@ -347,17 +347,20 @@ export function StartDialog({
   const [manualReview, setManualReview] = useState(suggestion.manualReview);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");
+  const [modelsLoad, setModelsLoad] = useState<"loading" | "ready" | "failed">("loading");
   useEffect(() => {
     get<ApiModels>("/api/models").then(
       (m) => {
         setModels(m.models);
-        setModel((current) => current || (m.default ?? ""));
+        setModel(m.default ?? "");
+        setModelsLoad("ready");
       },
-      (err: Error) => onError(err.message),
+      () => setModelsLoad("failed"),
     );
   }, []);
   const submit = (e: Event) => {
     e.preventDefault();
+    if (modelsLoad === "loading") return;
     const request: StartTaskRequest = { node: suggestion.node, findingIds: suggestion.findingIds, title, prompt, manualReview, ...(model && { model }) };
     post<Task>("/api/tasks", request).then(
       onClose,
@@ -378,7 +381,7 @@ export function StartDialog({
         </label>
         <label>
           Model
-          <select value={model} onChange={(e) => setModel((e.currentTarget as HTMLSelectElement).value)}>
+          <select value={model} disabled={modelsLoad === "loading"} onChange={(e) => setModel((e.currentTarget as HTMLSelectElement).value)}>
             <option value="">pi default</option>
             {model && !models.includes(model) && <option value={model}>{model}</option>}
             {models.map((m) => (
@@ -387,6 +390,8 @@ export function StartDialog({
               </option>
             ))}
           </select>
+          {modelsLoad === "loading" && <span class="small">Loading models…</span>}
+          {modelsLoad === "failed" && <span class="small error">Could not load models; the task will use pi's default.</span>}
         </label>
         <label class="inline">
           <input type="checkbox" checked={manualReview} onChange={(e) => setManualReview((e.currentTarget as HTMLInputElement).checked)} />
@@ -396,7 +401,7 @@ export function StartDialog({
           <button type="button" class="link" onClick={onClose}>
             Cancel
           </button>
-          <button type="submit" class="primary">
+          <button type="submit" class="primary" disabled={modelsLoad === "loading"}>
             Start
           </button>
         </div>

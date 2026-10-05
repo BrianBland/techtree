@@ -133,7 +133,8 @@ export interface FocusInput {
 /**
  * The children to draw when the tree is focused on `focus` (see DESIGN "UI → Tree → Focus"): the
  * ancestor path with a few siblings per level, then the focus's descendants breadth-first while
- * whole child lists fit the budget, with manual overrides applied on top.
+ * whole child lists fit the budget, with manual overrides applied on top. Manual expansions win:
+ * automatic ones are undone, latest first, until the view fits again.
  */
 export function focusView({ tree, focus, order, overrides, attention, budget = 150, context = 3 }: FocusInput): Map<NodeId, NodeId[]> {
   const shown = new Map<NodeId, NodeId[]>();
@@ -150,6 +151,7 @@ export function focusView({ tree, focus, order, overrides, attention, budget = 1
     for (const id of kids) if (id !== path[i + 1]) queue.push({ id, auto: false });
   }
   queue.unshift({ id: focus, auto: true });
+  const automatic: NodeId[] = [];
   let full = false;
   for (let head = 0; head < queue.length; head++) {
     const { id, auto } = queue[head];
@@ -166,7 +168,14 @@ export function focusView({ tree, focus, order, overrides, attention, budget = 1
     const kids = sortedChildren(tree, node, order).map((n) => n.id);
     shown.set(id, kids);
     visible += kids.length;
+    if (!override) automatic.push(id);
     for (const kid of kids) queue.push({ id: kid, auto });
+  }
+  const leadsToManual = withAncestors(tree, new Set([...overrides].filter(([id, open]) => open && shown.has(id)).map(([id]) => id)));
+  for (let i = automatic.length - 1; i >= 0 && visible > budget; i--) {
+    if (leadsToManual.has(automatic[i])) continue;
+    visible -= shown.get(automatic[i])!.length;
+    shown.delete(automatic[i]);
   }
   return shown;
 }

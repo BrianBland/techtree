@@ -226,6 +226,49 @@ test("the UI boots against the server and repo backend, opens nodes and answers 
   assert.equal(tasks.at(-1)!.model, "fake/beta");
 });
 
+/** Open the start dialog of the first suggestion and return its parts. */
+async function openStartDialog({ app, byClass }: Ui) {
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const start = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
+  await app.waitFor(() => start().length > 0, "suggestions with Start buttons");
+  start()[0].dispatch("click");
+  await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
+  const dialog = byClass("dialog")[0];
+  const submitButton = dialog.querySelectorAll((n) => n.localName === "button" && n.textContent === "Start")[0];
+  return { dialog, submitButton };
+}
+
+test("the start dialog waits for the model list, so the default model is never skipped", UI_TIMEOUT, async (t) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const ui = await bootUi(t, (real) => ({ ...delegate(real), models: () => gate.then(() => ({ default: "fake/beta", models: ["fake/alpha", "fake/beta"] })) }));
+  const { dialog, submitButton } = await openStartDialog(ui);
+  const before = (await ui.backend.getState()).tasks.length;
+  assert.notEqual(submitButton.getAttribute("disabled"), null, "Start is disabled while models load");
+  dialog.dispatch("submit");
+  await new Promise((r) => setTimeout(r, 50));
+  assert.equal((await ui.backend.getState()).tasks.length, before, "submitting early starts nothing");
+
+  release();
+  await ui.app.waitFor(() => submitButton.getAttribute("disabled") === null, "Start enabled once models load");
+  dialog.dispatch("submit");
+  await ui.app.waitFor(() => ui.byClass("dialog").length === 0, "dialog to close");
+  assert.equal((await ui.backend.getState()).tasks.at(-1)!.model, "fake/beta");
+});
+
+test("when the model list fails the start dialog says so and starts on pi's default", UI_TIMEOUT, async (t) => {
+  const ui = await bootUi(t, (real) => ({ ...delegate(real), models: () => Promise.reject(new HttpError(503, "backend not attached")) }));
+  const { dialog, submitButton } = await openStartDialog(ui);
+  await ui.app.waitFor(() => submitButton.getAttribute("disabled") === null, "Start enabled after the failure");
+  assert.match(dialog.textContent, /Could not load models/);
+  const before = (await ui.backend.getState()).tasks.length;
+  dialog.dispatch("submit");
+  await ui.app.waitFor(() => ui.byClass("dialog").length === 0, "dialog to close");
+  const { tasks } = await ui.backend.getState();
+  assert.equal(tasks.length, before + 1);
+  assert.equal(tasks.at(-1)!.model, undefined);
+});
+
 test("the node panel lists its own calls to action, then its children's, which select their node", UI_TIMEOUT, async (t) => {
   const { app, backend, byClass } = await bootUi(t);
   const state = await backend.getState();

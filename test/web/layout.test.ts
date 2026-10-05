@@ -168,6 +168,25 @@ test("manual overrides expand or collapse within the focused view", () => {
   assert.equal(focusOn(tree, "n4", { overrides: collapseFocus }).has("n4"), false);
   assert.ok(focusOn(tree, "n4", { overrides: collapseFocus }).has(""), "the path stays open");
 });
+test("manual expansions stay within the budget by undoing automatic ones, latest first", () => {
+  const tree = wideTree(20, 2);
+  const before = focusOn(tree, "", { budget: 150 });
+  assert.equal(visibleCount(tree, before), 141);
+  const collapsed = tree.nodes[""].children.find((id) => !before.has(id))!;
+  const after = focusOn(tree, "", { budget: 150, overrides: toggleOverride(new Map(), collapsed, true, false) });
+  assert.ok(visibleCount(tree, after) <= 150, `${visibleCount(tree, after)} visible`);
+  assert.equal(after.get(collapsed)?.length, 20, "the manual expansion is kept");
+  const lastAuto = [...before.keys()].at(-1)!;
+  assert.equal(after.has(lastAuto), false, "the latest automatic expansion made room");
+
+  const deep = wideTree(20, 3);
+  const opened = focusOn(deep, "", { budget: 150 });
+  const grandchild = deep.nodes[[...opened.keys()][1]].children[0];
+  const manual = focusOn(deep, "", { budget: 150, overrides: toggleOverride(new Map(), grandchild, true, false) });
+  assert.equal(manual.get(grandchild)?.length, 20, "a manual expansion under an automatic one keeps its parent open");
+  assert.ok(visibleCount(deep, manual) <= 150, `${visibleCount(deep, manual)} visible`);
+});
+
 test("siblings sort by name, by score (best first, missing last) or by weight (largest first)", () => {
   const tree = makeTree(["b", "a", "c"]);
   const score: Record<string, number | null> = { a: 10, b: 90, c: null };
