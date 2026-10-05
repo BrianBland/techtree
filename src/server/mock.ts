@@ -240,6 +240,14 @@ export function createMockBackend({ seed = 1, tickMs = 1500 }: MockOptions = {})
     emit({ type: "pr", pr: structuredClone(pr) });
   }
 
+  /** Credit a finished task's planned gain to its node, as a rescore would after the fix lands. */
+  function landImprovement(task: Task) {
+    const score = scores[task.node];
+    score.quality = round2(Math.min(100, quality(task.node) + task.plannedTo - task.plannedFrom));
+    snapshot = { sha: hex(rand, 40), createdAt: new Date().toISOString() };
+    emit({ type: "scores", snapshot });
+  }
+
   function tick() {
     for (const task of tasks.filter((t) => t.state === "running")) {
       const next = task.checklist.find((item) => !item.done);
@@ -250,10 +258,10 @@ export function createMockBackend({ seed = 1, tickMs = 1500 }: MockOptions = {})
         const doneCount = task.checklist.filter((c) => c.done).length;
         task.phase = PHASES[Math.min(PHASES.length - 1, doneCount)];
         log(task, `✓ ${next.text}`);
-      } else if (task.manualReview) {
-        task.state = "review";
       } else {
-        openPrFor(task);
+        if (task.manualReview) task.state = "review";
+        else openPrFor(task);
+        landImprovement(task);
       }
       touch(task);
     }

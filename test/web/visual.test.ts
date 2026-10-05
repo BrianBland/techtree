@@ -1,12 +1,19 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { NO_SCORE, ramp, researchBar, sparkline, sqrtScale } from "../../src/web/visual.ts";
+import { COMPOSITE, NO_SCORE, bottomDecile, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, tileLooks, tileSize } from "../../src/web/visual.ts";
 import { fitView, zoomAt } from "../../src/web/view.ts";
-import type { Task } from "../../src/types.ts";
+import type { MetricDef, NodeScore, Task } from "../../src/types.ts";
 
-const lightness = (color: string) => Number(/(\d+(?:\.\d+)?)%\)$/.exec(color)![1]);
+const hsl = (color: string) => {
+  const [h, s, l] = /^hsl\((\d+) (\d+)% (\d+)%\)$/.exec(color)!.slice(1).map(Number);
+  return { h, s, l };
+};
+const hueIn = (color: string, from: number, to: number) => {
+  const { h } = hsl(color);
+  return from <= to ? h >= from && h <= to : h >= from || h <= to;
+};
 
-test("sizes scale with the square root of the weight", () => {
+test("sqrtScale maps 0..max onto the output range proportionally to the square root", () => {
   const size = sqrtScale(400, 2, 22);
   assert.equal(size(0), 2);
   assert.equal(size(400), 22);
@@ -14,16 +21,53 @@ test("sizes scale with the square root of the weight", () => {
   assert.equal(sqrtScale(0, 2, 22)(0), 2);
 });
 
-test("fill ramp spans the repo's score range on a single hue, darker is better", () => {
+test("tile sides scale with the square root of the weight, snapped to the 8-unit grid", () => {
+  const side = tileSize(400);
+  assert.equal(side(0), 24);
+  assert.equal(side(400), 64);
+  assert.equal(side(100), 48);
+  for (let w = 0; w <= 400; w += 7) assert.equal(side(w) % 8, 0);
+  assert.equal(tileSize(0)(0), 24);
+});
+
+test("diverging ramp: the worst scores are saturated red, the best cool teal-green", () => {
   const fill = ramp([40, 60, null, 80]);
   assert.equal(fill(null), NO_SCORE);
-  const [low, mid, high] = [fill(40), fill(60), fill(80)];
-  for (const c of [low, mid, high]) assert.match(c, /^hsl\(217 /);
-  assert.ok(lightness(low) > lightness(mid) && lightness(mid) > lightness(high));
-  assert.equal(fill(10), low);
-  assert.equal(fill(99), high);
+  const [worst, mid, best] = [fill(40), fill(60), fill(80)];
+  assert.ok(hueIn(worst, 345, 10), worst);
+  assert.ok(hsl(worst).s >= 90, worst);
+  assert.ok(hueIn(mid, 35, 60), mid);
+  assert.ok(hueIn(best, 140, 190), best);
+  assert.ok(hsl(worst).s - hsl(best).s >= 20, "bad end is more saturated than the good end");
+  assert.ok(hueIn(fill(45), 0, 30) && fill(45) !== worst, "near-worst scores stay hot but distinct");
+  assert.equal(fill(10), worst);
+  assert.equal(fill(99), best);
   assert.equal(ramp([50, 50])(50), ramp([0, 100])(50));
   assert.equal(ramp([])(50), ramp([0, 100])(50));
+});
+
+test("the bottom decile is the ceil(n/10) lowest scored nodes, ties included", () => {
+  const values = [5, 50, 60, 70, 80, 90, 95, 99, 100, 100, 12, null];
+  const worst = bottomDecile(values);
+  assert.deepEqual(values.filter(worst), [5, 12]);
+  assert.equal(worst(null), false);
+  assert.deepEqual([1, 1, 9].filter(bottomDecile([1, 1, 9])), [1, 1]);
+  assert.equal(bottomDecile([null])(0), false);
+});
+
+test("stat pips are the weighted quality metrics, heaviest first, at most eight", () => {
+  const def = (key: string, direction: MetricDef["direction"] = "lower_better"): MetricDef => ({ key, label: key, direction, aggregate: "sum" });
+  const defs = [def("loc", "neutral"), def("a"), def("b"), def("c"), def("zero"), ...["d", "e", "f", "g", "h", "i"].map((k) => def(k))];
+  const weights = { loc: 5, a: 1, b: 3, c: 2, zero: 0, d: 1, e: 1, f: 1, g: 1, h: 1, i: 1 };
+  assert.deepEqual(statMetrics(defs, weights), ["b", "c", "a", "d", "e", "f", "g", "h"]);
+});
+
+test("score deltas list nodes whose selected score moved by at least 0.5", () => {
+  const score = (quality: number | null, pct: number | null): NodeScore => ({ node: "", quality, metrics: { m: { raw: 0, value: 0, pct } } });
+  const before = { a: score(40, 10), b: score(50, 20), c: score(60, 30), d: score(null, null) };
+  const after = { a: score(43.2, 10), b: score(50.3, 25), c: score(59, 30), d: score(70, null), e: score(10, 10) };
+  assert.deepEqual([...scoreDeltas(before, after, COMPOSITE)], [["a", 3.2], ["c", -1]]);
+  assert.deepEqual([...scoreDeltas(before, after, "m")], [["b", 5]]);
 });
 
 function task(partial: Partial<Task>): Task {
@@ -77,4 +121,21 @@ test("zooming keeps the point under the cursor fixed and clamps the scale", () =
 test("sparklines map 0..100 onto the box, top is best, gaps are skipped", () => {
   assert.equal(sparkline([0, 50, null, 100], 30, 10), "0,10 10,5 30,0");
   assert.equal(sparkline([], 30, 10), "");
+});
+
+test("tile looks colour pips by absolute percentile and leave missing metrics empty", () => {
+  const score = (quality: number, metrics: Record<string, number | null>): NodeScore => ({
+    node: "",
+    quality,
+    metrics: Object.fromEntries(Object.entries(metrics).map(([k, pct]) => [k, { raw: 0, value: 0, pct }])),
+  });
+  const scores = { a: score(90, { x: 0, y: 100 }), b: score(91, { x: 100 }), c: score(92, { x: null }) };
+  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x", "y"], hot: new Set(["b"]), findingCounts: { a: 3 } });
+  assert.deepEqual(look("a").pips, [ramp([0, 100])(0), ramp([0, 100])(100)]);
+  assert.deepEqual(look("b").pips, [ramp([0, 100])(100), null]);
+  assert.deepEqual(look("c").pips, [null, null]);
+  assert.equal(look("a").fill, ramp([90, 92])(90));
+  assert.deepEqual([look("a").worst, look("b").worst], [true, false]);
+  assert.deepEqual([look("a").hot, look("b").hot], [false, true]);
+  assert.deepEqual([look("a").findings, look("b").findings, look("a").xp], [3, 0, 90]);
 });

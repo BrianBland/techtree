@@ -83,6 +83,43 @@ test("the UI boots against the server and mock backend, opens nodes and answers 
   }
 });
 
+test("the node panel lists its own calls to action, then its children's, which select their node", async () => {
+  const { startServer } = await import("../../src/server/server.ts");
+  const { createMockBackend } = await import("../../src/server/mock.ts");
+  const { bootApp } = await importTsx<typeof import("./app-smoke.tsx")>("./app-smoke.tsx");
+  const backend = createMockBackend({ tickMs: 0 });
+  const server = await startServer({ backend, staticDir: tmpdir() });
+  const app = await bootApp(`http://127.0.0.1:${server.port}`, server.token);
+  const byClass = (cls: string) => app.find((n) => n.getAttribute("class") === cls);
+  try {
+    const state = await backend.getState();
+    await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+    app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
+    await app.waitFor(() => byClass("row clickable cta-child").length > 0, "children's calls to action");
+
+    const { childCtas } = await backend.getNode("");
+    const rows = byClass("row clickable cta-child");
+    assert.equal(rows.length, childCtas.length);
+    assert.ok(rows.length <= 10);
+    const text = byClass("panel")[0].textContent;
+    assert.ok(text.indexOf("This node") < text.indexOf("From children"), "own section first");
+    assert.ok(text.indexOf("From children") < text.indexOf("Composite"), "calls to action before the breakdown");
+    assert.ok(rows[0].textContent.includes(childCtas[0].reason) && rows[0].textContent.includes(childCtas[0].node));
+
+    rows[0].dispatch("click");
+    const child = state.tree.nodes[childCtas[0].node];
+    await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === child.name, "child node panel");
+    const title = childCtas[0].task?.title ?? childCtas[0].pr?.title ?? childCtas[0].suggestion!.title;
+    await app.waitFor(() => {
+      const own = app.find((n) => n.getAttribute("class") === "ctas")[0];
+      return own?.textContent.includes(title) ?? false;
+    }, "the call to action under This node");
+  } finally {
+    app.close();
+    await server.close();
+  }
+});
+
 test("the UI resyncs after reconnects and never acts on stale or failed data", async () => {
   const { startServer } = await import("../../src/server/server.ts");
   const { createMockBackend } = await import("../../src/server/mock.ts");
@@ -121,7 +158,7 @@ test("the UI resyncs after reconnects and never acts on stale or failed data", a
 
     const asking = state.tasks.find((t) => t.state === "needs_input")!;
     byClass("row clickable").find((n) => n.textContent.includes(asking.question!))!.dispatch("click");
-    await app.waitFor(() => byClass("answer").length === 1 && app.text().includes("Suggested tasks"), "panel with question");
+    await app.waitFor(() => byClass("answer").length === 1 && app.text().includes("This node"), "panel with question");
     fail.answer = true;
     const textarea = app.find((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
     textarea.value = "keep the old error type";
@@ -138,7 +175,7 @@ test("the UI resyncs after reconnects and never acts on stale or failed data", a
     rootLabel.dispatch("click");
     await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === state.repo.name, "root panel");
     await app.waitFor(() => app.text().includes("internal error"), "root detail failure shown");
-    assert.ok(!app.text().includes("Suggested tasks"), "previous node's suggestions still shown");
+    assert.ok(!app.text().includes("This node"), "previous node's calls to action still shown");
     assert.equal(app.find((n) => n.localName === "button" && n.textContent === "Start").length, 0);
   } finally {
     app.close();

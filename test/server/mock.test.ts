@@ -96,3 +96,17 @@ test("mutations follow task states and emit events", async () => {
   await mock.rescore();
   assert.ok(events.some((e) => e.type === "scores"));
 });
+
+test("a task that finishes its checklist raises its node's quality and emits a scores event", async () => {
+  const mock = createMockBackend({ tickMs: 0 });
+  const events: ServerEvent[] = [];
+  mock.subscribe((e) => events.push(e));
+  const before = await mock.getState();
+  const running = before.tasks.find((t) => t.state === "running")!;
+  for (let i = 0; i < 10 && (await mock.getState()).tasks.find((t) => t.id === running.id)!.state === "running"; i++) mock.tick();
+  const after = await mock.getState();
+  assert.ok(["review", "pr_open"].includes(after.tasks.find((t) => t.id === running.id)!.state));
+  assert.ok(after.scores[running.node].quality! > before.scores[running.node].quality!);
+  assert.ok(events.some((e) => e.type === "scores"));
+  assert.notDeepEqual(after.snapshot, before.snapshot);
+});

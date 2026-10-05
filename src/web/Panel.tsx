@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { ApiNode, ApiState, Finding, NodeId, PrState, Suggestion, Task } from "../types.ts";
+import type { ApiNode, ApiState, Cta, Finding, NodeId, PrState, Suggestion, Task } from "../types.ts";
 import { get, onServerEvent, post } from "./api.ts";
 import { sparkline, taskCompletion } from "./visual.ts";
 
@@ -12,11 +12,12 @@ export interface NodePanelProps {
   /** Bumped when scores change or the event stream reconnects, so details are refetched. */
   version: number;
   onStart(suggestion: Suggestion, findings: Finding[]): void;
+  onSelect(id: NodeId): void;
   onError(message: string): void;
   onClose(): void;
 }
 
-export function NodePanel({ id, state, version, onStart, onError, onClose }: NodePanelProps) {
+export function NodePanel({ id, state, version, onStart, onSelect, onError, onClose }: NodePanelProps) {
   const [fetched, setFetched] = useState<{ id: NodeId; detail: ApiNode } | null>(null);
   const detail = fetched?.id === id ? fetched.detail : null;
   const node = state.tree.nodes[id];
@@ -51,7 +52,7 @@ export function NodePanel({ id, state, version, onStart, onError, onClose }: Nod
       <div class="actions">
         <button onClick={scan}>Scan subtree</button>
       </div>
-      {detail ? <Detail detail={detail} state={state} onStart={onStart} /> : <p class="muted">Loading…</p>}
+      {detail ? <Detail id={id} detail={detail} state={state} onStart={onStart} onSelect={onSelect} onError={onError} /> : <p class="muted">Loading…</p>}
       <Section title="Pull requests" items={prs}>
         {(pr) => <PrRow key={pr.number} pr={pr} onError={onError} />}
       </Section>
@@ -62,10 +63,26 @@ export function NodePanel({ id, state, version, onStart, onError, onClose }: Nod
   );
 }
 
-function Detail({ detail, state, onStart }: { detail: ApiNode; state: ApiState; onStart: NodePanelProps["onStart"] }) {
+interface DetailProps extends Pick<NodePanelProps, "id" | "state" | "onStart" | "onSelect" | "onError"> {
+  detail: ApiNode;
+}
+
+function Detail({ id, detail, state, onStart, onSelect, onError }: DetailProps) {
   const findingsById = new Map(detail.findings.map((f) => [f.id, f]));
+  const start = (s: Suggestion) => onStart(s, s.findingIds.map((fid) => findingsById.get(fid)!).filter(Boolean));
   return (
     <>
+      <section class="ctas">
+        <h3>This node</h3>
+        {detail.ownCtas.length ? (
+          <ul class="list">{detail.ownCtas.map((cta) => <OwnCta key={ctaKey(cta)} cta={cta} state={state} onStart={start} onError={onError} />)}</ul>
+        ) : (
+          <p class="muted small">Nothing to do here.</p>
+        )}
+      </section>
+      <Section title="From children" items={detail.childCtas}>
+        {(cta) => <ChildCta key={ctaKey(cta)} cta={cta} from={id} onSelect={onSelect} />}
+      </Section>
       <table class="metrics">
         <tbody>
           <tr>
@@ -104,14 +121,99 @@ function Detail({ detail, state, onStart }: { detail: ApiNode; state: ApiState; 
           </li>
         )}
       </Section>
-      <Section title="Suggested tasks" items={detail.suggestions}>
-        {(s) => (
-          <li key={s.title + s.findingIds.join()}>
-            <SuggestionRow suggestion={s} onStart={() => onStart(s, s.findingIds.map((id) => findingsById.get(id)!).filter(Boolean))} />
-          </li>
-        )}
-      </Section>
     </>
+  );
+}
+
+function ctaKey(cta: Cta): string {
+  return cta.task?.id ?? (cta.pr ? `pr${cta.pr.number}` : `${cta.node}:${cta.suggestion!.title}:${cta.suggestion!.findingIds.join()}`);
+}
+
+/** A call to action at the selected node, with its action; tasks and PRs are read live from `state`. */
+function OwnCta({ cta, state, onStart, onError }: { cta: Cta; state: ApiState; onStart(s: Suggestion): void; onError(message: string): void }) {
+  if (cta.suggestion) {
+    const s = cta.suggestion;
+    return (
+      <li>
+        <SuggestionRow suggestion={s} onStart={() => onStart(s)} />
+      </li>
+    );
+  }
+  if (cta.pr) return <PrRow pr={state.prs.find((p) => p.number === cta.pr!.number) ?? cta.pr} reason={cta.reason} onError={onError} />;
+  const task = state.tasks.find((t) => t.id === cta.task!.id) ?? cta.task!;
+  return (
+    <li class="cta">
+      <Reason cta={cta} /> <strong>{task.title}</strong>
+      {task.state === "needs_input" && <AnswerForm task={task} onError={onError} />}
+      {task.state === "review" && <ReviewDiff task={task} onError={onError} />}
+    </li>
+  );
+}
+
+/** A call to action from a descendant, labelled with its path relative to `from`; clicking selects it. */
+function ChildCta({ cta, from, onSelect }: { cta: Cta; from: NodeId; onSelect(id: NodeId): void }) {
+  return (
+    <li class="row clickable cta-child" onClick={() => onSelect(cta.node)}>
+      <div>
+        <Reason cta={cta} /> {cta.task?.title ?? cta.pr?.title ?? cta.suggestion?.title}
+        <div class="path small">{from === "" ? cta.node : cta.node.slice(from.length + 1)}</div>
+      </div>
+    </li>
+  );
+}
+
+function Reason({ cta }: { cta: Pick<Cta, "kind" | "reason"> }) {
+  return <span class={`reason ${cta.kind}`}>{cta.reason}</span>;
+}
+
+/** POST a task action; resolves to whether it succeeded, reporting failures through `onError`. */
+function taskAction(task: Task, path: string, onError: (message: string) => void, body?: unknown): Promise<boolean> {
+  return post(`/api/tasks/${task.id}/${path}`, body).then(
+    () => true,
+    (e: Error) => {
+      onError(e.message);
+      return false;
+    },
+  );
+}
+
+function AnswerForm({ task, onError }: { task: Task; onError(message: string): void }) {
+  const [answer, setAnswer] = useState("");
+  return (
+    <form
+      class="answer"
+      onSubmit={(e) => {
+        e.preventDefault();
+        void taskAction(task, "answer", onError, { text: answer }).then((ok) => ok && setAnswer(""));
+      }}
+    >
+      <p>{task.question}</p>
+      <textarea value={answer} onInput={(e) => setAnswer((e.currentTarget as HTMLTextAreaElement).value)} rows={3} />
+      <button type="submit" disabled={!answer.trim()}>
+        Answer
+      </button>
+    </form>
+  );
+}
+
+function ReviewDiff({ task, onError }: { task: Task; onError(message: string): void }) {
+  const [diff, setDiff] = useState<string | null>(null);
+  useEffect(() => {
+    get<string>(`/api/tasks/${task.id}/diff`).then(setDiff, (e: Error) => onError(e.message));
+  }, [task.id]);
+  return (
+    <div>
+      <pre class="diff">
+        {(diff ?? "").split("\n").map((line, i) => (
+          <div key={i} class={line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : undefined}>
+            {line || " "}
+          </div>
+        ))}
+      </pre>
+      <button class="primary" onClick={() => taskAction(task, "open-pr", onError)}>
+        Open PR
+      </button>
+    </div>
   );
 }
 
@@ -130,12 +232,17 @@ export function SuggestionRow({ suggestion: s, onStart }: { suggestion: Suggesti
   );
 }
 
-export function PrRow({ pr, onError }: { pr: PrState; onError(message: string): void }) {
+export function PrRow({ pr, reason, onError }: { pr: PrState; reason?: string; onError(message: string): void }) {
   const toggle = (e: Event) =>
     post(`/api/prs/${pr.number}/babysit`, { on: (e.currentTarget as HTMLInputElement).checked }).catch((err: Error) => onError(err.message));
   return (
     <li class="row">
       <div>
+        {reason && (
+          <>
+            <Reason cta={{ kind: "pr", reason }} />{" "}
+          </>
+        )}
         <a href={pr.url} target="_blank" rel="noreferrer">
           #{pr.number}
         </a>{" "}
@@ -156,8 +263,6 @@ export function PrRow({ pr, onError }: { pr: PrState; onError(message: string): 
 
 export function TaskCard({ task, version, onError }: { task: Task; version: number; onError(message: string): void }) {
   const [log, setLog] = useState<string[]>([]);
-  const [diff, setDiff] = useState<string | null>(null);
-  const [answer, setAnswer] = useState("");
   const logEl = useRef<HTMLPreElement>(null);
   const showLog = ["running", "needs_input", "review", "failed"].includes(task.state);
 
@@ -178,19 +283,6 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
     logEl.current?.scrollTo(0, logEl.current.scrollHeight);
   }, [log]);
 
-  useEffect(() => {
-    if (task.state === "review") get<string>(`/api/tasks/${task.id}/diff`).then(setDiff, (e: Error) => onError(e.message));
-  }, [task.id, task.state]);
-
-  /** Resolves to whether the request succeeded; failures are reported through `onError`. */
-  const act = (path: string, body?: unknown) =>
-    post(`/api/tasks/${task.id}/${path}`, body).then(
-      () => true,
-      (e: Error) => {
-        onError(e.message);
-        return false;
-      },
-    );
 
   return (
     <li class="task">
@@ -205,7 +297,7 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
           </div>
         </div>
         {["queued", "running", "needs_input", "review"].includes(task.state) && (
-          <button class="link" onClick={() => act("cancel")}>
+          <button class="link" onClick={() => taskAction(task, "cancel", onError)}>
             cancel
           </button>
         )}
@@ -220,35 +312,6 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
         </ul>
       )}
       {task.error && <p class="error small">{task.error}</p>}
-      {task.state === "needs_input" && (
-        <form
-          class="answer"
-          onSubmit={(e) => {
-            e.preventDefault();
-            void act("answer", { text: answer }).then((ok) => ok && setAnswer(""));
-          }}
-        >
-          <p>{task.question}</p>
-          <textarea value={answer} onInput={(e) => setAnswer((e.currentTarget as HTMLTextAreaElement).value)} rows={3} />
-          <button type="submit" disabled={!answer.trim()}>
-            Answer
-          </button>
-        </form>
-      )}
-      {task.state === "review" && (
-        <div>
-          <pre class="diff">
-            {(diff ?? "").split("\n").map((line, i) => (
-              <div key={i} class={line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : undefined}>
-                {line || " "}
-              </div>
-            ))}
-          </pre>
-          <button class="primary" onClick={() => act("open-pr")}>
-            Open PR
-          </button>
-        </div>
-      )}
       {showLog && log.length > 0 && (
         <pre class="log" ref={logEl}>
           {log.join("\n")}
