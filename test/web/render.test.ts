@@ -129,6 +129,9 @@ function delegate(real: Backend): Backend {
     answer: (id, text) => real.answer(id, text),
     openPr: (id) => real.openPr(id),
     cancel: (id) => real.cancel(id),
+    message: (id, text) => real.message(id, text),
+    chat: (id) => real.chat(id),
+    openTerminal: (id, mode) => real.openTerminal(id, mode),
     discard: (id) => real.discard(id),
     source: (path, line) => real.source(path, line),
     report: (id, report) => real.report(id, report),
@@ -381,4 +384,57 @@ test("the UI resyncs after reconnects and never acts on stale or failed data", U
   await app.waitFor(() => app.text().includes("internal error"), "root detail failure shown");
   assert.ok(!app.text().includes("This node"), "previous node's calls to action still shown");
   assert.equal(app.find((n) => n.localName === "button" && n.textContent === "Start").length, 0);
+});
+
+/** Open the node panel of `node` and return the task row (in the Tasks list) whose text includes `title`. */
+async function taskRow({ app, backend }: Ui, node: string, title: string) {
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const name = (await backend.getState()).tree.nodes[node].name;
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === name)[0].dispatch("click");
+  const row = () => app.find((n) => n.getAttribute("class") === "task" && n.textContent.includes(title))[0];
+  await app.waitFor(() => row() !== undefined, `task row ${title}`);
+  return row;
+}
+
+const buttons = (row: ReturnType<SmokeDriver["find"]>[number]) =>
+  row.querySelectorAll((n) => n.localName === "button").map((b) => b.textContent);
+
+test("the task action bar shows each action only in the states it applies to", UI_TIMEOUT, async (t) => {
+  const ui = await bootUi(t);
+  const review = await ui.backend.startTask({ node: RUNNING_NODE, findingIds: [], title: "Reviewable", prompt: "scenario:happy", manualReview: true });
+  await until(() => ui.backend.getState().then((s) => s.tasks.find((x) => x.id === review.id && x.state === "review")), "review");
+
+  const running = await taskRow(ui, RUNNING_NODE, ui.running.title);
+  assert.deepEqual(buttons(running()), ["Cancel", "Discard", "Log", "Diff", "Chat", "Open shell", "Open agent"]);
+  const agent = running().querySelectorAll((n) => n.localName === "button" && n.textContent === "Open agent")[0];
+  assert.notEqual(agent.getAttribute("disabled"), null, "agent mode waits for the live worker");
+
+  const reviewing = () => ui.app.find((n) => n.getAttribute("class") === "task" && n.textContent.includes("Reviewable"))[0];
+  await ui.app.waitFor(() => reviewing() !== undefined, "review task row");
+  assert.deepEqual(buttons(reviewing()), ["Open PR", "Cancel", "Discard", "Log", "Diff", "Chat", "Open shell", "Open agent"]);
+  await ui.app.waitFor(() => reviewing().querySelectorAll((n) => n.getAttribute("class") === "diff").length === 1, "diff open in review");
+
+  await ui.backend.cancel(ui.running.id);
+  await ui.app.waitFor(() => !buttons(running()).includes("Cancel"), "no cancel once failed");
+  assert.deepEqual(buttons(running()), ["Discard", "Log", "Diff", "Chat", "Open shell", "Open agent"]);
+});
+
+test("the chat pane shows the transcript, sends messages to the agent and follows replies", UI_TIMEOUT, async (t) => {
+  const ui = await bootUi(t);
+  const row = await taskRow(ui, RUNNING_NODE, ui.running.title);
+  row().querySelectorAll((n) => n.localName === "button" && n.textContent === "Chat")[0].dispatch("click");
+  const pane = () => row().querySelectorAll((n) => n.getAttribute("class") === "chat")[0];
+  await ui.app.waitFor(() => pane()?.textContent.includes("scenario:hang") ?? false, "transcript with the initial prompt");
+
+  const input = pane().querySelectorAll((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  input.value = "see https://example.com/doc";
+  input.dispatch("input");
+  const send = () => pane().querySelectorAll((n) => n.localName === "button" && n.textContent === "Send")[0];
+  await ui.app.waitFor(() => send().getAttribute("disabled") === null, "send enabled");
+  pane().querySelectorAll((n) => n.localName === "form")[0].dispatch("submit");
+
+  await ui.app.waitFor(() => pane().textContent.includes("see https://example.com/doc"), "message in the transcript");
+  assert.match(await ui.backend.taskLog(ui.running.id, 50), /prompt: see https:\/\/example.com\/doc/);
+  const link = pane().querySelectorAll((n) => n.localName === "a" && n.getAttribute("href") === "https://example.com/doc");
+  assert.equal(link.length, 1, "URLs in the chat are links");
 });

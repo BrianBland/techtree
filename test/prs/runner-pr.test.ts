@@ -149,7 +149,7 @@ test("a slow PR checkout does not block the event loop", async (t) => {
   assert.equal(task.state, "pr_open", task.error);
 });
 
-test("a task cancelled during its PR checkout never starts a worker", async (t) => {
+test("a PR task cancelled during its checkout never starts a worker and stays on its PR", async (t) => {
   const h = await setup(t);
   process.env.FAKE_GH_DELAY = "0.3";
   const id = h.runner.start(babysitStart("Fix. scenario:auto")).id;
@@ -157,7 +157,18 @@ test("a task cancelled during its PR checkout never starts a worker", async (t) 
   await h.waitFor(id, (x) => x.worktree !== undefined);
   await new Promise((r) => setTimeout(r, 100));
   const task = h.runner.get(id)!;
-  assert.equal(task.state, "failed");
-  assert.equal(task.error, "cancelled");
+  assert.equal(task.state, "pr_open");
+  assert.equal(task.pr, 7);
+  assert.equal(task.pid, undefined);
+});
+
+test("cancelling a running fix of an open PR stops its worker and returns the task to pr_open", async (t) => {
+  const h = await setup(t);
+  const id = h.runner.start(babysitStart("Fix. scenario:hang")).id;
+  const running = await h.waitFor(id, (x) => x.state === "running" && x.pid !== undefined);
+  const task = h.runner.cancel(id);
+  assert.equal(task.state, "pr_open");
+  assert.equal(task.pr, 7);
+  assert.equal(task.worktree, running.worktree, "the worktree is kept for the next fix");
   assert.equal(task.pid, undefined);
 });

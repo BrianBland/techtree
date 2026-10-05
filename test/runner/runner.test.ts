@@ -389,3 +389,87 @@ test("discard stops the worker and deletes worktree, local branch and task; open
   stuck.state = "pr_open";
   assert.throws(() => h.runner.discard(b.id), /open PR/);
 });
+
+test("a message to a running task steers its worker, and the chat transcript records the conversation", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("chat"));
+  await h.waitFor(id, (x) => x.checklist.length === 1);
+  const steered = h.runner.message(id, "please finish");
+  assert.equal(steered.state, "running");
+  const review = await h.waitFor(id, (x) => x.state === "review");
+  assert.match(log(review), /stderr: streamed as steer/);
+
+  const chat = h.runner.chat(id);
+  assert.deepEqual(
+    chat.map(({ role, text }) => [role, text]).slice(1),
+    [["user", "please finish"], ["tool", 'read {"path":"README.md"}'], ["assistant", "heard: please finish"]],
+  );
+  assert.equal(chat[0].role, "user");
+  assert.match(chat[0].text, /scenario:chat/, "the initial prompt opens the transcript");
+  assert.ok(chat.every((e) => !Number.isNaN(Date.parse(e.at))));
+});
+
+test("a message to a needs_input task answers it", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("ask"));
+  await h.waitFor(id, (x) => x.state === "needs_input");
+  assert.equal(h.runner.message(id, "blue").state, "running");
+  assert.match(log(await h.waitFor(id, (x) => x.state === "review")), /assistant: got: blue/);
+});
+
+test("a message resumes a review task on its session, which returns to review", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("chat"));
+  await h.waitFor(id, (x) => x.checklist.length === 1);
+  h.runner.message(id, "finish up");
+  await h.waitFor(id, (x) => x.state === "review");
+
+  assert.equal(h.runner.message(id, "also finish the docs").state, "queued");
+  const again = await h.waitFor(id, (x) => x.state === "review" && h.runner.chat(id).some((e) => e.text === "heard: also finish the docs"));
+  assert.match(log(again), /prompt: also finish the docs/);
+});
+
+test("a message resumes a failed task on its session and clears its error", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("chat"));
+  await h.waitFor(id, (x) => x.checklist.length === 1);
+  h.runner.cancel(id);
+  h.runner.message(id, "keep going");
+  const resumed = await h.waitFor(id, (x) => x.state === "running" && x.pid !== undefined);
+  assert.equal(resumed.error, undefined);
+  await h.waitFor(id, () => h.runner.chat(id).some((e) => e.text === "heard: keep going"));
+});
+
+test("a message resumes a pr_open task, which keeps its PR", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("auto", false));
+  await h.waitFor(id, (x) => x.state === "pr_open");
+  h.runner.message(id, "rebase please");
+  const task = await h.waitFor(id, (x) => x.state === "pr_open" && log(x).includes("prompt: rebase please"));
+  assert.equal(task.pr, 7);
+});
+
+test("messages are refused while queued or before a worktree exists", async (t) => {
+  const h = await setup(t, 1);
+  const a = h.runner.start(req("hang"));
+  const b = h.runner.start(req("hang"));
+  assert.throws(() => h.runner.message(b.id, "hi"), /queued/);
+  assert.throws(() => h.runner.message("nope", "hi"), /unknown task/);
+  h.runner.cancel(b.id);
+  await h.waitFor(a.id, (x) => x.checklist.length === 1);
+  h.runner.discard(a.id);
+  assert.throws(() => h.runner.message(b.id, "hi"), /worktree/);
+});
+
+test("the interactive agent command resumes the task's session, and is refused while a worker is live", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start({ ...req("happy"), model: "fake/beta" });
+  assert.throws(() => h.runner.agentCommand(id), /live worker/);
+  await h.waitFor(id, (x) => x.state === "review");
+  assert.deepEqual(h.runner.agentCommand(id), [
+    process.execPath, FAKE_PI,
+    "--session-dir", join(h.cache, "sessions", id),
+    "--session-id", id,
+    "--model", "fake/beta",
+  ]);
+});

@@ -93,6 +93,16 @@ const scenarios = {
     say("thinking");
     settle();
   },
+  // Replies to every later message; one containing "finish" completes the checklist.
+  async chat(message, settle) {
+    if (prompts === 1) return report({ plan: ["reply"] });
+    emit({ type: "tool_execution_start", toolName: "read", args: { path: "README.md" } });
+    say(`heard: ${message}`);
+    if (!message.includes("finish")) return;
+    commit();
+    await report({ done: 0 });
+    settle();
+  },
   async hang() {
     if (prompts === 1) await report({ plan: ["wait"] });
   },
@@ -123,6 +133,7 @@ const scenarios = {
 function onCommand(command) {
   if (command.type === "extension_ui_response") return dialogs.get(command.id)?.(command);
   if (command.type !== "prompt") return emit({ type: "response", id: command.id, command: command.type, success: false, error: "unsupported" });
+  if (command.streamingBehavior === "steer") process.stderr.write("streamed as steer\n");
   // The asking run's settle crossing the answer on the wire: it must not count as the answered run settling.
   if (scenario === "ask" && prompts === 1) emit({ type: "agent_settled" });
   if (!scenario) {
