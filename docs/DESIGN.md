@@ -94,6 +94,54 @@ The v1 plugins are listed below.
 | `rust` | crate annotation, `fn_count`, `complexity` (approx.), `unwrap_density`, `test_count`, `test_ratio`, `ignored_tests`, `lint_warnings` (clippy JSON), `test_time` (nextest JUnit, if present) | clippy diagnostics, untested public fns, unwrap/expect in non-test code |
 | `llm-scan` (on demand) | `review_debt` (severity-weighted, per kLOC) | each scanned issue, with severity, effort and a suggested fix |
 
+### v1 plugin metrics
+
+Own values are per node: a directory's own files only; the core aggregates up. Density and ratio metrics hold a raw count and name their denominator in `normalizeBy`, so findings can state their effect as a count and parents aggregate correctly by summing.
+
+| Metric | Own value | Direction | Aggregate | normalizeBy |
+|---|---|---|---|---|
+| `loc` | non-blank lines | neutral | sum | |
+| `files` | counted files | neutral | sum | |
+| `max_file_loc` | largest file's `loc` | lower_better | max | |
+| `todo_density` | lines with `TODO`/`FIXME`/`XXX`/`HACK` | lower_better | sum | `loc` |
+| `churn_90d` | lines added + deleted in the last 90 days | neutral | sum | |
+| `authors_90d` | distinct author emails in the last 90 days | neutral | max | |
+| `last_touched_days` | days since the newest commit touching an own file | neutral | max (stalest part) | |
+| `open_pr_overlap` | open PRs changing an own file | neutral | max | |
+| `fn_count` | `fn` items in non-test Rust code | neutral | sum | |
+| `pub_fn_count` | `pub fn` items in non-test Rust code | neutral | sum | |
+| `complexity` | branch points (`if`, `match`, `while`, `for … in`, `loop`, `&&`, `\|\|`) in non-test code | lower_better | sum | `fn_count` |
+| `unwrap_density` | `.unwrap()` / `.expect(` in non-test code | lower_better | sum | `loc` |
+| `test_count` | test fns (`#[test]`, `#[<path>::test]`, `#[rstest]`) | neutral | sum | |
+| `test_ratio` | test fns (same count as `test_count`) | higher_better | sum | `pub_fn_count` |
+| `ignored_tests` | `#[ignore]` attributes | lower_better | sum | |
+| `fan_in` | workspace crates depending on this crate (crate nodes only) | neutral | max | |
+| `lint_warnings` | clippy/rustc lint diagnostics in own files (linted crates only) | lower_better | sum | `loc` |
+| `test_time` | seconds from nextest JUnit XML (crate nodes only) | neutral | sum | |
+
+Git metrics are neutral: churn, authorship and recency describe how hot a node is (used by the complexity heuristic and as weights), not its quality. `open_pr_overlap` feeds conflict, not quality.
+
+Rules shared by the plugins:
+
+- **Skipped files** (`generic`): binary files (NUL byte in the first 8 KB), files over 2 MB, lockfiles, minified `*.min.*` files, files under `vendor/` or `third_party/`, and files whose first lines say `@generated` or `DO NOT EDIT`.
+- **Non-test Rust code** excludes files under a `tests/`, `benches/` or `examples/` directory and the bodies of `#[cfg(test)]` modules and test fns. Comments and string literals are ignored. The detection is lexical and approximate.
+- **Crates** (`rust.annotate`): a directory whose `Cargo.toml` has a `[package]` section becomes kind `crate`, named after the package. `fan_in` counts dependents across all workspace `Cargo.toml` dependency tables (renames via `package = "…"` honoured).
+- **Clippy** runs only when `plugins.rust.clippy` is true or `TECHTREE_CLIPPY=1`. One `cargo clippy --message-format=json -p … <clippyArgs>` covers every crate whose key (hash of its files, the root `Cargo.toml`, `Cargo.lock`, `rust-toolchain[.toml]` and `clippyArgs`) is not cached. The child inherits the parent environment (e.g. `CARGO_TARGET_DIR`). A crate that fails to build gets no `lint_warnings` and is logged. `plugins.rust.exclude` lists crate names to skip.
+- **test_time** sums `testsuite` times per package from `<target>/nextest/*/*.xml`, where `<target>` is `CARGO_TARGET_DIR` or `<repo>/target`.
+- **open_pr_overlap** uses `gh pr list --state open --json number,files` when a remote points at GitHub, cached for 10 minutes; any failure yields 0.
+
+Findings (ids hash source, file, rule and a snippet, never a line number):
+
+| Source | Rule | Granularity | metricEffects |
+|---|---|---|---|
+| `large-file` | `large-file` | file with ≥ 1000 loc; ≥ 2000 medium/large, ≥ 4000 high/large | `max_file_loc` down to max(1000, next largest file) |
+| `todo` | `todo-cluster` | file with ≥ 3 TODO lines | `todo_density: -n` |
+| `clippy` | lint code | one per diagnostic; trivial when machine-applicable, else small | `lint_warnings: -1` |
+| `test-gap` | `untested-pub-fn` | file whose `pub fn` names never appear in the crate's test code | `test_count: +n`, `test_ratio: +n` |
+| `unwrap` | `unwrap-expect` | file with unwrap/expect in non-test code | `unwrap_density: -n` |
+
+Clippy findings are tagged `concurrency` (lock, mutex, atomic, `Arc`, `Send`/`Sync`, await), `security` (unsafe, transmute, raw pointers, uninit) or `api` (`must_use`, docs, `new_without_default`, self conventions); untested public fns are tagged `api`.
+
 **Impact estimation (what-if).** Fixing finding *f* applies `metricEffects` to its node's raw values, then recomputes aggregation, percentiles and composite for that node and its ancestors, holding everyone else fixed. impact(f) = Δquality at the node, and the root delta is shown alongside. A task's planned delta applies all its findings together.
 
 **Priority** of a suggested task = impact ÷ effort cost × (1 − conflict), where conflict ∈ [0,1] is the overlap of its files and directories with running tasks' worktree diffs and open-PR file lists.
