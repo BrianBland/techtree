@@ -1,5 +1,6 @@
 import type { CollectCtx, Effort, Finding, MetricPlugin, MetricValues, NodeId } from "../types.ts";
 import { lexRust, matchingBrace, rustTestCode, TEST_ATTR, type RustTestCode } from "./rust.ts";
+import { dict } from "../core/tree.ts";
 import { findingId, nodeOfFile, readSource, treeFiles } from "./util/source.ts";
 
 const CODE_FILE = /\.(rs|ts|tsx|js|jsx|mjs|cjs|go|java|kt|swift|c|h|cc|cpp|hpp|cs|scala|sol)$/;
@@ -93,29 +94,44 @@ function findDuplicates(files: DupInput[]): { blocks: Block[]; dupLines: number[
       else occurrences.set(k, [[f, p]]);
     }),
   );
-  const partners = (f: number, p: number): [number, number][] => {
-    const list = keys[f][p] === undefined ? undefined : occurrences.get(keys[f][p]!)!;
-    if (!list || list.length < 2) return [];
-    return list.filter(([g, q]) => g !== f || Math.abs(q - p) >= WINDOW);
+  const spans = new Map<string, { files: number; first: number; last: number }>();
+  for (const [key, list] of occurrences) {
+    spans.set(key, { files: new Set(list.map(([f]) => f)).size, first: list[0][1], last: list.at(-1)![1] });
+  }
+  const hasPartner = (f: number, p: number): boolean => {
+    const span = keys[f][p] === undefined ? undefined : spans.get(keys[f][p]!)!;
+    return !!span && (span.files > 1 || span.last - p >= WINDOW || p - span.first >= WINDOW);
   };
+  const partners = (f: number, p: number): [number, number][] =>
+    occurrences.get(keys[f][p]!)!.filter(([g, q]) => g !== f || Math.abs(q - p) >= WINDOW);
 
   const dupLines = files.map(({ lines }, f) => {
     const covered = new Uint8Array(lines.length);
-    for (let p = 0; p < keys[f].length; p++) if (partners(f, p).length) covered.fill(1, p, p + WINDOW);
+    let coveredTo = 0;
+    for (let p = 0; p < keys[f].length; p++) {
+      if (!hasPartner(f, p)) continue;
+      covered.fill(1, Math.max(p, coveredTo), p + WINDOW);
+      coveredTo = p + WINDOW;
+    }
     return covered.reduce((sum, c) => sum + c, 0);
   });
 
   const started = keys.map((ks) => new Uint8Array(ks.length));
   const blocks: Block[] = [];
+  const marked = new Set<string>();
   files.forEach(({ file, lines, isTestLine }, f) => {
     for (let p = 0; p < keys[f].length; p++) {
-      if (started[f][p]) continue;
+      if (started[f][p] || !hasPartner(f, p)) continue;
       const others = partners(f, p);
-      if (!others.length) continue;
       const [g, q] = others[0];
       let len = 1;
       while (p + len < keys[f].length && keys[f][p + len] !== undefined && keys[f][p + len] === keys[g][q + len]) len++;
-      for (let k = 0; k < len; k++) for (const [h, r] of occurrences.get(keys[f][p + k]!)!) started[h][r] = 1;
+      for (let k = 0; k < len; k++) {
+        const key = keys[f][p + k]!;
+        if (marked.has(key)) continue;
+        marked.add(key);
+        for (const [h, r] of occurrences.get(key)!) started[h][r] = 1;
+      }
       blocks.push({
         file,
         lines: lines.slice(p, p + len + WINDOW - 1),
@@ -299,6 +315,8 @@ const LITERAL = /^(?:-?\d[\w.]*|b?""|b?''|true|false)$/;
 
 interface FnBody {
   start: number;
+  /** Offset of the body's `{`. */
+  open: number;
   name: string;
   line: number;
   header: string;
@@ -320,7 +338,7 @@ function fnBodies({ code, lineOf }: SourceFile): FnBody[] {
     const open = bodyOrDecl.exec(code)?.index ?? -1;
     if (code[open] !== "{") continue;
     const name = m[1] ?? `${m[2]}!`;
-    fns.push({ start: m.index, name, line: lineOf(m.index), header: code.slice(m.index, open), body: code.slice(open, matchingBrace(code, open)) });
+    fns.push({ start: m.index, open, name, line: lineOf(m.index), header: code.slice(m.index, open), body: code.slice(open, matchingBrace(code, open)) });
   }
   return fns;
 }
@@ -344,27 +362,52 @@ function expectingFns(fns: FnBody[]): Set<string> {
   return expecting;
 }
 
-/** Operands of the macro call whose `(` is at `open`, split at top-level commas, whitespace removed. */
-function macroArgs(code: string, open: number): string[] {
-  const args = [""];
+/** Operand ranges of the macro call whose `(` is at `open` in stripped `code`, split at top-level commas. */
+function macroArgs(code: string, open: number): [number, number][] {
+  const args: [number, number][] = [[open + 1, open + 1]];
   let depth = 0;
   for (let i = open; i < code.length; i++) {
     const c = code[i];
     if ("([{".includes(c) && depth++ === 0) continue;
     if (")]}".includes(c) && --depth === 0) break;
-    if (c === "," && depth === 1) args.push("");
-    else if (!/\s/.test(c)) args[args.length - 1] += c;
+    if (c === "," && depth === 1) args.push([i + 1, i + 1]);
+    else args[args.length - 1][1] = i + 1;
   }
   return args;
 }
 
-function trivialAsserts(body: string): number {
+/**
+ * Asserts in a test body that cannot fail: `assert!(true)`, literal-only operands, or identical
+ * call-free operands. `body` is stripped (see `lexRust`); `original` is the same span with literals,
+ * so operands differing only inside literals stay distinct.
+ */
+function trivialAsserts(body: string, original: string): number {
   let n = body.match(/\bassert!\s*\(\s*(?:true|!\s*false)\s*\)/g)?.length ?? 0;
+  const operand = (text: string, [from, to]: [number, number]) => text.slice(from, to).replace(/\s+/g, "");
   for (const m of body.matchAll(/\bassert_(?:eq|ne)!\s*\(/g)) {
     const [a, b] = macroArgs(body, m.index + m[0].length - 1);
-    if (b !== undefined && ((a === b && !a.includes("(")) || (LITERAL.test(a) && LITERAL.test(b)))) n++;
+    if (b === undefined) continue;
+    const identical = operand(original, a) === operand(original, b) && !operand(body, a).includes("(");
+    if (identical || (LITERAL.test(operand(body, a)) && LITERAL.test(operand(body, b)))) n++;
   }
   return n;
+}
+
+/** Start of the attribute group (`#[…]` lines) that ends with the attribute at `index`. */
+function attributeGroupStart(code: string, index: number): number {
+  let start = index;
+  for (;;) {
+    const before = code.slice(0, start).trimEnd();
+    if (!before.endsWith("]")) return start;
+    let depth = 0;
+    let j = before.length - 1;
+    for (; j >= 0; j--) {
+      if (before[j] === "]") depth++;
+      else if (before[j] === "[" && --depth === 0) break;
+    }
+    if (j < 1 || before[j - 1] !== "#") return start;
+    start = j - 1;
+  }
 }
 
 /** Test smells of a Rust file (DESIGN "Test smells"). */
@@ -378,7 +421,7 @@ function testSmells(src: SourceFile): Smell[] {
     nextFn.lastIndex = m.index;
     const found = nextFn.exec(code);
     const fn = found && byStart.get(found.index);
-    if (fn && !tests.has(fn.start)) tests.set(fn.start, { ...fn, attrs: code.slice(m.index, fn.start) });
+    if (fn && !tests.has(fn.start)) tests.set(fn.start, { ...fn, attrs: code.slice(attributeGroupStart(code, m.index), fn.start) });
   }
   if (tests.size === 0) return [];
   const expecting = expectingFns(fns);
@@ -402,7 +445,7 @@ function testSmells(src: SourceFile): Smell[] {
     groups.set(shape, [...(groups.get(shape) ?? []), t]);
   }
   for (const group of groups.values()) if (group.length > 1) add("duplicate-tests", group);
-  const trivial = [...tests.values()].map((t) => ({ t, n: trivialAsserts(t.body) })).filter((x) => x.n > 0);
+  const trivial = [...tests.values()].map((t) => ({ t, n: trivialAsserts(t.body, src.text.slice(t.open, t.open + t.body.length)) })).filter((x) => x.n > 0);
   add("trivial-assert", trivial.map((x) => x.t), trivial.reduce((sum, x) => sum + x.n, 0));
   add("long-test", [...tests.values()].filter((t) => t.body.split("\n").filter((l) => l.trim()).length > LONG_TEST && (t.body.match(/;/g)?.length ?? 0) > LONG_TEST_STATEMENTS));
   return smells;
@@ -499,7 +542,7 @@ export const slopPlugin: MetricPlugin = {
   ],
 
   async collect(ctx) {
-    const values: MetricValues = {};
+    const values: MetricValues = dict();
     for (const f of analysisFor(ctx).files) {
       const v = (values[nodeOfFile(f.file) as NodeId] ??= { dup_lines: 0, comment_noise: 0, test_smells: 0 });
       v.dup_lines += f.dupLines;

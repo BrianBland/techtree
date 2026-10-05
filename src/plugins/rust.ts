@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import type { CollectCtx, Effort, Finding, MetricPlugin, MetricValues, NodeId, Tree } from "../types.ts";
+import { dict } from "../core/tree.ts";
 import { findingId, nodeOfFile, readSource, run, treeFiles } from "./util/source.ts";
 
 type FileKind = "src" | "test" | "aux";
@@ -190,7 +191,10 @@ function closingBracket(code: string, open: number): number {
   return code.length;
 }
 
-/** End of the item starting at `start`: past its `;` or its matching `}`, whichever comes first at bracket depth 0. */
+/**
+ * End of the item or statement starting at `start`: past its `;` or past the `}` closing its first
+ * top-level block, unless the code after that block continues the expression (`.`, `?`, `;`, `else`, `as`).
+ */
 function itemEnd(code: string, start: number): number {
   let depth = 0;
   for (let j = start; j < code.length; j++) {
@@ -198,13 +202,34 @@ function itemEnd(code: string, start: number): number {
     if (c === "(" || c === "[") depth++;
     else if (c === ")" || c === "]") depth--;
     else if (depth === 0 && c === ";") return j + 1;
-    else if (depth === 0 && c === "{") return matchingBrace(code, j);
+    else if (depth === 0 && c === "{") {
+      const end = matchingBrace(code, j);
+      const next = end + code.slice(end).search(/\S|$/);
+      if (!/^(?:[.?;]|(?:else|as)\b)/.test(code.slice(next, next + 5))) return end;
+      j = next - 1;
+    }
   }
   return code.length;
 }
 
+/** Offset of the `{` opening the innermost block around `index`, or -1 at file level. */
+function enclosingBrace(code: string, index: number): number {
+  const open: number[] = [];
+  for (let j = 0; j < index; j++) {
+    if (code[j] === "{") open.push(j);
+    else if (code[j] === "}") open.pop();
+  }
+  return open.at(-1) ?? -1;
+}
+
+/** The `cfg(…)` predicate opening at `open`: tokens from the stripped code, so comments drop out, with string contents from the original. */
+function cfgPredicate(code: string, src: string, open: number): string {
+  const predicate = code.slice(open + 1, closingBracket(code, open) - 1);
+  return predicate.replace(/"[^"]*"/g, (literal, at: number) => src.slice(open + 1 + at, open + 1 + at + literal.length));
+}
+
 interface TestRegions {
-  /** The file is test-only (inner `#![cfg(test)]`). */
+  /** The file is test-only (file-level inner `#![cfg(test)]`). */
   wholeFile: boolean;
   regions: [number, number][];
   /** Names of out-of-line test-only modules (`#[cfg(test)] mod name;`). */
@@ -219,9 +244,11 @@ export function testRegions(code: string, src: string): TestRegions {
   const found: TestRegions = { wholeFile: false, regions: [], modules: [] };
   for (const m of code.matchAll(CFG_ATTR)) {
     const open = m.index + m[0].length - 1;
-    if (!testOnlyCfg(src.slice(open + 1, closingBracket(code, open) - 1))) continue;
+    if (!testOnlyCfg(cfgPredicate(code, src, open))) continue;
     if (m[1] === "!") {
-      found.wholeFile = true;
+      const block = enclosingBrace(code, m.index);
+      if (block < 0) found.wholeFile = true;
+      else found.regions.push([block, matchingBrace(code, block)]);
       continue;
     }
     let start = closingBracket(code, code.indexOf("[", m.index));
@@ -657,7 +684,7 @@ export const rustPlugin: MetricPlugin = {
 
   async collect(ctx) {
     const { files, crates, crateOf, lints } = await analysisFor(ctx);
-    const values: MetricValues = {};
+    const values: MetricValues = dict();
     const own = (node: NodeId) => (values[node] ??= {});
     for (const f of files) {
       const v = own(nodeOfFile(f.file));

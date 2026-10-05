@@ -260,3 +260,32 @@ fn smoke() { let _ = parse("ok"); }
   assert.deepEqual(smells.map((f) => f.title), ["1 test in src/lib.rs asserts nothing"]);
   assert.match(smells[0].detail, /Tests smoke in/);
 });
+
+test("a node named __proto__ gets its own values and never touches Object.prototype", async () => {
+  const { values } = await run({ "__proto__/a.ts": "// ----------\nexport const x = 1;\n" });
+  assert.equal(Object.hasOwn(values, "__proto__"), true);
+  assert.equal(values["__proto__"].comment_noise, 1);
+  for (const key of ["dup_lines", "comment_noise", "test_smells"]) assert.equal(Object.hasOwn(Object.prototype, key), false);
+});
+
+test("attributes before #[test] count, and asserts on distinct literals are not trivial", async () => {
+  const src = `
+#[should_panic]
+#[test]
+fn rejects_bad_input() { decode_invalid(); }
+
+#[test]
+fn aliases_differ() { let aliases = load(); assert_eq!(aliases["first"], aliases["second"]); assert_ne!(s['a'], s['b']); }
+`;
+  assert.deepEqual(only((await run({ "src/lib.rs": src })).findings, "test-smell"), []);
+});
+
+test("duplicate detection stays linear on highly repetitive input", async () => {
+  const period = Array.from({ length: 10 }, (_, i) => `    let repeated_value_${i} = compute_expensive_thing(${i}, "constant");`);
+  const file = Array.from({ length: 2000 }, () => period.join("\n")).join("\n");
+  const started = performance.now();
+  const { values } = await run({ "a.rs": file, "b.rs": file, "c.rs": file, "d.rs": file });
+  const elapsed = performance.now() - started;
+  assert.equal(values[""].dup_lines, 80000);
+  assert.ok(elapsed < 3000, `80k repetitive lines took ${elapsed.toFixed(0)} ms`);
+});

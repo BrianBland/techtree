@@ -1,4 +1,5 @@
 import type { CollectCtx, Effort, Finding, MetricPlugin, MetricValues, Severity } from "../types.ts";
+import { dict } from "../core/tree.ts";
 import { findingId, readSource } from "./util/source.ts";
 
 export const LARGE_FILE_LOC = 1000;
@@ -43,7 +44,7 @@ export const genericPlugin: MetricPlugin = {
   ],
 
   async collect(ctx) {
-    const values: MetricValues = {};
+    const values: MetricValues = dict();
     for (const node of Object.values(ctx.tree.nodes)) {
       const stats = measure(ctx, node.files);
       if (stats.length === 0) continue;
