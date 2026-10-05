@@ -13,6 +13,7 @@ interface FileStats {
   pubFns: string[];
   branches: number;
   unwraps: number;
+  unwrapWeight: number;
   firstUnwrapLine?: number;
   tests: number;
   ignored: number;
@@ -48,17 +49,33 @@ interface RustOptions {
   exclude?: string[];
 }
 
-const TEST_ATTR = /#\[\s*(?:(?:[\w:]+::)?test|rstest)\b[^\]]*\]/g;
+export const TEST_ATTR = /#\[\s*(?:(?:[\w:]+::)?test|rstest)\b[^\]]*\]/g;
 const CFG_TEST_MOD = /#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])/g;
 const IGNORE_ATTR = /#\[\s*ignore\b/g;
 const FN = /\bfn\s+[A-Za-z_]\w*/g;
 const PUB_FN = /\bpub\s+(?:const\s+|async\s+|unsafe\s+|extern\s+(?:"[^"]*"\s+)?)*fn\s+([A-Za-z_]\w*)/g;
 const BRANCH = /\b(?:if|match|while|loop)\b|&&|\|\||\bfor\s+[^{;]*?\bin\b/g;
 const UNWRAP = /\.unwrap\(\)|\.expect\(/g;
+const LOCK_GUARD = /\.(?:lock|read|write)\(\)\s*$/;
+const LITERAL_PARSE = /"[^"\n]*"\s*\.parse(?:::<[^()]*>)?\(\)\s*$/;
+const ENTRY_POINT = /(^|\/)(main|build)\.rs$|(^|\/)src\/bin\//;
 const IDENT = /[A-Za-z_]\w*/g;
+
+/** How likely an unwrap/expect at `index` is a real panic risk (DESIGN "Confidence"). */
+function unwrapWeight(code: string, index: number): number {
+  const before = code.slice(Math.max(0, index - 200), index);
+  if (LOCK_GUARD.test(before) || LITERAL_PARSE.test(before)) return 0.2;
+  return code.startsWith(".expect(", index) ? 0.6 : 1;
+}
 
 /** Rust source with comments and string/char literal contents blanked to spaces (offsets and newlines kept). */
 export function stripRust(src: string): string {
+  return lexRust(src).code;
+}
+
+/** `code` as `stripRust` returns it, plus the [start, end) offsets of every comment in `src`. */
+export function lexRust(src: string): { code: string; comments: [number, number][] } {
+  const comments: [number, number][] = [];
   const out = src.split("");
   const blank = (from: number, to: number) => {
     for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " ";
@@ -73,6 +90,7 @@ export function stripRust(src: string): string {
       const eol = src.indexOf("\n", i);
       const end = eol < 0 ? src.length : eol;
       blank(i, end);
+      comments.push([i, end]);
       i = end;
       continue;
     }
@@ -85,6 +103,7 @@ export function stripRust(src: string): string {
         else j++;
       }
       blank(i, j);
+      comments.push([i, j]);
       i = j;
       continue;
     }
@@ -118,10 +137,11 @@ export function stripRust(src: string): string {
     }
     i++;
   }
-  return out.join("");
+  return { code: out.join(""), comments };
 }
 
-function matchingBrace(code: string, open: number): number {
+/** Offset just past the `}` closing the `{` at `open`, or the end of `code`. */
+export function matchingBrace(code: string, open: number): number {
   let depth = 0;
   for (let j = open; j < code.length; j++) {
     if (code[j] === "{") depth++;
@@ -176,15 +196,16 @@ function analyzeFile(file: string, code: string, kind: FileKind): FileStats {
     for (let k = from; k < to; k++) if (mask[k] !== "\n") mask[k] = " ";
   }
   const nonTest = kind === "src" ? mask.join("") : "";
-  const firstUnwrap = nonTest.search(UNWRAP);
+  const unwraps = ENTRY_POINT.test(file) ? [] : [...nonTest.matchAll(UNWRAP)].map((m) => m.index);
   return {
     file,
     kind,
     fns: nonTest.match(FN)?.length ?? 0,
     pubFns: [...nonTest.matchAll(PUB_FN)].map((m) => m[1]),
     branches: nonTest.match(BRANCH)?.length ?? 0,
-    unwraps: nonTest.match(UNWRAP)?.length ?? 0,
-    firstUnwrapLine: firstUnwrap >= 0 ? lineAt(nonTest, firstUnwrap) : undefined,
+    unwraps: unwraps.length,
+    unwrapWeight: unwraps.reduce((sum, i) => sum + unwrapWeight(nonTest, i), 0),
+    firstUnwrapLine: unwraps.length ? lineAt(nonTest, unwraps[0]) : undefined,
     tests: code.match(TEST_ATTR)?.length ?? 0,
     ignored: code.match(IGNORE_ATTR)?.length ?? 0,
     testCode,
@@ -565,6 +586,7 @@ export const rustPlugin: MetricPlugin = {
         findings.push(clippyFinding(d, n));
       }
     }
+    const dependents = fanIn(ctx, crates);
     const testIdents = new Map<NodeId, Set<string>>(crates.map((c) => [c.node, new Set<string>()]));
     for (const f of files) {
       const idents = testIdents.get(crateOf.get(nodeOfFile(f.file))?.node ?? "\0");
@@ -584,10 +606,12 @@ export const rustPlugin: MetricPlugin = {
           severity: f.unwraps >= 5 ? "medium" : "low",
           effort: scaledEffort(f.unwraps, 2, 10),
           metricEffects: { unwrap_density: -f.unwraps },
+          confidence: f.unwrapWeight / f.unwraps,
         });
       }
-      const idents = testIdents.get(crateOf.get(node)?.node ?? "\0");
-      if (!idents) continue;
+      const crate = crateOf.get(node);
+      const idents = testIdents.get(crate?.node ?? "\0");
+      if (!idents || !dependents.get(crate!.name)) continue;
       const untested = [...new Set(f.pubFns)].filter((name) => !idents.has(name));
       if (untested.length === 0) continue;
       findings.push({
@@ -601,6 +625,7 @@ export const rustPlugin: MetricPlugin = {
         effort: untested.length <= 3 ? "small" : "medium",
         metricEffects: { test_count: untested.length, test_ratio: untested.length },
         tags: ["api"],
+        confidence: 0.3,
       });
     }
     return findings;

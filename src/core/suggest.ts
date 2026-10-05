@@ -1,4 +1,5 @@
-import type { Config, Effort, Finding, Impact, ScoreResult, Suggestion } from "../types.ts";
+import type { Config, Effort, Finding, Impact, NodeId, ScoreResult, Suggestion } from "../types.ts";
+import { rankSuggestions } from "./cta.ts";
 import { hotNodes } from "./hot.ts";
 import { buildModel, commonAncestor, findingsImpact } from "./scoring.ts";
 
@@ -9,9 +10,23 @@ export const EFFORT_COST: Record<Effort, number> = { trivial: 1, small: 2, mediu
 
 const REVIEW_TAGS = ["concurrency", "security", "api"];
 
-/** impact ÷ effort cost × (1 − conflict). */
-export function priority(impact: Impact, effort: Effort, conflict: number): number {
-  return (impact.node / EFFORT_COST[effort]) * (1 - conflict);
+/** impact.node × confidence × size ÷ effort cost × (1 − conflict). */
+export function priority(impact: Impact, effort: Effort, conflict: number, confidence = 1, size = 1): number {
+  return ((impact.node * confidence * size) / EFFORT_COST[effort]) * (1 - conflict);
+}
+
+/** √(loc share of the root) of the nearest scored node at or above `node`, where its impact is measured; 1 without loc. */
+export function sizeFactor(result: Pick<ScoreResult, "tree" | "scores">, node: NodeId): number {
+  let scored: NodeId | null = node;
+  while (scored !== null && result.scores[scored]?.quality == null) scored = result.tree.nodes[scored]?.parent ?? null;
+  const loc = scored === null ? undefined : result.scores[scored].metrics.loc?.raw;
+  const rootLoc = result.scores[""]?.metrics.loc?.raw;
+  return loc === undefined || !rootLoc ? 1 : Math.sqrt(loc / rootLoc);
+}
+
+/** Mean confidence of `findings` (unset counts as 1). */
+export function confidence(findings: Finding[]): number {
+  return findings.reduce((sum, f) => sum + (f.confidence ?? 1), 0) / findings.length;
 }
 
 /** Fraction of `paths` that overlap (equal, contain or are contained by) any busy path. */
@@ -33,7 +48,7 @@ export function needsManualReview(findings: Finding[], hot: boolean): boolean {
   );
 }
 
-/** Suggested tasks for a scoring result, highest priority first. */
+/** Suggested tasks for a scoring result, by priority and diversified by source. */
 export function suggestTasks(result: ScoreResult, config: Config, busyPaths: string[] = []): Suggestion[] {
   const model = buildModel(result.tree, result.metricDefs, result.own, config);
   const hot = hotNodes(result.tree, result.scores);
@@ -52,13 +67,14 @@ export function suggestTasks(result: ScoreResult, config: Config, busyPaths: str
     return {
       node,
       title: findings.length === 1 ? first.title : `${findings.length} ${first.source} fixes in ${first.file}`,
+      source: first.source,
       findingIds: findings.map((f) => f.id),
       impact,
       effort: first.effort,
       conflict: c,
-      priority: priority(impact, first.effort, c),
+      priority: priority(impact, first.effort, c, confidence(findings), sizeFactor(result, node)),
       manualReview: needsManualReview(findings, hot.has(node)),
     };
   });
-  return suggestions.sort((a, b) => b.priority - a.priority);
+  return rankSuggestions(suggestions);
 }

@@ -69,6 +69,7 @@ export interface Finding {
   effort: Effort;
   metricEffects: Record<string, number>; // e.g. { lint_warnings: -1 } if fixed
   tags?: string[]; // "concurrency" | "security" | "api" | ... (complexity heuristic)
+  confidence?: number; // 0..1, default 1: how likely the finding is a real problem (scales priority)
 }
 
 export type TaskState = "queued" | "running" | "needs_input" | "review" | "pr_open" | "done" | "failed";
@@ -159,6 +160,7 @@ export interface ScoreResult {
 export interface Suggestion {
   node: NodeId;
   title: string;
+  source?: string; // the findings' source; suggestion lists are diversified by it
   findingIds: string[];
   impact: Impact;
   effort: Effort;

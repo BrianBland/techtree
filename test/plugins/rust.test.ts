@@ -288,3 +288,36 @@ test("fan_in credits aliases a member inherits from [workspace.dependencies] to 
   const values = await rustPlugin.collect(makeCtx(annotated(root)));
   assert.deepEqual(values["crates/core"], { fan_in: 3 });
 });
+
+test("unwraps in binary entry points and build scripts are not counted; confidence weighs each call", async () => {
+  const root = fixture({
+    "Cargo.toml": `[package]\nname = "solo"\n`,
+    "build.rs": "fn main() { std::env::var(\"X\").unwrap(); }\n",
+    "src/main.rs": "fn main() { run().unwrap(); }\n",
+    "src/bin/tool.rs": "fn main() { run().unwrap(); }\n",
+    "src/lib.rs": [
+      "pub fn a(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "pub fn b(r: Result<u8, ()>) -> u8 { r.expect(\"validated by caller\") }",
+      "pub fn c(m: &std::sync::Mutex<u8>) -> u8 { *m.lock().unwrap() }",
+      "pub fn d() -> std::net::IpAddr { \"127.0.0.1\".parse::<std::net::IpAddr>().unwrap() }",
+      "",
+    ].join("\n"),
+  });
+  const ctx = makeCtx(annotated(root));
+  const values = await rustPlugin.collect(ctx);
+  assert.equal(values[""].unwrap_density, 0);
+  assert.equal(values.src.unwrap_density, 4);
+  assert.equal(values["src/bin"].unwrap_density, 0);
+  const unwraps = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "unwrap");
+  assert.deepEqual(unwraps.map((f) => f.file), ["src/lib.rs"]);
+  assert.equal(unwraps[0].confidence, (1 + 0.6 + 0.2 + 0.2) / 4);
+});
+
+test("test gaps are reported with low confidence, and only for crates other crates depend on", async () => {
+  const findings = (await rustPlugin.findings!(makeCtx(annotated(workspace())))).filter((f) => f.source === "test-gap");
+  assert.deepEqual(findings.map((f) => [f.file, f.confidence]), [["crates/core/src/lib.rs", 0.3]]);
+  const leaf = fixture({ "Cargo.toml": `[package]\nname = "leaf"\n`, "src/lib.rs": "pub fn untested() {}\n" });
+  const ctx = makeCtx(annotated(leaf));
+  assert.deepEqual((await rustPlugin.findings!(ctx)).filter((f) => f.source === "test-gap"), []);
+  assert.equal((await rustPlugin.collect(ctx)).src.pub_fn_count, 1, "test_ratio still counts the untested fn");
+});

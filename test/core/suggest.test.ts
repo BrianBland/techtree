@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { buildModel, findingImpact, findingsImpact } from "../../src/core/scoring.ts";
-import { conflict, hotNodes, needsManualReview, priority, suggestTasks } from "../../src/core/suggest.ts";
+import { conflict, hotNodes, needsManualReview, priority, sizeFactor, suggestTasks } from "../../src/core/suggest.ts";
 import { treeFromFiles } from "../../src/core/tree.ts";
 import type { Finding, MetricDef, ScoreResult } from "../../src/types.ts";
 import { config, finding, LINT, LOC } from "./fixture.ts";
@@ -15,6 +15,23 @@ test("priority divides impact by effort cost and scales by (1 - conflict)", () =
   assert.equal(priority(impact, "medium", 0), 2);
   assert.equal(priority(impact, "large", 0.5), 10 / 13 / 2);
   assert.equal(priority(impact, "trivial", 1), 0);
+});
+
+test("priority scales by confidence and node size", () => {
+  const impact = { node: 10, root: 1 };
+  assert.equal(priority(impact, "small", 0, 0.3), 1.5);
+  assert.equal(priority(impact, "small", 0, 1, 0.25), 1.25);
+  assert.equal(priority(impact, "small", 0.5, 0.5, 0.5), 0.625);
+});
+
+test("size factor is the square root of the loc share of the nearest scored node", () => {
+  const tree = treeFromFiles("/repo", ["big/f.rs", "small/f.rs", "small/tiny/f.rs"]);
+  const own = { big: { loc: 3000, lint_warnings: 1 }, small: { loc: 900, lint_warnings: 1 }, "small/tiny": { loc: 100, lint_warnings: 1 } };
+  const model = buildModel(tree, [LOC, LINT], own, config({ minLoc: 200 }));
+  const result = { tree, scores: model.scores };
+  assert.equal(sizeFactor(result, "big"), Math.sqrt(3000 / 4000));
+  assert.equal(sizeFactor(result, "small/tiny"), Math.sqrt(1000 / 4000), "unscored tiny folder uses its scored parent");
+  assert.equal(sizeFactor({ tree, scores: buildModel(tree, [LINT], own, config()).scores }, "big"), 1, "no loc metric");
 });
 
 test("conflict is the fraction of paths overlapping busy files or directories", () => {
@@ -98,4 +115,28 @@ test("a group spanning nodes is anchored at their common ancestor, matching its 
   const [group] = suggestTasks(result, cfg);
   assert.equal(group.node, "a");
   assert.deepEqual(group.impact, findingsImpact(model, findings, "a"));
+});
+
+test("suggestions carry their source, weigh confidence and node size, and are diversified", () => {
+  const dirs = ["a", "b", "c", "d", "e"];
+  const tree = treeFromFiles("/repo", dirs.map((d) => `${d}/f.rs`));
+  const own = Object.fromEntries(dirs.map((d, i) => [d, { loc: 1000, lint_warnings: 5 + i }]));
+  const cfg = config({ weights: { lint_warnings: 1 } });
+  const findings: Finding[] = [
+    finding("a", "a", { lint_warnings: -1 }, { source: "unwrap", file: "a/f.rs" }),
+    finding("b", "b", { lint_warnings: -1 }, { source: "unwrap", file: "b/f.rs" }),
+    finding("c", "c", { lint_warnings: -1 }, { source: "unwrap", file: "c/f.rs" }),
+    finding("d", "d", { lint_warnings: -1 }, { source: "duplication", file: "d/f.rs", effort: "large" }),
+    finding("e", "e", { lint_warnings: -1 }, { source: "test-gap", file: "e/f.rs", confidence: 0.01 }),
+  ];
+  const model = buildModel(tree, [LOC, LINT], own, cfg);
+  const result: ScoreResult = {
+    sha: "", createdAt: "", tree, metricDefs: [LOC, LINT], own, scores: model.scores, findings,
+    impacts: Object.fromEntries(findings.map((f) => [f.id, findingImpact(model, f)])),
+  };
+  const suggestions = suggestTasks(result, cfg);
+  const e = suggestions.find((s) => s.source === "test-gap")!;
+  const size = Math.sqrt(1000 / 5000);
+  assert.ok(Math.abs(e.priority - result.impacts.e.node * 0.01 * size) < 1e-9);
+  assert.deepEqual(suggestions.map((s) => s.source), ["unwrap", "unwrap", "duplication", "test-gap", "unwrap"]);
 });
