@@ -128,6 +128,7 @@ function delegate(real: Backend): Backend {
     getOverview: (project) => real.getOverview(project),
     taskLog: (id, tail) => real.taskLog(id, tail),
     taskDiff: (id) => real.taskDiff(id),
+    acceptScorer: (id) => real.acceptScorer(id),
     models: () => real.models(),
     startTask: (req) => real.startTask(req),
     answer: (id, text) => real.answer(id, text),

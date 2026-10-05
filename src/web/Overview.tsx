@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
-import { ALL_PROJECTS, hasScorer } from "../core/projects.ts";
-import type { ApiOverview, ApiState, NodeId, Project, Suggestion } from "../types.ts";
-import { get } from "./api.ts";
+import { ALL_PROJECTS, isScannable, isScored } from "../core/projects.ts";
+import type { ApiOverview, ApiState, NodeId, Project, StartTaskRequest, Suggestion, TaskKind } from "../types.ts";
+import { get, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { PrRow, Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
 
@@ -35,12 +35,14 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
     };
   }, [view, attentionKey(state), version, all && eventTick]);
 
+  const [projectTask, setProjectTask] = useState<{ kind: TaskKind; title: string } | null>(null);
   const overview = fetched?.view === view ? fetched.overview : null;
   if (!overview) return <aside class="panel muted">Loading…</aside>;
   const nodeName = (id: NodeId) => (id === "" ? state.repo.name : id);
   const projectName = (id = state.project.id) => projects.find((p) => p.id === id)?.name ?? id;
   const tag = (id?: string) => all && <span class="project-tag">{projectName(id)}</span>;
-  const scored = all || hasScorer(state.project);
+  const scored = all || isScored(state.project);
+  const custom = !all && !state.project.builtin;
   const { coverage } = overview;
   return (
     <aside class="panel">
@@ -73,15 +75,24 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
       <Section title="Pull requests needing attention" items={overview.flaggedPrs}>
         {(pr) => <PrRow key={pr.number} pr={pr} tag={tag(pr.project)} onError={onError} />}
       </Section>
-      {!scored && (
+      {overview.scorerErrors?.map((e) => (
+        <p key={e} class="error small">
+          Scorer failed: {linkify(e)}
+        </p>
+      ))}
+      {custom && (
         <section class="ctas">
-          <h3>No scorer yet</h3>
-          <p class="small">
-            This project has no scorer, so there are no scores or suggestions. Scorers for custom projects are coming in a later update; meanwhile
-            select a node and use “New task here” to work toward the goal.
-          </p>
+          <h3>{scored ? "Scorer" : "No scorer yet"}</h3>
+          {!scored && <p class="small">Draft a scorer to measure progress toward the goal, or plan the work as items to track.</p>}
+          <div class="actions">
+            <button onClick={() => setProjectTask({ kind: "scorer", title: scored ? "Refine scorer" : "Draft scorer" })}>
+              {scored ? "Refine scorer" : "Draft scorer"}
+            </button>
+            {(!scored || state.project.scorer.plan) && <button onClick={() => setProjectTask({ kind: "plan", title: "Plan the work" })}>Plan the work</button>}
+          </div>
         </section>
       )}
+      {projectTask && <ProjectTaskDialog {...projectTask} project={state.project.id} onClose={() => setProjectTask(null)} onError={onError} />}
       <Section title="Top suggestions" items={overview.suggestions}>
         {(s) => (
           <li key={(s.project ?? "") + s.node + s.title}>
@@ -93,7 +104,7 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
           </li>
         )}
       </Section>
-      {scored && (
+      {(all || isScannable(state.project)) && (
       <section>
         <h3>Scan coverage</h3>
         <p class="small">
@@ -105,6 +116,36 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
       </section>
       )}
     </aside>
+  );
+}
+
+/** Start a scorer or plan task with an optional instruction (DESIGN "Task kinds"). */
+function ProjectTaskDialog({ kind, title, project, onClose, onError }: { kind: TaskKind; title: string; project: string; onClose(): void; onError(message: string): void }) {
+  const [instruction, setInstruction] = useState("");
+  const submit = (e: Event) => {
+    e.preventDefault();
+    const request: StartTaskRequest = { node: "", findingIds: [], manualReview: false, kind, project, ...(instruction.trim() && { prompt: instruction }) };
+    onClose();
+    post("/api/tasks", request).catch((err: Error) => onError(err.message));
+  };
+  return (
+    <div class="overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
+      <form class="dialog" onSubmit={submit}>
+        <h3>{title}</h3>
+        <label>
+          Instruction (optional)
+          <textarea rows={5} value={instruction} onInput={(e) => setInstruction((e.currentTarget as HTMLTextAreaElement).value)} />
+        </label>
+        <div class="buttons">
+          <button type="button" class="link" onClick={onClose}>
+            Cancel
+          </button>
+          <button type="submit" class="primary">
+            Start
+          </button>
+        </div>
+      </form>
+    </div>
   );
 }
 

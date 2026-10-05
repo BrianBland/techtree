@@ -3,12 +3,42 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { ApiOverview, CollectCtx, Effort, Finding, MetricPlugin, MetricValues, NodeId, Severity } from "../types.ts";
+import type { ApiOverview, CollectCtx, Effort, Finding, MetricDef, MetricPlugin, MetricValues, NodeId, Severity } from "../types.ts";
 
 /** review_debt points per finding; fixing a finding removes its weight. */
 export const SEVERITY_WEIGHT: Record<Severity, number> = { low: 1, medium: 3, high: 9 };
 
 const KIND = "llm-scan";
+
+/** What a scan looks for, where its results are cached and which metrics and findings it yields. */
+export interface ScanKind {
+  /** Cache kind of its batch and file entries. */
+  kind: string;
+  source: string;
+  debt: MetricDef;
+  loc: MetricDef;
+  rubric?: string;
+}
+
+/** Quality's LLM scan with the techtree-scan focus areas. */
+export const QUALITY_SCAN: ScanKind = {
+  kind: KIND,
+  source: KIND,
+  debt: { key: "review_debt", label: "Review debt", unit: "pts", direction: "lower_better", aggregate: "sum", normalizeBy: "scanned_loc" },
+  loc: { key: "scanned_loc", label: "LLM-scanned LOC", unit: "lines", direction: "neutral", aggregate: "sum" },
+};
+
+/** A project's rubric scan (DESIGN "Project scorers"); editing the rubric changes its cache kind. */
+export function rubricScan(project: string, rubric: string): ScanKind {
+  return {
+    kind: `rubric:${project}:${sha256(rubric).slice(0, 12)}`,
+    source: "rubric",
+    debt: { key: "issues", label: "Rubric issues", unit: "pts", direction: "lower_better", aggregate: "sum", normalizeBy: "rubric_loc" },
+    loc: { key: "rubric_loc", label: "Rubric-scanned LOC", unit: "lines", direction: "neutral", aggregate: "sum" },
+    rubric,
+  };
+}
+
 const SEVERITIES = Object.keys(SEVERITY_WEIGHT);
 const EFFORTS: Effort[] = ["trivial", "small", "medium", "large"];
 /** How long a stopped pi child gets to exit after SIGTERM before SIGKILL. */
@@ -27,6 +57,8 @@ export interface ScanProgress {
 export type ScanOptions = Partial<typeof DEFAULTS> & {
   onProgress?(progress: ScanProgress): void;
   signal?: AbortSignal;
+  /** Default: Quality's scan. */
+  scan?: ScanKind;
 };
 
 /** A validated model finding as stored in the cache. */
@@ -61,6 +93,7 @@ const lineCount = (text: string) => (text === "" ? 0 : text.split("\n").length -
  */
 export async function scanNode(node: NodeId, ctx: CollectCtx, opts: ScanOptions = {}): Promise<ScanProgress> {
   const o = { ...DEFAULTS, ...(ctx.config.plugins[KIND] as Partial<typeof DEFAULTS> | undefined), ...opts };
+  const { kind, rubric } = opts.scan ?? QUALITY_SCAN;
   const signal = opts.signal ?? ctx.signal;
   const skillDir = findSkillDir();
   const skillText = readFileSync(join(skillDir, "SKILL.md"), "utf8");
@@ -68,13 +101,13 @@ export async function scanNode(node: NodeId, ctx: CollectCtx, opts: ScanOptions 
   const progress: ScanProgress = { done: 0, total: batches.length, cached: 0, failed: 0, findings: 0 };
 
   const scanBatch = async (batch: SourceFile[]) => {
-    const key = `batch:${sha256(JSON.stringify([skillText, batch.map((f) => [f.path, f.text])]))}`;
-    let items = ctx.cache.get<ScanItem[]>(KIND, key);
+    const key = `batch:${sha256(JSON.stringify([skillText, ...(rubric ? [rubric] : []), batch.map((f) => [f.path, f.text])]))}`;
+    let items = ctx.cache.get<ScanItem[]>(kind, key);
     if (items) progress.cached++;
     else {
       try {
-        items = parseFindings(await runPi(ctx, skillDir, batch, o.timeoutMs, signal), batch);
-        ctx.cache.set(KIND, key, items);
+        items = parseFindings(await runPi(ctx, skillDir, prompt(batch, rubric), o.timeoutMs, signal), batch);
+        ctx.cache.set(kind, key, items);
       } catch (err) {
         if (signal?.aborted) throw signal.reason;
         ctx.log(`llm-scan: batch of ${batch.length} files under "${node}" failed: ${(err as Error).message}`);
@@ -84,7 +117,7 @@ export async function scanNode(node: NodeId, ctx: CollectCtx, opts: ScanOptions 
     if (items) {
       for (const f of batch) {
         const entry: FileEntry = { sha: sha256(f.text), loc: lineCount(f.text), findings: items.filter((i) => i.file === f.path) };
-        ctx.cache.set(KIND, `file:${f.path}`, entry);
+        ctx.cache.set(kind, `file:${f.path}`, entry);
       }
       progress.findings += items.length;
     }
@@ -145,19 +178,24 @@ function chunk(files: SourceFile[], o: typeof DEFAULTS): SourceFile[][] {
   return batches;
 }
 
-function prompt(batch: SourceFile[]): string {
+/** Replaces the skill's focus areas with a project rubric; the output format stays the same. */
+function rubricPreamble(rubric: string): string {
+  return `Rubric: ${rubric}\nReport only issues this rubric describes, instead of the skill's focus areas; keep the output format.`;
+}
+
+function prompt(batch: SourceFile[], rubric?: string): string {
   const numbered = (text: string) =>
     text
       .split("\n")
       .slice(0, lineCount(text))
       .map((line, i) => `${i + 1}: ${line}`)
       .join("\n");
-  return `/skill:techtree-scan Review these files:\n\n${batch.map((f) => `=== ${f.path} ===\n${numbered(f.text)}`).join("\n\n")}`;
+  return `/skill:techtree-scan ${rubric ? `${rubricPreamble(rubric)}\n\n` : ""}Review these files:\n\n${batch.map((f) => `=== ${f.path} ===\n${numbered(f.text)}`).join("\n\n")}`;
 }
 
-function runPi(ctx: CollectCtx, skillDir: string, batch: SourceFile[], timeout: number, signal?: AbortSignal): Promise<string> {
+function runPi(ctx: CollectCtx, skillDir: string, message: string, timeout: number, signal?: AbortSignal): Promise<string> {
   const [cmd, ...prefix] = ctx.config.piCommand;
-  const args = [...prefix, "-p", "--no-session", "--tools", "read,grep,find,ls", "--skill", skillDir, prompt(batch)];
+  const args = [...prefix, "-p", "--no-session", "--tools", "read,grep,find,ls", "--skill", skillDir, message];
   return new Promise((resolve, reject) => {
     const child = spawn(cmd, args, { cwd: ctx.repoRoot, stdio: ["ignore", "pipe", "pipe"] });
     let stdout = "";
@@ -249,8 +287,8 @@ function parseJsonArray(output: string): unknown[] | undefined {
 }
 
 /** Cached scan results for `path`, if its current contents are the ones that were scanned. */
-function freshEntry(ctx: CollectCtx, path: string): FileEntry | undefined {
-  const entry = ctx.cache.get<FileEntry>(KIND, `file:${path}`);
+function freshEntry(ctx: CollectCtx, kind: string, path: string): FileEntry | undefined {
+  const entry = ctx.cache.get<FileEntry>(kind, `file:${path}`);
   if (!entry) return undefined;
   try {
     return sha256(readFileSync(join(ctx.repoRoot, path), "utf8")) === entry.sha ? entry : undefined;
@@ -259,14 +297,14 @@ function freshEntry(ctx: CollectCtx, path: string): FileEntry | undefined {
   }
 }
 
-function scannedNodeEntries(ctx: CollectCtx): [NodeId, FileEntry[]][] {
+function scannedNodeEntries(ctx: CollectCtx, kind: string): [NodeId, FileEntry[]][] {
   return Object.values(ctx.tree.nodes)
-    .map((n): [NodeId, FileEntry[]] => [n.id, n.files.flatMap((p) => freshEntry(ctx, p) ?? [])])
+    .map((n): [NodeId, FileEntry[]] => [n.id, n.files.flatMap((p) => freshEntry(ctx, kind, p) ?? [])])
     .filter(([, entries]) => entries.length > 0);
 }
 
 /** Overview scan coverage: nodes with any scanned own file, and scanned vs total lines. */
-export function scanCoverage(ctx: CollectCtx): ApiOverview["coverage"] {
+export function scanCoverage(ctx: CollectCtx, scan: ScanKind = QUALITY_SCAN): ApiOverview["coverage"] {
   const files = Object.values(ctx.tree.nodes).flatMap((n) => n.files);
   const totalLoc = files.reduce((sum, p) => {
     try {
@@ -275,7 +313,7 @@ export function scanCoverage(ctx: CollectCtx): ApiOverview["coverage"] {
       return sum;
     }
   }, 0);
-  const scanned = scannedNodeEntries(ctx);
+  const scanned = scannedNodeEntries(ctx, scan.kind);
   return {
     scannedNodes: scanned.length,
     totalNodes: Object.keys(ctx.tree.nodes).length,
@@ -284,35 +322,37 @@ export function scanCoverage(ctx: CollectCtx): ApiOverview["coverage"] {
   };
 }
 
-/** On-demand LLM review results; scoring reads only the cache filled by `scanNode`. */
-export const llmScanPlugin: MetricPlugin = {
-  id: KIND,
-  metrics: [
-    { key: "review_debt", label: "Review debt", unit: "pts", direction: "lower_better", aggregate: "sum", normalizeBy: "scanned_loc" },
-    { key: "scanned_loc", label: "LLM-scanned LOC", unit: "lines", direction: "neutral", aggregate: "sum" },
-  ],
-  async collect(ctx): Promise<MetricValues> {
-    const values: MetricValues = {};
-    for (const [node, entries] of scannedNodeEntries(ctx)) {
-      const items = entries.flatMap((e) => e.findings);
-      values[node] = {
-        review_debt: items.reduce((sum, i) => sum + SEVERITY_WEIGHT[i.severity], 0),
-        scanned_loc: entries.reduce((sum, e) => sum + e.loc, 0),
-      };
-    }
-    return values;
-  },
-  async findings(ctx): Promise<Finding[]> {
-    return scannedNodeEntries(ctx).flatMap(([node, entries]) =>
-      entries
-        .flatMap((e) => e.findings)
-        .map(({ metricEffects, ...item }) => ({
-          ...item,
-          id: sha256(JSON.stringify([KIND, item.file, item.title])).slice(0, 16),
-          node,
-          source: KIND,
-          metricEffects: { ...metricEffects, review_debt: -SEVERITY_WEIGHT[item.severity] },
-        })),
-    );
-  },
-};
+/** On-demand LLM review results of `scan`; scoring reads only the cache filled by `scanNode`. */
+export function scanPlugin(scan: ScanKind): MetricPlugin {
+  const { debt, loc } = scan;
+  return {
+    id: scan.source,
+    metrics: [debt, loc],
+    async collect(ctx): Promise<MetricValues> {
+      const values: MetricValues = {};
+      for (const [node, entries] of scannedNodeEntries(ctx, scan.kind)) {
+        const items = entries.flatMap((e) => e.findings);
+        values[node] = {
+          [debt.key]: items.reduce((sum, i) => sum + SEVERITY_WEIGHT[i.severity], 0),
+          [loc.key]: entries.reduce((sum, e) => sum + e.loc, 0),
+        };
+      }
+      return values;
+    },
+    async findings(ctx): Promise<Finding[]> {
+      return scannedNodeEntries(ctx, scan.kind).flatMap(([node, entries]) =>
+        entries
+          .flatMap((e) => e.findings)
+          .map(({ metricEffects, ...item }) => ({
+            ...item,
+            id: sha256(JSON.stringify([scan.kind, item.file, item.title])).slice(0, 16),
+            node,
+            source: scan.source,
+            metricEffects: { ...metricEffects, [debt.key]: -SEVERITY_WEIGHT[item.severity] },
+          })),
+      );
+    },
+  };
+}
+
+export const llmScanPlugin = scanPlugin(QUALITY_SCAN);

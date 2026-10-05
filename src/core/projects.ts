@@ -1,5 +1,5 @@
 import type { Db } from "../db.ts";
-import type { Project } from "../types.ts";
+import type { Project, ScorerSpec } from "../types.ts";
 
 /** Id of the built-in Quality project, the default of every project-scoped route and column. */
 export const QUALITY = "quality";
@@ -14,9 +14,38 @@ export const QUALITY_PROJECT: Project = {
   builtin: true,
 };
 
-/** Whether the project is scored (DESIGN "Projects": a non-empty `scorer.plugins`). */
+/** Whether the project is scored by metric plugins (Quality); the CLI scores only these. */
 export function hasScorer(project: Project): boolean {
   return !!project.scorer.plugins?.length;
+}
+
+/** Whether the project has any scorer: plugins, a rubric, a command or a plan (DESIGN "Projects"). */
+export function isScored(project: Project): boolean {
+  const { rubric, command, plan } = project.scorer;
+  return hasScorer(project) || !!rubric?.trim() || !!command?.length || !!plan;
+}
+
+/** Whether subtrees of the project can be scanned: Quality's LLM scan or a rubric. */
+export function isScannable(project: Project): boolean {
+  return hasScorer(project) || !!project.scorer.rubric?.trim();
+}
+
+/**
+ * The `rubric`, `command` and `plan` parts of an untrusted scorer, or an error message.
+ * Blank rubric, empty command and false plan are dropped.
+ */
+export function scorerParts(value: unknown): ScorerSpec | string {
+  if (typeof value !== "object" || value === null || Array.isArray(value)) return "scorer must be an object";
+  const { rubric, command, plan, ...rest } = value as Record<string, unknown>;
+  if (Object.keys(rest).length) return `unknown scorer fields: ${Object.keys(rest).join(", ")}`;
+  if (rubric !== undefined && typeof rubric !== "string") return "scorer.rubric must be a string";
+  if (command !== undefined && !(Array.isArray(command) && command.every((a) => typeof a === "string"))) return "scorer.command must be a list of strings";
+  if (plan !== undefined && typeof plan !== "boolean") return "scorer.plan must be a boolean";
+  return {
+    ...(rubric?.trim() && { rubric: rubric.trim() }),
+    ...(command?.length && { command }),
+    ...(plan && { plan }),
+  };
 }
 
 /** Every project, Quality first, then by creation. */

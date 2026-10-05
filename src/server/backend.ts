@@ -8,6 +8,7 @@ import type {
   NodeId,
   PrState,
   Project,
+  ScorerSpec,
   ServerEvent,
   StartTaskRequest,
   Task,
@@ -21,11 +22,17 @@ export interface WorkerReport {
   phase?: TaskPhase;
   done?: number;
   needs_input?: string;
+  /** Plan tasks: work items, validated by the backend. */
+  items?: unknown;
+  /** Scorer tasks: the proposed scorer, validated by the runner. */
+  scorer?: unknown;
 }
 
 export interface ProjectInput {
   name?: string;
   goal?: string;
+  /** `rubric`, `command` and `plan` replace the project's; see `scorerParts`. */
+  scorer?: ScorerSpec;
 }
 
 /**
@@ -51,6 +58,8 @@ export interface Backend {
   startTask(req: StartTaskRequest): Promise<Task>;
   answer(taskId: string, text: string): Promise<Task>;
   openPr(taskId: string): Promise<Task>;
+  /** Save a `review` scorer task's proposal as its project's scorer, mark it done and rescore. */
+  acceptScorer(taskId: string): Promise<Task>;
   cancel(taskId: string): Promise<Task>;
   /** Message the task's agent; routed by task state (steer, answer or resume). */
   message(taskId: string, text: string): Promise<Task>;

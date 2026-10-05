@@ -61,10 +61,15 @@ interface ProjectDialogProps {
 function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps) {
   const [name, setName] = useState(project?.name ?? "");
   const [goal, setGoal] = useState(project?.goal ?? "");
+  const [rubric, setRubric] = useState(project?.scorer.rubric ?? "");
+  const [command, setCommand] = useState(project?.scorer.command?.join("\n") ?? "");
+  const [plan, setPlan] = useState(!!project?.scorer.plan);
+  const editsScorer = project && !project.builtin;
   const submit = (e: Event) => {
     e.preventDefault();
+    const scorer = { rubric, command: command.split("\n").map((arg) => arg.trim()).filter(Boolean), plan };
     const saved = project
-      ? send<Project>("PATCH", `/api/projects/${encodeURIComponent(project.id)}`, { name, goal })
+      ? send<Project>("PATCH", `/api/projects/${encodeURIComponent(project.id)}`, { name, goal, ...(editsScorer && { scorer }) })
       : send<Project>("POST", "/api/projects", { name, goal });
     saved.then((p) => onDone(p.id), (err: Error) => onError(err.message));
   };
@@ -89,6 +94,32 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
             onInput={(e) => setGoal((e.currentTarget as HTMLTextAreaElement).value)}
           />
         </label>
+        {editsScorer && (
+          <>
+            <label>
+              Rubric
+              <textarea
+                rows={4}
+                value={rubric}
+                placeholder="What an LLM scan should look for, e.g. allocation-heavy hot paths"
+                onInput={(e) => setRubric((e.currentTarget as HTMLTextAreaElement).value)}
+              />
+            </label>
+            <label>
+              Command (one argument per line)
+              <textarea
+                rows={3}
+                value={command}
+                placeholder={"node\n/path/to/score.mjs"}
+                onInput={(e) => setCommand((e.currentTarget as HTMLTextAreaElement).value)}
+              />
+            </label>
+            <label class="inline">
+              <input type="checkbox" checked={plan} onChange={(e) => setPlan((e.currentTarget as HTMLInputElement).checked)} />
+              Plan: score progress on work items
+            </label>
+          </>
+        )}
         <div class="buttons">
           {project && !project.builtin && (
             <button type="button" class="link danger" onClick={remove}>
