@@ -489,3 +489,80 @@ test("chat events that arrive while the transcript loads stay in the pane", UI_T
   await ui.app.waitFor(() => pane().textContent.includes("scenario:hang"), "snapshot merged");
   assert.ok(pane().textContent.includes("sent while loading"), "the live message survives the snapshot");
 });
+
+/** Record the URLs the app writes with `history.replaceState`, for the rest of the test. */
+function recordUrls(t: TestContext): string[] {
+  const urls: string[] = [];
+  Object.assign(globalThis, { location: { search: "", pathname: "/" }, history: { replaceState: (_s: unknown, _t: string, url: string) => urls.push(url) } });
+  t.after(() => {
+    delete (globalThis as { location?: unknown }).location;
+    delete (globalThis as { history?: unknown }).history;
+  });
+  return urls;
+}
+
+test("the project switcher creates a project, switches the view and keeps it in the URL", UI_TIMEOUT, async (t) => {
+  const urls = recordUrls(t);
+  const { app, backend } = await bootUi(t);
+  await app.waitFor(() => app.text().includes("Scan coverage"), "Quality overview");
+  const switcher = () => app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as SmokeDriver["root"] & { value: string };
+  const choose = (value: string) => {
+    switcher().value = value;
+    switcher().dispatch("change");
+  };
+  const type = (tag: string, value: string) => {
+    const field = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0].querySelectorAll((n) => n.localName === tag)[0] as unknown as { value: string; dispatch(t: string): void };
+    field.value = value;
+    field.dispatch("input");
+  };
+
+  choose("__new");
+  await app.waitFor(() => app.text().includes("New project"), "new project dialog");
+  type("input", "Faster startup");
+  type("textarea", "cold start below 1 s");
+  await new Promise((r) => setTimeout(r, 0));
+  app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0].dispatch("submit");
+  await app.waitFor(() => app.text().includes("No scorer yet") && app.text().includes("cold start below 1 s"), "the new project's overview");
+  assert.deepEqual((await backend.listProjects()).map((p) => p.id), ["quality", "faster-startup"]);
+  assert.equal(urls.at(-1), "?project=faster-startup");
+  assert.ok(!app.text().includes("Scan coverage"), "no scorer, no scan coverage");
+
+  const heading = () => app.find((n) => n.localName === "h2")[0]?.textContent;
+  choose("all");
+  await app.waitFor(() => heading() === "All projects" && app.text().includes("Top suggestions"), "cross-project overview");
+  assert.equal(urls.at(-1), "?project=all");
+  assert.ok(app.find((n) => n.getAttribute("class") === "project-tag").some((n) => n.textContent === "Quality"), "items are labelled with their project");
+
+  choose("quality");
+  await app.waitFor(() => heading() === "Quality" && app.text().includes("Scan coverage"), "back to Quality");
+  assert.equal(urls.at(-1), "/");
+});
+
+test("New task here starts a free-form task in the selected project", UI_TIMEOUT, async (t) => {
+  const { app, backend, byClass } = await bootUi(t);
+  const perf = await backend.createProject({ name: "Perf" });
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const switcher = app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as { value: string; dispatch(t: string): void };
+  switcher.value = perf.id;
+  switcher.dispatch("change");
+  await app.waitFor(() => app.text().includes("No scorer yet"), "Perf overview");
+  const state = await backend.getState();
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === state.repo.name)[0].dispatch("click");
+  const newTask = () => app.find((n) => n.localName === "button" && n.textContent === "New task here");
+  await app.waitFor(() => newTask().length === 1, "node panel");
+  assert.ok(!app.text().includes("Scan subtree"), "no scorer, nothing to scan");
+  newTask()[0].dispatch("click");
+  await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
+  const dialog = byClass("dialog")[0];
+  const start = dialog.querySelectorAll((n) => n.localName === "button" && n.textContent === "Start")[0];
+  await new Promise((r) => setTimeout(r, 50));
+  assert.notEqual(start.getAttribute("disabled"), null, "an empty prompt cannot start");
+  const prompt = dialog.querySelectorAll((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  prompt.value = "Profile the startup path. scenario:hang";
+  prompt.dispatch("input");
+  await app.waitFor(() => start.getAttribute("disabled") === null, "Start enabled");
+  dialog.dispatch("submit");
+  const task = await until(async () => (await backend.getState(perf.id)).tasks[0], "the Perf task");
+  assert.equal(task.node, "");
+  assert.match(task.prompt, /^Profile the startup path/);
+});

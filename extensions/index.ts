@@ -11,6 +11,8 @@ import type { ApiNode, ApiOverview, ApiState, NodeId, ServerEvent, Task } from "
 const WIDGET = "techtree";
 const RECONNECT_MS = 5000;
 const DEFAULT_FINDINGS = 10;
+const PROJECT_PARAM = Type.Optional(Type.String({ description: 'techtree project id (default "quality")' }));
+const projectQuery = (project: string | undefined) => `project=${encodeURIComponent(project || "quality")}`;
 
 /** techtree pi extension; see docs/DESIGN.md "pi extension". Its factory starts nothing. */
 export default function techtree(pi: ExtensionAPI): void {
@@ -36,12 +38,13 @@ export default function techtree(pi: ExtensionAPI): void {
     name: "techtree_status",
     label: "techtree status",
     description: "techtree overview of this repository: root quality score, running tasks, items needing attention, web UI URL.",
-    parameters: Type.Object({}),
-    async execute(_id, _params, signal, _onUpdate, ctx) {
+    parameters: Type.Object({ project: PROJECT_PARAM }),
+    async execute(_id, params, signal, _onUpdate, ctx) {
       const { server } = await connect(ctx.cwd);
+      const project = projectQuery(params.project);
       const [state, overview] = await Promise.all([
-        api<ApiState>(server, "/api/state", signal),
-        api<ApiOverview>(server, "/api/overview", signal),
+        api<ApiState>(server, `/api/state?${project}`, signal),
+        api<ApiOverview>(server, `/api/overview?${project}`, signal),
       ]);
       return text(statusReport(server, state, overview));
     },
@@ -56,13 +59,15 @@ export default function techtree(pi: ExtensionAPI): void {
     parameters: Type.Object({
       path: Type.Optional(Type.String({ description: "File or directory, repo-relative or absolute; defaults to the working directory" })),
       limit: Type.Optional(Type.Integer({ minimum: 1, description: `Number of findings (default ${DEFAULT_FINDINGS})` })),
+      project: PROJECT_PARAM,
     }),
     async execute(_id, params, signal, _onUpdate, ctx) {
       const { repoRoot, server } = await connect(ctx.cwd);
       const absolute = params.path ? resolve(repoRoot, params.path) : ctx.cwd;
       let id = nodeIdOf(repoRoot, absolute);
       let node: ApiNode | undefined;
-      while (!(node = await api<ApiNode | undefined>(server, `/api/node?id=${encodeURIComponent(id)}`, signal, true))) {
+      const project = projectQuery(params.project);
+      while (!(node = await api<ApiNode | undefined>(server, `/api/node?id=${encodeURIComponent(id)}&${project}`, signal, true))) {
         if (id === "") throw new Error("techtree has no score for the repository root yet");
         id = parentOf(id);
       }

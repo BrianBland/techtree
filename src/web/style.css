@@ -259,3 +259,7 @@ main { flex: 1; display: flex; min-height: 0; }
   *, *::before, *::after { animation: none !important; transition: none !important; }
   .node .delta { opacity: 1; }
 }
+.project-switcher { color: var(--gold); }
+.project-tag { display: inline-block; margin-right: 6px; padding: 0 4px; font-size: 11px; color: var(--ink); background: var(--accent); }
+.goal { margin: 4px 0 0; color: var(--text); white-space: pre-wrap; }
+button.link.danger { color: var(--bad); margin-right: auto; }

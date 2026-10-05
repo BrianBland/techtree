@@ -12,10 +12,13 @@ export async function get<T>(path: string): Promise<T> {
   return parse<T>(await fetch(path));
 }
 
-export async function post<T>(path: string, body: unknown = {}): Promise<T> {
-  return parse<T>(
-    await fetch(path, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }),
-  );
+/** A mutating request (`POST`, `PATCH`, `DELETE`) with a JSON body, as the server requires. */
+export async function send<T>(method: "POST" | "PATCH" | "DELETE", path: string, body: unknown = {}): Promise<T> {
+  return parse<T>(await fetch(path, { method, headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) }));
+}
+
+export function post<T>(path: string, body: unknown = {}): Promise<T> {
+  return send<T>("POST", path, body);
 }
 
 type Listener = (event: ServerEvent) => void;
