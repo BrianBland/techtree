@@ -168,6 +168,8 @@ export interface Config {
   minLoc: number; // nodes below this inherit their parent's percentile
   workers: number;
   worktreeTemplate: string; // "{home}", "{repo}", "{task}" placeholders
+  baseRef: string; // ref new task worktrees branch from
+  piCommand: string[]; // argv prefix used to spawn pi children, e.g. ["pi"]
   ignore: string[]; // path prefixes or globs excluded from the tree
   plugins: Record<string, Record<string, unknown>>; // per-plugin options
 }

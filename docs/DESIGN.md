@@ -33,7 +33,7 @@ pi extension (techtree)
      └─ PR poller        → gh pr list/view/checks
 ```
 
-There is one server per repo, shared by every pi session in that repo through a lockfile in the cache dir. A second `/techtree` reuses the running server.
+There is one server per repo, shared by every pi session in that repo through a lockfile (`server.json`: pid, port, token) in the cache dir. The server runs as a detached Node process (`techtree serve <repo>`) so tasks outlive the pi session that started it; `/techtree` starts it when the lockfile is missing or stale and reuses it otherwise.
 
 ## Data model (contract for all subtasks)
 
@@ -132,6 +132,8 @@ weights: { }          # metric key → composite weight (defaults in src/config.
 minLoc: 200           # smaller nodes inherit their parent's percentile
 workers: 3
 worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}"
+baseRef: HEAD         # ref task worktrees branch from
+piCommand: [pi]       # argv prefix for pi children; env TECHTREE_PI overrides the default
 ignore: [target, node_modules, .git]
 plugins:              # per-plugin options, e.g.
   rust: { }
@@ -156,6 +158,7 @@ All routes are under `/api`, require the token, and return JSON. Payload types a
 | `POST /api/prs/:number/babysit` | body `{ on: boolean }` |
 | `POST /api/score` | rescore the repo |
 | `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree |
+| `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`{plan}`, `{phase}`, `{done}`, `{needs_input}`) |
 
 ## Security
 

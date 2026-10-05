@@ -18,6 +18,8 @@ export const DEFAULT_CONFIG: Config = {
   minLoc: 200,
   workers: 3,
   worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}",
+  baseRef: "HEAD",
+  piCommand: process.env.TECHTREE_PI ? process.env.TECHTREE_PI.split(" ") : ["pi"],
   ignore: ["target", "node_modules", ".git"],
   plugins: {},
 };
