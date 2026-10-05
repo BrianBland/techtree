@@ -2,6 +2,7 @@ import type {
   ApiModels,
   ApiNode,
   ApiOverview,
+  ApiSource,
   ApiState,
   NodeId,
   PrState,
@@ -29,6 +30,8 @@ export interface Backend {
   getOverview(): Promise<ApiOverview>;
   taskLog(taskId: string, tail: number): Promise<string>;
   taskDiff(taskId: string): Promise<string>;
+  /** Lines around `line` of repo file `path` at the scored commit. */
+  source(path: string, line?: number): Promise<ApiSource>;
   models(): Promise<ApiModels>;
   startTask(req: StartTaskRequest): Promise<Task>;
   answer(taskId: string, text: string): Promise<Task>;

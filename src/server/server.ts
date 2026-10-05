@@ -132,6 +132,7 @@ function apiRoutes(backend: Backend): Route[] {
     get(/^\/api\/overview$/, () => backend.getOverview()),
     get(/^\/api\/tasks\/([^/]+)\/log$/, (_req, url, [id]) => backend.taskLog(id, tailParam(url))),
     get(/^\/api\/tasks\/([^/]+)\/diff$/, (_req, _url, [id]) => backend.taskDiff(id)),
+    get(/^\/api\/source$/, (_req, url) => backend.source(url.searchParams.get("path") ?? "", Number(url.searchParams.get("line")) || undefined)),
     get(/^\/api\/models$/, () => backend.models()),
     post(/^\/api\/tasks$/, async (req) => backend.startTask(startTaskRequest(await readJson(req)))),
     post(/^\/api\/tasks\/([^/]+)\/answer$/, async (req, _url, [id]) => {

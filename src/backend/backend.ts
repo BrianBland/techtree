@@ -1,4 +1,5 @@
-import { execFileSync } from "node:child_process";
+import { execFile, execFileSync } from "node:child_process";
+import { promisify } from "node:util";
 import { readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { nodeCtas, rankCtas } from "../core/cta.ts";
@@ -20,6 +21,7 @@ import type {
   ApiModels,
   ApiNode,
   ApiOverview,
+  ApiSource,
   ApiState,
   Cache,
   CollectCtx,
@@ -207,6 +209,21 @@ export class RepoBackend implements Backend {
     const lines = text.split("\n");
     if (lines.at(-1) === "") lines.pop();
     return tail === 0 ? "" : lines.slice(-tail).join("\n");
+  }
+
+  async source(path: string, line?: number): Promise<ApiSource> {
+    const { sha } = await this.latest();
+    if (!path || path.startsWith("-") || path.startsWith("/") || path.split("/").includes("..")) throw new HttpError(400, "bad path");
+    let text: string;
+    try {
+      ({ stdout: text } = await promisify(execFile)("git", ["show", `${sha}:${path}`], { cwd: this.opts.repoRoot, maxBuffer: 8 * 1024 * 1024 }));
+    } catch {
+      throw new HttpError(404, `no file ${JSON.stringify(path)} at ${sha.slice(0, 8)}`);
+    }
+    const all = text.split("\n");
+    const start = line ? Math.max(1, line - 10) : 1;
+    const end = line ? line + 20 : 30;
+    return { path, startLine: start, lines: all.slice(start - 1, end).map((l) => l.slice(0, 400)) };
   }
 
   async taskDiff(taskId: string): Promise<string> {

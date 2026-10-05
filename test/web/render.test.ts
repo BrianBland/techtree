@@ -130,6 +130,7 @@ function delegate(real: Backend): Backend {
     openPr: (id) => real.openPr(id),
     cancel: (id) => real.cancel(id),
     discard: (id) => real.discard(id),
+    source: (path, line) => real.source(path, line),
     report: (id, report) => real.report(id, report),
     setBabysit: (n, on) => real.setBabysit(n, on),
     rescore: () => real.rescore(),
@@ -222,7 +223,7 @@ test("the UI boots against the server and repo backend, opens nodes and answers 
   await new Promise((r) => setTimeout(r, 0)); // let Preact re-render with the picked model before submitting
   byClass("dialog")[0].dispatch("submit");
   await app.waitFor(() => byClass("dialog").length === 0, "dialog to close");
-  const { tasks } = await backend.getState();
+  const tasks = await tasksAfter(backend, before);
   assert.equal(tasks.length, before + 1);
   assert.equal(tasks.at(-1)!.model, "fake/beta");
 });
@@ -257,6 +258,16 @@ test("the start dialog waits for the model list, so the default model is never s
   assert.equal((await ui.backend.getState()).tasks.at(-1)!.model, "fake/beta");
 });
 
+/** The task list once the dialog's fire-and-forget start has added a task (the dialog closes before the POST resolves). */
+async function tasksAfter(backend: { getState(): Promise<{ tasks: Task[] }> }, before: number): Promise<Task[]> {
+  for (let i = 0; i < 250; i++) {
+    const { tasks } = await backend.getState();
+    if (tasks.length > before) return tasks;
+    await new Promise((r) => setTimeout(r, 20));
+  }
+  return (await backend.getState()).tasks;
+}
+
 test("when the model list fails the start dialog says so and starts on pi's default", UI_TIMEOUT, async (t) => {
   const ui = await bootUi(t, (real) => ({ ...delegate(real), models: () => Promise.reject(new HttpError(503, "backend not attached")) }));
   const { dialog, submitButton } = await openStartDialog(ui);
@@ -265,7 +276,7 @@ test("when the model list fails the start dialog says so and starts on pi's defa
   const before = (await ui.backend.getState()).tasks.length;
   dialog.dispatch("submit");
   await ui.app.waitFor(() => ui.byClass("dialog").length === 0, "dialog to close");
-  const { tasks } = await ui.backend.getState();
+  const tasks = await tasksAfter(ui.backend, before);
   assert.equal(tasks.length, before + 1);
   assert.equal(tasks.at(-1)!.model, undefined);
 });

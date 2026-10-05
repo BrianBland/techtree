@@ -268,35 +268,25 @@ export class TaskRunner {
       return;
     }
     task.state = "running";
-    if (task.pr !== undefined) {
-      void this.launchOnPr(task, task.pr);
-      return;
-    }
-    const { path, branch } = this.worktreeFor(task);
-    try {
-      git(this.opts.repoRoot, "worktree", "add", "-b", branch, path, this.opts.config.baseRef);
-    } catch (err) {
-      this.fail(task, `worktree: ${(err as Error).message}`);
-      return;
-    }
-    this.useWorktree(task, path, branch);
-    this.spawnWorker(task, `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}`);
+    void this.launchNew(task);
   }
 
-  /** Check the PR out without blocking the event loop (gh may be slow), then start the worker if still wanted. */
-  private async launchOnPr(task: Task, pr: number): Promise<void> {
+  /** Create the worktree (and check the PR out for babysit tasks) without blocking the event loop, then start the worker if still wanted. */
+  private async launchNew(task: Task): Promise<void> {
     this.checkingOut.add(task.id);
     this.save(task);
     const { path, branch } = this.worktreeFor(task);
+    const run = promisify(execFile);
     try {
-      git(this.opts.repoRoot, "worktree", "add", "--detach", path, this.opts.config.baseRef);
-      await promisify(execFile)("gh", ["pr", "checkout", String(pr), "--branch", branch], {
-        cwd: path,
-        timeout: PR_CHECKOUT_TIMEOUT_MS,
-      });
+      if (task.pr === undefined) {
+        await run("git", ["worktree", "add", "-b", branch, path, this.opts.config.baseRef], { cwd: this.opts.repoRoot });
+      } else {
+        await run("git", ["worktree", "add", "--detach", path, this.opts.config.baseRef], { cwd: this.opts.repoRoot });
+        await run("gh", ["pr", "checkout", String(task.pr), "--branch", branch], { cwd: path, timeout: PR_CHECKOUT_TIMEOUT_MS });
+      }
     } catch (err) {
       this.checkingOut.delete(task.id);
-      if (task.state === "running") this.fail(task, `worktree: ${(err as Error).message}`);
+      if (task.state === "running" && this.tasks.has(task.id)) this.fail(task, `worktree: ${(err as Error).message}`);
       else this.pump();
       return;
     }
@@ -309,7 +299,7 @@ export class TaskRunner {
     }
     this.useWorktree(task, path, branch);
     if (task.state !== "running" || this.closed) return this.pump();
-    this.spawnWorker(task, task.prompt);
+    this.spawnWorker(task, task.pr === undefined ? `/skill:techtree-worker ${task.prompt}\n\n${finishRule(task)}` : task.prompt);
   }
 
   private worktreeFor(task: Task): { path: string; branch: string } {

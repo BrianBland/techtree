@@ -1,6 +1,6 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { ApiModels, ApiNode, ApiState, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task } from "../types.ts";
+import type { ApiModels, ApiNode, ApiSource, ApiState, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task } from "../types.ts";
 import { get, onServerEvent, post } from "./api.ts";
 import { sparkline, taskCompletion } from "./visual.ts";
 
@@ -342,6 +342,49 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
   );
 }
 
+/** A finding's detail and, when it names a file, the code around it at the scored commit. */
+function FindingPreview({ finding, open }: { finding: Finding; open: boolean }) {
+  const [source, setSource] = useState<ApiSource | "loading" | "failed" | null>(null);
+  const load = () => {
+    if (source !== null || !finding.file) return;
+    setSource("loading");
+    const query = `path=${encodeURIComponent(finding.file)}${finding.line ? `&line=${finding.line}` : ""}`;
+    get<ApiSource>(`/api/source?${query}`).then(setSource, () => setSource("failed"));
+  };
+  useEffect(() => {
+    if (open) load();
+  }, []);
+  return (
+    <details class="preview" open={open} onToggle={(e) => (e.currentTarget as HTMLDetailsElement).open && load()}>
+      <summary>
+        <span class="small muted">{finding.source}</span> {finding.title}
+      </summary>
+      {finding.detail && <p class="small">{finding.detail}</p>}
+      {finding.file && (
+        <div class="small muted">
+          {finding.file}
+          {finding.line ? `:${finding.line}` : ""}
+        </div>
+      )}
+      {source === "loading" && <div class="small muted">Loading code…</div>}
+      {source === "failed" && <div class="small error">Could not load {finding.file}.</div>}
+      {source && typeof source === "object" && (
+        <pre class="code">
+          {source.lines.map((text, i) => {
+            const n = source.startLine + i;
+            return (
+              <div key={n} class={n === finding.line ? "hit" : undefined}>
+                <span class="ln">{n}</span>
+                {text}
+              </div>
+            );
+          })}
+        </pre>
+      )}
+    </details>
+  );
+}
+
 export function StartDialog({
   suggestion,
   findings,
@@ -373,15 +416,20 @@ export function StartDialog({
     e.preventDefault();
     if (modelsLoad === "loading") return;
     const request: StartTaskRequest = { node: suggestion.node, findingIds: suggestion.findingIds, title, prompt, manualReview, ...(model && { model }) };
-    post<Task>("/api/tasks", request).then(
-      onClose,
-      (err: Error) => onError(err.message),
-    );
+    onClose(); // the task appears in the list via its event; errors surface as a notice
+    post<Task>("/api/tasks", request).catch((err: Error) => onError(err.message));
   };
   return (
     <div class="overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
       <form class="dialog" onSubmit={submit}>
         <h3>Start task</h3>
+        {findings.length > 0 && (
+          <div class="previews">
+            {findings.map((f, i) => (
+              <FindingPreview key={f.id} finding={f} open={i === 0} />
+            ))}
+          </div>
+        )}
         <label>
           Title
           <input value={title} onInput={(e) => setTitle((e.currentTarget as HTMLInputElement).value)} />

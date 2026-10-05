@@ -256,3 +256,16 @@ test("the default model is config.defaultModel, else the last model a task used,
   await configured.backend.startTask({ node: "", findingIds: [], prompt: "scenario:hang", manualReview: true, model: "fake/beta" });
   assert.equal((await configured.backend.models()).default, "fake/alpha");
 });
+
+test("source returns lines around a line at the scored commit and rejects bad paths", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t, { "src/many.ts": Array.from({ length: 60 }, (_, i) => `line ${i + 1}`).join("\n") });
+  const { backend } = await boot(t, repo, cache, tmp);
+  const slice = await backend.source("src/many.ts", 30);
+  assert.equal(slice.startLine, 20);
+  assert.equal(slice.lines[10], "line 30");
+  assert.equal(slice.lines.length, 31);
+  assert.equal((await backend.source("src/many.ts")).lines.length, 30);
+  assert.equal(status(await backend.source("../etc/passwd").catch((e) => e)), 400);
+  assert.equal(status(await backend.source("-p").catch((e) => e)), 400);
+  assert.equal(status(await backend.source("nope.ts").catch((e) => e)), 404);
+});

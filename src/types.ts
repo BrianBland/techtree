@@ -146,6 +146,13 @@ export interface Impact {
   root: number; // Δquality at the root
 }
 
+/** A slice of a repo file at the scored commit, for previews. */
+export interface ApiSource {
+  path: string;
+  startLine: number; // 1-based line number of lines[0]
+  lines: string[];
+}
+
 export interface ScoreResult {
   sha: string;
   createdAt: string;
