@@ -18,7 +18,8 @@ export interface TerminalRequest {
 /** Argv that opens a terminal window running `command` in `cwd` (see docs/DESIGN.md "Open in terminal"); undefined when the platform has no default. */
 export function terminalArgv({ template, platform, cwd, command }: TerminalRequest): string[] | undefined {
   if (template?.length) {
-    return template.map((arg) => arg.replaceAll("{cwd}", cwd).replaceAll("{command}", command)).filter((arg) => arg !== "");
+    const values: Record<string, string> = { "{cwd}": cwd, "{command}": command };
+    return template.map((arg) => arg.replace(/\{cwd\}|\{command\}/g, (placeholder) => values[placeholder])).filter((arg) => arg !== "");
   }
   const line = `cd ${shellQuote([cwd])}${command ? ` && ${command}` : ""}`;
   if (platform === "darwin") {

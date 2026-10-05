@@ -110,6 +110,10 @@ const scenarios = {
   timeout: (_message, settle) => timedDialog({ advertised: 100, resolvesAfter: 100, workAfter: 300 }, settle),
   // pi's clock resolves the dialog before the runner's timer would, and the agent settles at once.
   expired: (_message, settle) => timedDialog({ advertised: 60_000, resolvesAfter: 20, workAfter: 0 }, settle),
+  async stubborn() {
+    process.on("SIGTERM", () => {});
+    await report({ plan: ["ignore SIGTERM"] });
+  },
   async late() {
     process.on("SIGTERM", () => {
       emit({ type: "extension_ui_request", id: "late", method: "confirm", title: "Still there?" });

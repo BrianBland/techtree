@@ -438,3 +438,26 @@ test("the chat pane shows the transcript, sends messages to the agent and follow
   const link = pane().querySelectorAll((n) => n.localName === "a" && n.getAttribute("href") === "https://example.com/doc");
   assert.equal(link.length, 1, "URLs in the chat are links");
 });
+
+test("chat events that arrive while the transcript loads stay in the pane", UI_TIMEOUT, async (t) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const ui = await bootUi(t, (real) => ({
+    ...delegate(real),
+    chat: async (id) => {
+      const snapshot = await real.chat(id);
+      await gate;
+      return snapshot;
+    },
+  }));
+  const row = await taskRow(ui, RUNNING_NODE, ui.running.title);
+  row().querySelectorAll((n) => n.localName === "button" && n.textContent === "Chat")[0].dispatch("click");
+  const pane = () => row().querySelectorAll((n) => n.getAttribute("class") === "chat")[0];
+  await ui.app.waitFor(() => pane() !== undefined, "chat pane");
+  await new Promise((r) => setTimeout(r, 50)); // the server has taken its snapshot
+  await ui.backend.message(ui.running.id, "sent while loading");
+  await ui.app.waitFor(() => pane().textContent.includes("sent while loading"), "live message shown");
+  release();
+  await ui.app.waitFor(() => pane().textContent.includes("scenario:hang"), "snapshot merged");
+  assert.ok(pane().textContent.includes("sent while loading"), "the live message survives the snapshot");
+});

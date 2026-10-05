@@ -39,6 +39,12 @@ test("a configured template substitutes {cwd} and {command} and drops elements l
   assert.deepEqual(terminalArgv({ template, platform: "darwin", cwd: "/w", command: "" }), ["wezterm", "start", "--cwd", "/w", "--", "sh", "-c"]);
 });
 
+test("template values are inserted literally, in one pass", () => {
+  assert.deepEqual(terminalArgv({ template: ["t", "{cwd}", "--", "{command}"], platform: "linux", cwd: "/w/a$&b$`c$'{command}", command: "'a$&b' '$1'" }), [
+    "t", "/w/a$&b$`c$'{command}", "--", "'a$&b' '$1'",
+  ]);
+});
+
 test("hostile worktree paths and arguments reach the shell quoted", () => {
   const tmp = realpathSync(mkdtempSync(join(tmpdir(), "techtree-quote-")));
   try {

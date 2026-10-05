@@ -276,12 +276,13 @@ test("open in terminal runs the configured template detached in the worktree; ag
   const record = `require("fs").writeFileSync(${JSON.stringify(out)}, JSON.stringify(process.argv.slice(1)))`;
   const { backend } = await boot(t, repo, cache, tmp, undefined, { terminal: [process.execPath, "-e", record, "{cwd}", "{command}"] });
   assert.equal(status(await backend.openTerminal("nope", "shell").catch((e) => e)), 404);
+  assert.equal(status(await backend.chat("nope").catch((e) => e)), 404);
 
   const task = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:happy", manualReview: true });
   assert.equal(status(await backend.openTerminal(task.id, "agent").catch((e) => e)), 409, "agent mode while the worker is live");
   const reviewed = await until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.state === "review")), "review");
 
-  await backend.openTerminal(task.id, "agent");
+  await until(() => backend.openTerminal(task.id, "agent").then(() => true, (e) => (status(e) === 409 ? undefined : Promise.reject(e))), "the finished worker to exit");
   const [cwd, command] = await until(() => (existsSync(out) ? (JSON.parse(readFileSync(out, "utf8")) as string[]) : undefined), "terminal to run");
   assert.equal(cwd, reviewed.worktree);
   assert.ok(command.startsWith(`'${process.execPath}' '${FAKE_PI}' '--session-dir'`), command);

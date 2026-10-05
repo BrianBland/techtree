@@ -396,13 +396,20 @@ function DiffPane({ task, onError }: { task: Task; onError(message: string): voi
   );
 }
 
+/** The snapshot followed by every shown entry it lacks (events that arrived while it loaded). */
+function mergeChat(snapshot: ChatEntry[], shown: ChatEntry[]): ChatEntry[] {
+  const key = (e: ChatEntry) => `${e.at}\0${e.role}\0${e.text}`;
+  const known = new Set(snapshot.map(key));
+  return [...snapshot, ...shown.filter((e) => !known.has(key(e)))];
+}
+
 function ChatPane({ task, version, onError }: { task: Task; version: number; onError(message: string): void }) {
   const [entries, setEntries] = useState<ChatEntry[]>([]);
   const [text, setText] = useState("");
   const listEl = useRef<HTMLDivElement>(null);
   useEffect(() => {
     let live = true;
-    get<ChatEntry[]>(`/api/tasks/${task.id}/chat`).then((list) => live && setEntries(list), (e: Error) => onError(e.message));
+    get<ChatEntry[]>(`/api/tasks/${task.id}/chat`).then((snapshot) => live && setEntries((shown) => mergeChat(snapshot, shown)), (e: Error) => onError(e.message));
     const unsubscribe = onServerEvent((e) => {
       if (e.type === "chat" && e.taskId === task.id) setEntries((list) => [...list, e.entry]);
     });

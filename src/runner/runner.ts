@@ -43,11 +43,15 @@ interface Worker {
   lastText: string;
   /** Prompts written but not yet acknowledged; an `agent_settled` seen meanwhile predates them. */
   unacknowledgedPrompts: number;
+  /** Prompts written so far; a finish check that started before the latest one is stale. */
+  promptsSent: number;
 }
 
 const PHASES: TaskPhase[] = ["plan", "explore", "edit", "test", "pr"];
 const LIVE_STATES: TaskState[] = ["queued", "running", "needs_input"];
 const RESUMABLE_BY_MESSAGE: TaskState[] = ["review", "failed", "pr_open"];
+const KILL_GRACE_MS = 1_000;
+const FINISH_GRACE_MS = 5_000;
 
 const CONTINUE_PROMPT = "techtree restarted. Continue the task where you left off.";
 const PR_LOOKUP_TIMEOUT_MS = 60_000;
@@ -66,6 +70,8 @@ export class TaskRunner {
   private readonly packageRoot: string;
   /** Tasks holding a worker slot while `gh pr checkout` prepares their worktree. */
   private readonly checkingOut = new Set<string>();
+  /** Stopped workers that have not exited yet, by task; their session is still busy. */
+  private readonly exiting = new Map<string, ChildProcess>();
   private closed = false;
   private recovering = false;
 
@@ -202,9 +208,10 @@ export class TaskRunner {
 
   /** The task's chat transcript, oldest first. */
   chat(taskId: string): ChatEntry[] {
+    const path = this.chatPath(this.require(taskId));
     let text: string;
     try {
-      text = readFileSync(this.chatPath(this.require(taskId)), "utf8");
+      text = readFileSync(path, "utf8");
     } catch {
       return [];
     }
@@ -215,6 +222,7 @@ export class TaskRunner {
   agentCommand(taskId: string): string[] {
     const task = this.require(taskId);
     if (LIVE_STATES.includes(task.state)) throw new Error(`task ${taskId} has a live worker; cancel it first`);
+    if (this.exiting.has(taskId)) throw new Error(`task ${taskId}'s worker is still shutting down; try again in a moment`);
     return [...this.opts.config.piCommand, ...this.sessionArgs(task)];
   }
 
@@ -302,7 +310,7 @@ export class TaskRunner {
     if (this.closed || this.recovering) return;
     for (const task of this.tasks.values()) {
       if (this.workers.size + this.checkingOut.size >= this.opts.config.workers) return;
-      if (task.state === "queued") this.launch(task);
+      if (task.state === "queued" && !this.exiting.has(task.id)) this.launch(task);
     }
   }
 
@@ -399,7 +407,7 @@ export class TaskRunner {
       env: { ...process.env, TECHTREE_URL: this.opts.url, TECHTREE_TOKEN: this.opts.token, TECHTREE_TASK: task.id },
       stdio: ["pipe", "pipe", "pipe"],
     });
-    const worker: Worker = { child, nudged: false, lastText: "", unacknowledgedPrompts: 0 };
+    const worker: Worker = { child, nudged: false, lastText: "", unacknowledgedPrompts: 0, promptsSent: 0 };
     this.workers.set(task.id, worker);
     task.pid = child.pid;
     this.save(task);
@@ -423,6 +431,7 @@ export class TaskRunner {
     this.log(task, `prompt: ${message}`);
     this.chatEntry(task, "user", message);
     worker.unacknowledgedPrompts++;
+    worker.promptsSent++;
     send(worker, { type: "prompt", message, streamingBehavior });
   }
 
@@ -478,11 +487,13 @@ export class TaskRunner {
   }
 
   private async onSettled(task: Task, worker: Worker): Promise<void> {
-    if (task.checklist.length > 0 && task.checklist.every((item) => item.done)) {
-      const prStage = !task.manualReview || task.phase === "pr";
+    if (checklistDone(task)) {
+      const prStage = !task.manualReview || task.phase === "pr" || task.pr !== undefined;
       if (!prStage) return this.stop(task, worker, "review");
+      const promptsSent = worker.promptsSent;
       const pr = (await findPr(task)) ?? prFromText(worker.lastText);
-      if (this.workers.get(task.id) !== worker || task.state !== "running") return;
+      const stale = worker.promptsSent !== promptsSent || !checklistDone(task);
+      if (this.workers.get(task.id) !== worker || task.state !== "running" || stale) return;
       if (pr !== undefined) {
         task.pr = pr;
         return this.stop(task, worker, "pr_open");
@@ -505,6 +516,7 @@ export class TaskRunner {
     task.pid = undefined;
     this.save(task);
     worker.child.stdin?.end();
+    this.awaitExit(task.id, worker.child, FINISH_GRACE_MS);
     this.pump();
   }
 
@@ -526,8 +538,21 @@ export class TaskRunner {
       this.workers.delete(task.id);
       clearDialog(worker);
       worker.child.kill();
+      this.awaitExit(task.id, worker.child, KILL_GRACE_MS);
     }
     task.pid = undefined;
+  }
+
+  /** Keep the task's session busy until `child` exits, SIGKILLing it after `graceMs`. */
+  private awaitExit(taskId: string, child: ChildProcess, graceMs: number): void {
+    if (child.pid === undefined || child.exitCode !== null || child.signalCode !== null) return;
+    this.exiting.set(taskId, child);
+    const timer = setTimeout(() => child.kill("SIGKILL"), graceMs).unref();
+    child.once("exit", () => {
+      clearTimeout(timer);
+      if (this.exiting.get(taskId) === child) this.exiting.delete(taskId);
+      this.pump();
+    });
   }
 
   private baseSha(): string {
@@ -560,6 +585,10 @@ export class TaskRunner {
     appendFileSync(task.logPath!, lines.join("\n") + "\n");
     for (const line of lines) this.opts.onEvent?.({ type: "log", taskId: task.id, line });
   }
+}
+
+function checklistDone(task: Task): boolean {
+  return task.checklist.length > 0 && task.checklist.every((item) => item.done);
 }
 
 function defaultPrompt(title: string, req: StartTaskRequest): string {

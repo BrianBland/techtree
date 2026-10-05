@@ -390,6 +390,18 @@ test("discard stops the worker and deletes worktree, local branch and task; open
   assert.throws(() => h.runner.discard(b.id), /open PR/);
 });
 
+/** `agentCommand` once the task's previous worker has exited. */
+async function sessionFree(h: Harness, id: string): Promise<string[]> {
+  for (;;) {
+    try {
+      return h.runner.agentCommand(id);
+    } catch (err) {
+      if (!/shutting down/.test((err as Error).message)) throw err;
+      await new Promise((r) => setTimeout(r, 10));
+    }
+  }
+}
+
 test("a message to a running task steers its worker, and the chat transcript records the conversation", async (t) => {
   const h = await setup(t);
   const { id } = h.runner.start(req("chat"));
@@ -424,7 +436,7 @@ test("a message resumes a review task on its session, which returns to review", 
   h.runner.message(id, "finish up");
   await h.waitFor(id, (x) => x.state === "review");
 
-  assert.equal(h.runner.message(id, "also finish the docs").state, "running", "resumed at once while a slot is free");
+  assert.notEqual(h.runner.message(id, "also finish the docs").state, "review");
   const again = await h.waitFor(id, (x) => x.state === "review" && h.runner.chat(id).some((e) => e.text === "heard: also finish the docs"));
   assert.match(log(again), /prompt: also finish the docs/);
 });
@@ -466,10 +478,64 @@ test("the interactive agent command resumes the task's session, and is refused w
   const { id } = h.runner.start({ ...req("happy"), model: "fake/beta" });
   assert.throws(() => h.runner.agentCommand(id), /live worker/);
   await h.waitFor(id, (x) => x.state === "review");
-  assert.deepEqual(h.runner.agentCommand(id), [
+  assert.deepEqual(await sessionFree(h, id), [
     process.execPath, FAKE_PI,
     "--session-dir", join(h.cache, "sessions", id),
     "--session-id", id,
     "--model", "fake/beta",
   ]);
+});
+
+test("a PR lookup still running when another message arrives does not finish the task", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("chat", false));
+  const { worktree } = await h.waitFor(id, (x) => x.checklist.length === 1);
+  writeFileSync(join(worktree!, ".fake-pr"), "9\n");
+  process.env.FAKE_GH_DELAY = "0.5";
+  t.after(() => delete process.env.FAKE_GH_DELAY);
+  h.runner.message(id, "finish");
+  await h.waitFor(id, (x) => /agent idle/.test(log(x)));
+  h.runner.message(id, "one more thing");
+  await new Promise((r) => setTimeout(r, 1000));
+  const task = h.runner.get(id)!;
+  assert.equal(task.state, "running", "the stale lookup's PR is ignored");
+  assert.equal(task.pr, undefined);
+  assert.notEqual(task.pid, undefined);
+});
+
+test("a message to a manually reviewed task with an open PR returns it to pr_open", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("happy"));
+  await h.waitFor(id, (x) => x.state === "review");
+  h.runner.openPr(id);
+  await h.waitFor(id, (x) => x.state === "pr_open");
+  h.runner.message(id, "address the review comments");
+  const task = await h.waitFor(id, (x) => (x.state === "pr_open" || x.state === "review") && log(x).includes("prompt: address the review comments") && x.pid === undefined);
+  assert.equal(task.state, "pr_open");
+  assert.equal(task.pr, 42);
+});
+
+test("a cancelled worker's session stays busy until the worker has exited", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("late"));
+  const { pid } = await h.waitFor(id, (x) => x.checklist.length === 1);
+  h.runner.cancel(id);
+  assert.throws(() => h.runner.agentCommand(id), /shutting down/);
+  await processGone(pid!);
+  assert.ok((await sessionFree(h, id)).includes(id));
+});
+
+test("a worker that ignores SIGTERM is killed after a second", async (t) => {
+  const h = await setup(t);
+  const { id } = h.runner.start(req("stubborn"));
+  const { pid } = await h.waitFor(id, (x) => x.checklist.length === 1);
+  const started = Date.now();
+  h.runner.cancel(id);
+  await processGone(pid!);
+  assert.ok(Date.now() - started < 3000, `gone after ${Date.now() - started} ms`);
+});
+
+test("the chat transcript of an unknown task is an error, not an empty list", async (t) => {
+  const h = await setup(t);
+  assert.throws(() => h.runner.chat("nope"), /unknown task/);
 });

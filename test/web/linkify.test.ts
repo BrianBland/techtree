@@ -45,3 +45,9 @@ test("markup in the text stays text and never becomes part of a link", () => {
   ]);
   assert.deepEqual(pieces("javascript:alert(1)"), ["javascript:alert(1)"]);
 });
+
+test("trimming a URL ending in thousands of unmatched brackets stays fast", () => {
+  const started = performance.now();
+  assert.deepEqual(pieces(`https://example.com/${")".repeat(50_000)}`), [["https://example.com/", "https://example.com/"], ")".repeat(50_000)]);
+  assert.ok(performance.now() - started < 200, `${performance.now() - started} ms`);
+});

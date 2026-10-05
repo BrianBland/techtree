@@ -18,13 +18,17 @@ export function linkify(text: string): ComponentChild[] {
   return pieces;
 }
 
-/** Drop trailing punctuation and closing brackets whose opener is not part of the URL. */
+/** Drop trailing punctuation and closing brackets whose opener is not part of the URL, in one pass. */
 function trimUrl(url: string): string {
-  for (;;) {
-    const last = url.at(-1)!;
+  const counts: Record<string, number> = { "(": 0, ")": 0, "[": 0, "]": 0 };
+  for (const char of url) if (char in counts) counts[char]++;
+  let end = url.length;
+  while (end > 0) {
+    const last = url[end - 1];
     const opener = CLOSERS[last];
-    const unbalanced = opener !== undefined && url.split(opener).length <= url.split(last).length - 1;
-    if (!TRAILING_PUNCTUATION.test(url) && !unbalanced) return url;
-    url = url.slice(0, -1);
+    if (opener !== undefined && counts[opener] < counts[last]) counts[last]--;
+    else if (!TRAILING_PUNCTUATION.test(last)) break;
+    end--;
   }
+  return url.slice(0, end);
 }
