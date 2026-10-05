@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, watch, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -11,10 +11,14 @@ export interface ServerInfo {
   token: string;
   url: string;
   version: string;
+  /** `dist/build-id` the server started with; absent for servers older than build ids. */
+  build?: string;
 }
 
 const HEALTH_TIMEOUT_MS = 2000;
 const LAUNCH_TIMEOUT_MS = 30_000;
+const STOP_TIMEOUT_MS = 15_000;
+const BUILD_POLL_MS = 5000;
 
 /** Root of this package (holds `package.json`, `dist/`, `extensions/`, `skills/`). */
 export const PACKAGE_ROOT = findPackageRoot(fileURLToPath(new URL(".", import.meta.url)));
@@ -26,6 +30,44 @@ function findPackageRoot(dir: string): string {
 }
 
 export const lockPath = (cacheDir: string) => join(cacheDir, "server.json");
+
+/** The built package: `dist/` (`TECHTREE_DIST` overrides it, for tests). */
+export const distDir = () => process.env.TECHTREE_DIST || join(PACKAGE_ROOT, "dist");
+
+/** The id of the complete build in `dist/`, or undefined while there is none (see DESIGN "Server lifecycle"). */
+export function currentBuild(): string | undefined {
+  const dist = distDir();
+  if (!existsSync(join(dist, "cli.js")) || !existsSync(join(dist, "web", "app.js"))) return undefined;
+  try {
+    return readFileSync(join(dist, "build-id"), "utf8").trim() || undefined;
+  } catch {
+    return undefined;
+  }
+}
+
+/** Call `onBuild` once, when a complete build other than `started` appears in `dist/`. Returns the stop function. */
+export function watchBuild(started: string | undefined, onBuild: (build: string) => void): () => void {
+  let fired = false;
+  const check = () => {
+    const build = currentBuild();
+    if (fired || !build || build === started) return;
+    fired = true;
+    stop();
+    onBuild(build);
+  };
+  const poll = setInterval(check, BUILD_POLL_MS).unref();
+  let watcher: ReturnType<typeof watch> | undefined;
+  try {
+    watcher = watch(distDir(), check).unref();
+  } catch {
+    // no dist/ yet: the poll covers it
+  }
+  const stop = () => {
+    clearInterval(poll);
+    watcher?.close();
+  };
+  return stop;
+}
 
 export function packageVersion(): string {
   return (JSON.parse(readFileSync(join(PACKAGE_ROOT, "package.json"), "utf8")) as { version: string }).version;
@@ -78,19 +120,66 @@ export interface LaunchOptions {
   timeoutMs?: number;
 }
 
-/** Reuse the repo's live server or start a detached `techtree serve` and wait for it. */
+/** Reuse the repo's live server (restarting it when built from another build) or start a detached `techtree serve` and wait for it. */
 export async function ensureServer(repoRoot: string, cacheDir: string, opts: LaunchOptions = {}): Promise<ServerInfo> {
   const live = await liveServer(cacheDir);
-  if (live) return live;
-  const cli = opts.cli ?? ensureBuilt();
+  if (!live) return launch(repoRoot, cacheDir, opts);
+  const build = currentBuild();
+  return build && live.build !== build ? restartServer(repoRoot, cacheDir, opts) : live;
+}
+
+/** Stop the repo's live server and start a new one on the same port and token (or a fresh one when none is live). */
+export async function restartServer(repoRoot: string, cacheDir: string, opts: LaunchOptions = {}): Promise<ServerInfo> {
+  const live = await liveServer(cacheDir);
+  if (live) await terminate(live.pid);
+  return launch(repoRoot, cacheDir, opts, live);
+}
+
+/** `techtree stop`: stop the live server and wait for it to exit, or clear a stale lockfile. Returns a message. */
+export async function stopServer(cacheDir: string): Promise<string> {
+  const live = await liveServer(cacheDir);
+  if (live) {
+    await terminate(live.pid);
+    return `stopped techtree server (pid ${live.pid})`;
+  }
+  const stale = readLock(cacheDir);
+  if (!stale) return "no techtree server running";
+  removeLock(cacheDir, stale.pid);
+  return `removed stale ${lockPath(cacheDir)}`;
+}
+
+/** SIGTERM `pid` and wait for it to exit, escalating to SIGKILL after 15 s. */
+async function terminate(pid: number): Promise<void> {
+  process.kill(pid, "SIGTERM");
+  let deadline = Date.now() + STOP_TIMEOUT_MS;
+  while (pidAlive(pid)) {
+    if (Date.now() > deadline) {
+      process.kill(pid, "SIGKILL");
+      deadline = Infinity;
+    }
+    await sleep(50);
+  }
+}
+
+/**
+ * Spawn a detached `serve` with output appended to `server.log`, on `reuse`'s port and token when given.
+ * Called by a handing-over server too, which is why it does not wait.
+ */
+export function spawnServer(cli: string, repoRoot: string, cacheDir: string, reuse?: Pick<ServerInfo, "port" | "token">): void {
   const logPath = join(cacheDir, "server.log");
   const log = openSync(logPath, "a", 0o600);
   chmodSync(logPath, 0o600); // the log holds the token-bearing URL; also tighten a log created by an older version
+  const args = [cli, "serve", repoRoot, ...(reuse ? ["--port", String(reuse.port)] : [])];
+  const env = reuse ? { ...process.env, TECHTREE_TOKEN: reuse.token } : process.env;
   try {
-    spawn(process.execPath, [cli, "serve", repoRoot], { detached: true, stdio: ["ignore", log, log], cwd: repoRoot }).unref();
+    spawn(process.execPath, args, { detached: true, stdio: ["ignore", log, log], cwd: repoRoot, env }).unref();
   } finally {
     closeSync(log);
   }
+}
+
+async function launch(repoRoot: string, cacheDir: string, opts: LaunchOptions, reuse?: ServerInfo): Promise<ServerInfo> {
+  spawnServer(opts.cli ?? ensureBuilt(), repoRoot, cacheDir, reuse);
   const deadline = Date.now() + (opts.timeoutMs ?? LAUNCH_TIMEOUT_MS);
   while (Date.now() < deadline) {
     await sleep(100);
@@ -102,8 +191,8 @@ export async function ensureServer(repoRoot: string, cacheDir: string, opts: Lau
 
 /** Path of `dist/cli.js`, building the package first when it or the web UI is missing. */
 function ensureBuilt(): string {
-  const cli = join(PACKAGE_ROOT, "dist", "cli.js");
-  if (existsSync(cli) && existsSync(join(PACKAGE_ROOT, "dist", "web", "app.js"))) return cli;
+  const cli = join(distDir(), "cli.js");
+  if (existsSync(cli) && existsSync(join(distDir(), "web", "app.js"))) return cli;
   if (!existsSync(join(PACKAGE_ROOT, "node_modules", "esbuild"))) {
     throw new Error(`techtree is not built and esbuild is missing; run \`npm install && npm run build\` in ${PACKAGE_ROOT}`);
   }

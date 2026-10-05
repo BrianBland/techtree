@@ -43,11 +43,22 @@ export function onReconnect(listener: () => void): () => void {
   return () => reconnectListeners.delete(listener);
 }
 
+const serverBuild = () => get<{ build: string }>("/api/health").then((h) => h.build);
+
+/** Reload the page (same URL) when the server came back running another build, so its UI assets load. */
+async function reloadOnNewBuild(loaded: Promise<string>): Promise<boolean> {
+  const [before, now] = await Promise.all([loaded, serverBuild()]);
+  if (!before || before === now) return false;
+  location.reload();
+  return true;
+}
+
 function openStream(): EventSource {
   const stream = new EventSource("/api/events");
+  const loadedBuild = serverBuild().catch(() => "");
   let opened = false;
-  stream.onopen = () => {
-    if (opened) reconnectListeners.forEach((l) => l());
+  stream.onopen = async () => {
+    if (opened && !(await reloadOnNewBuild(loadedBuild).catch(() => false))) reconnectListeners.forEach((l) => l());
     opened = true;
   };
   stream.onmessage = (message) => {

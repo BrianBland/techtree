@@ -24,7 +24,7 @@ Open source, with no dependency on any specific pi host. It works in plain pi, i
 
 ```
 pi extension (techtree)
- ├─ /techtree command → start server, notify URL
+ ├─ /techtree command → start server, notify URL, open it in the default browser
  ├─ tools: techtree_status, techtree_findings, techtree_report (worker progress)
  └─ server (node:http, localhost, random port, token in URL)
      ├─ REST + SSE API  ←→  web UI (Preact/SVG)
@@ -33,15 +33,18 @@ pi extension (techtree)
      └─ PR poller        → gh pr list/view/checks
 ```
 
-There is one server per repo, shared by every pi session in that repo through a lockfile (`server.json`: pid, port, token, url, version) in the cache dir. The server runs as a detached Node process (`techtree serve <repo>`) so tasks outlive the pi session that started it; `/techtree` starts it when the lockfile is missing or stale and reuses it otherwise.
+There is one server per repo, shared by every pi session in that repo through a lockfile (`server.json`: pid, port, token, url, version, build) in the cache dir. The server runs as a detached Node process (`techtree serve <repo>`) so tasks outlive the pi session that started it; `/techtree` starts it when the lockfile is missing or stale and reuses it otherwise.
 
 ### Server lifecycle
 
 - **`techtree serve [repo] [--port N]`** (default `.`, random port) starts the server for the repo with the real backend and serves the built UI from `dist/web`, read from disk on every request, so `npm run build` and a page reload is the UI dev loop. When a live server already exists (see below) it prints that server's URL and exits instead. Otherwise it claims the repo with an exclusive SQLite lock on `<cacheDir>/server.lock` (released by the OS when the process dies, so a crash leaves no stale claim); a process that loses the claim waits up to 30 s for the winner to become live, prints its URL and exits, so concurrent launches yield one server. The owner listens, writes `<cacheDir>/server.json` atomically (temp file + rename), prints the URL, and stays in the foreground. On SIGINT/SIGTERM or idle exit it removes `server.json` (only if it still names its own pid), detaches from task workers, aborts running scans and waits for their pi children to exit, then releases the claim and exits.
 - **Idle exit:** the server exits after 2 hours (`TECHTREE_IDLE_MS` overrides) with no API request, no SSE client, no task with a live worker or waiting in the queue (`queued`, `running`, `needs_input`) and no scoring or scan in progress.
-- **`techtree stop [repo]`** sends SIGTERM to the pid in `server.json` when that server is live, and removes a stale `server.json`.
+- **`techtree stop [repo]`** sends SIGTERM to the pid in `server.json` when that server is live and waits up to 15 s for it to exit (then SIGKILL), so a following start never races the old server's lockfile; it removes a stale `server.json`.
+- **Build id:** `npm run build` writes `dist/build-id` (a fresh random id) after `dist/cli.js` and `dist/web/`. The server records the id it started with in `server.json` (`build`). A build is *complete* when `dist/build-id`, `dist/cli.js` and `dist/web/app.js` all exist.
+- **Auto-update:** the server watches `dist/` (`fs.watch` plus a 5 s poll). When `dist/build-id` differs from its own and the build is complete, it waits until no scoring run or LLM scan is in progress (at most 10 minutes, then proceeds), logs the handover to `server.log`, shuts down as on SIGTERM, and spawns its replacement detached on the **same port and token** (`serve --port <port>`, token passed in the `TECHTREE_TOKEN` environment variable, which `serve` consumes and removes from its environment), so open pages and URLs keep working. Tasks resume as on any restart.
+- **Restart** (same port and token): stop the live server as `techtree stop` does, then spawn `serve --port <port>` with its token. Used by `/techtree restart` and by Launch on a build mismatch.
 - **Live server:** `server.json` exists, its pid is alive, and `GET /api/health` on its port answers 200 within 2 s. Anything else is stale.
-- **Launch** (`/techtree` and the extension tools): reuse a live server; otherwise spawn `node <package>/dist/cli.js serve <repo>` detached, with stdout and stderr appended to `<cacheDir>/server.log` (mode 0600, also enforced on an existing log, because it holds the token-bearing URL), and wait up to 30 s for a live server. If `dist/cli.js` or `dist/web` is missing, the launcher builds the package first (`node build.mjs`) and fails with an error naming the missing `esbuild` dev dependency when it is not installed.
+- **Launch** (`/techtree` and the extension tools): reuse a live server, restarting it (see Restart) when its `build` differs from the current complete `dist/build-id` (covers servers that missed the watch; no restart when there is no `dist/build-id`); otherwise spawn `node <package>/dist/cli.js serve <repo>` detached, with stdout and stderr appended to `<cacheDir>/server.log` (mode 0600, also enforced on an existing log, because it holds the token-bearing URL), and wait up to 30 s for a live server. If `dist/cli.js` or `dist/web` is missing, the launcher builds the package first (`node build.mjs`) and fails with an error naming the missing `esbuild` dev dependency when it is not installed.
 
 ### Backend (`src/backend/`)
 
@@ -61,7 +64,11 @@ There is one server per repo, shared by every pi session in that repo through a 
 It is `index.ts` so that both `-e <package>/extensions` (a directory loads its `index.ts`) and the package manifest's `./extensions` discovery find it. pi loads the TypeScript directly through jiti; it imports modules from `src/`, and only the server it launches runs from `dist/`. Its factory starts nothing.
 
 - **In worker children** (`TECHTREE_TASK` set) it registers only `techtree_report` and never starts a server.
-- **`/techtree`** launches or reuses the server and shows the URL: a `warning` notify (delivered by every UI host, including RPC hosts that drop background `info` notifies), and on stdout in print mode, where notifies have no channel. It then starts the status widget.
+- **`/techtree`** launches or reuses the server and shows the URL: a `warning` notify (delivered by every UI host, including RPC hosts that drop background `info` notifies), and on stdout in print mode, where notifies have no channel. Outside print mode it also opens the URL in the OS default browser (detached, errors ignored: `open <url>` on macOS, `cmd /c start "" <url>` on Windows, else `xdg-open <url>`) unless config `openBrowser` is false. It then starts the status widget. Subcommands (offered as argument completions):
+  - `/techtree url`: show the URL without opening the browser.
+  - `/techtree stop`: stop this repo's server (as `techtree stop`) and notify the result.
+  - `/techtree restart`: restart the server on the same port and token (see "Server lifecycle"), then behave like `/techtree`.
+  - anything else is an error naming the subcommands.
 - **Status widget** (`setWidget` key `techtree`): one line, `techtree: <n> running · <m> need attention · <url>`, fed by one `GET /api/state` and then the `/api/events` stream (refetching state on reconnect). It stops on `session_shutdown`.
 - **Tools:** `techtree_status` (`{ project? }`: root quality, running tasks, attention tasks and flagged PRs, URL) and `techtree_findings` (`{ path?, limit?, project? }`: top findings by impact for the deepest node containing `path`, a repo-relative or absolute file or directory defaulting to the working directory; limit 10). `project` defaults to `quality`. Both launch the server when needed.
 
@@ -423,6 +430,7 @@ baseRef: HEAD         # ref task worktrees branch from
 piCommand: [pi]       # user config only. argv prefix for pi children; env TECHTREE_PI (one executable path, may contain spaces) overrides the default
 piLoadsExtension: false # user config only. true when pi already loads techtree's extension (installed in pi's extensions dir); workers then get no `-e` flag, for hosts that reject it
 terminal: []          # user config only. argv template for "Open in terminal", e.g. [open, -a, iTerm, "{cwd}"]; {cwd}, {command}; empty = platform default
+openBrowser: true     # /techtree opens the UI in the default browser
 defaultModel: ""      # provider/model prefilled in the start dialog; empty = last used, else pi's default
 ignore: [target, node_modules, .git]
 plugins:              # per-plugin options, e.g.
@@ -435,7 +443,7 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 
 | Route | Result |
 |---|---|
-| `GET /api/health` | `{ version }`; the only route that needs no token |
+| `GET /api/health` | `{ version, build }` (`build`: the server's build id, `""` when unknown); the only route that needs no token. The web UI reads it when it loads and again whenever the event stream reconnects, and reloads itself (same URL) when the build changed, so a new server's UI assets load |
 | `GET /api/projects` | `Project[]`, Quality first, then by creation |
 | `POST /api/projects` | body `{ name, goal? }` → the new custom `Project` (empty scorer); 400 for an empty name |
 | `PATCH /api/projects/:id` | body `{ name?, goal? }` → `Project` (an empty goal removes it) |

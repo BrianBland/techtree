@@ -48,6 +48,17 @@ export function withCacheHome(t: TestContext, cache: string): void {
   });
 }
 
+/** Set (or with `undefined`, unset) an environment variable for the rest of the test. */
+export function withEnv(t: TestContext, name: string, value: string | undefined): void {
+  const previous = process.env[name];
+  if (value === undefined) delete process.env[name];
+  else process.env[name] = value;
+  t.after(() => {
+    if (previous === undefined) delete process.env[name];
+    else process.env[name] = previous;
+  });
+}
+
 export async function until<T>(probe: () => T | undefined | Promise<T | undefined>, what: string, timeoutMs = 15_000): Promise<T> {
   const deadline = Date.now() + timeoutMs;
   while (Date.now() < deadline) {

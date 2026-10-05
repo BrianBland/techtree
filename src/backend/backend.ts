@@ -164,12 +164,12 @@ export class RepoBackend implements Backend {
 
   /** Whether anything should keep the server alive: SSE clients, live or queued tasks, scoring or scans. */
   busy(): boolean {
-    return (
-      this.listeners.size > 0 ||
-      this.scoring !== undefined ||
-      this.scanning.size > 0 ||
-      this.runner().list().some((t) => LIVE_STATES.includes(t.state))
-    );
+    return this.listeners.size > 0 || this.analyzing() || this.runner().list().some((t) => LIVE_STATES.includes(t.state));
+  }
+
+  /** Whether a scoring run or LLM scan is in progress (work a restart would lose, unlike tasks, which resume). */
+  analyzing(): boolean {
+    return this.scoring !== undefined || this.scanning.size > 0;
   }
 
   /** Resolves once the scoring run in progress (if any) has finished. */

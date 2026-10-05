@@ -1,9 +1,11 @@
+import { spawn } from "node:child_process";
 import { statSync } from "node:fs";
 import { dirname, relative, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ensureServer, type ServerInfo } from "../src/backend/launch.ts";
+import { ensureServer, restartServer, stopServer, type ServerInfo } from "../src/backend/launch.ts";
+import { loadConfig } from "../src/config.ts";
 import { cacheDir, repoId, repoRootOf } from "../src/paths.ts";
 import { techtreeReportTool } from "../src/runner/report-tool.ts";
 import type { ApiNode, ApiOverview, ApiState, NodeId, ServerEvent, Task } from "../src/types.ts";
@@ -13,9 +15,26 @@ const RECONNECT_MS = 5000;
 const DEFAULT_FINDINGS = 10;
 const PROJECT_PARAM = Type.Optional(Type.String({ description: 'techtree project id (default "quality")' }));
 const projectQuery = (project: string | undefined) => `project=${encodeURIComponent(project || "quality")}`;
+const SUBCOMMANDS = [
+  { value: "url", label: "url", description: "show the URL without opening the browser" },
+  { value: "stop", label: "stop", description: "stop this repository's server" },
+  { value: "restart", label: "restart", description: "restart the server (same URL) and open it" },
+];
 
-/** techtree pi extension; see docs/DESIGN.md "pi extension". Its factory starts nothing. */
-export default function techtree(pi: ExtensionAPI): void {
+/** Open `url` in the OS default browser, detached, ignoring failures. */
+function openInBrowser(url: string): void {
+  const [command, ...args] =
+    process.platform === "darwin" ? ["open", url] : process.platform === "win32" ? ["cmd", "/c", "start", "", url] : ["xdg-open", url];
+  const child = spawn(command, args, { detached: true, stdio: "ignore" });
+  child.on("error", () => {});
+  child.unref();
+}
+
+/**
+ * techtree pi extension; see docs/DESIGN.md "pi extension". Its factory starts nothing.
+ * `openUrl` replaces the browser opener (tests).
+ */
+export default function techtree(pi: ExtensionAPI, openUrl: (url: string) => void = openInBrowser): void {
   if (process.env.TECHTREE_TASK) {
     pi.registerTool(techtreeReportTool);
     return;
@@ -23,11 +42,24 @@ export default function techtree(pi: ExtensionAPI): void {
   let widget: AbortController | undefined;
 
   pi.registerCommand("techtree", {
-    description: "Open the techtree web UI for this repository (starts its server if needed)",
-    handler: async (_args, ctx) => {
-      const { server } = await connect(ctx.cwd);
+    description: "Open the techtree web UI for this repository (starts its server if needed); url | stop | restart",
+    getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.value.startsWith(prefix.trim())),
+    handler: async (args, ctx) => {
+      const subcommand = args.trim();
+      if (subcommand && !SUBCOMMANDS.some((s) => s.value === subcommand)) {
+        throw new Error(`techtree: unknown subcommand ${JSON.stringify(subcommand)}; use url, stop, restart or nothing`);
+      }
+      const repoRoot = repoRootIn(ctx.cwd);
+      const dir = cacheDir(repoId(repoRoot));
+      if (subcommand === "stop") {
+        widget?.abort();
+        ctx.ui.notify(`techtree: ${await stopServer(dir)}`, "warning");
+        return;
+      }
+      const server = subcommand === "restart" ? await restartServer(repoRoot, dir) : await ensureServer(repoRoot, dir);
       ctx.ui.notify(`techtree: ${server.url}`, "warning");
       if (ctx.mode === "print") process.stdout.write(`${server.url}\n`);
+      else if (subcommand !== "url" && loadConfig(repoRoot).openBrowser !== false) openUrl(server.url);
       widget?.abort();
       widget = new AbortController();
       void runWidget(ctx, server, widget.signal);
@@ -81,13 +113,16 @@ export default function techtree(pi: ExtensionAPI): void {
   });
 }
 
-async function connect(cwd: string): Promise<{ repoRoot: string; server: ServerInfo }> {
-  let repoRoot: string;
+function repoRootIn(cwd: string): string {
   try {
-    repoRoot = repoRootOf(cwd);
+    return repoRootOf(cwd);
   } catch {
     throw new Error(`techtree: ${cwd} is not inside a git repository`);
   }
+}
+
+async function connect(cwd: string): Promise<{ repoRoot: string; server: ServerInfo }> {
+  const repoRoot = repoRootIn(cwd);
   return { repoRoot, server: await ensureServer(repoRoot, cacheDir(repoId(repoRoot))) };
 }
 

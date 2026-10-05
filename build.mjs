@@ -1,4 +1,5 @@
-import { copyFileSync } from "node:fs";
+import { randomUUID } from "node:crypto";
+import { copyFileSync, writeFileSync } from "node:fs";
 import { build } from "esbuild";
 
 const watch = process.argv.includes("--watch");
@@ -28,3 +29,5 @@ await Promise.all([
 ]);
 
 for (const file of ["index.html", "style.css"]) copyFileSync(`src/web/${file}`, `dist/web/${file}`);
+// Written last: running servers hand over to a new build once its id appears (DESIGN "Server lifecycle").
+writeFileSync("dist/build-id", `${randomUUID()}\n`);

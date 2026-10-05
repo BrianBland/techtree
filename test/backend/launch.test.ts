@@ -1,8 +1,8 @@
-import { test } from "node:test";
+import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, spawnSync } from "node:child_process";
 import { createServer } from "node:http";
-import { existsSync, mkdirSync, mkdtempSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, statSync, writeFileSync } from "node:fs";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -11,20 +11,20 @@ import { stopServer } from "../../src/backend/serve.ts";
 import { cacheDir, repoId } from "../../src/paths.ts";
 import type { Backend } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
-import { CLI, fixture, until, withCacheHome } from "./helpers.ts";
+import { CLI, fixture, until, withCacheHome, withEnv } from "./helpers.ts";
 
 const lock = (over: Partial<ServerInfo>): ServerInfo => ({ pid: process.pid, port: 1, token: "t", url: "u", version: "0", ...over });
 
-test("/api/health answers without a token and reveals only the version", { timeout: 30_000 }, async (t) => {
+test("/api/health answers without a token and reveals only the version and build", { timeout: 30_000 }, async (t) => {
   const staticDir = mkdtempSync(join(tmpdir(), "techtree-health-"));
-  const server = await startServer({ backend: {} as Backend, staticDir, version: "9.9.9" });
+  const server = await startServer({ backend: {} as Backend, staticDir, version: "9.9.9", build: "b1" });
   t.after(async () => {
     await server.close();
     rmSync(staticDir, { recursive: true, force: true });
   });
   const res = await fetch(`http://127.0.0.1:${server.port}/api/health`);
   assert.equal(res.status, 200);
-  assert.deepEqual(await res.json(), { version: "9.9.9" });
+  assert.deepEqual(await res.json(), { version: "9.9.9", build: "b1" });
   assert.equal((await fetch(`http://127.0.0.1:${server.port}/api/state`)).status, 401);
 });
 
@@ -73,7 +73,7 @@ test("ensureServer starts one detached server, reuses it, replaces a stale one, 
   assert.notEqual(second.pid, first.pid);
 
   assert.match(await stopServer(repo), /stopped/);
-  await until(() => !pidAlive(second.pid), "stopped server to exit");
+  assert.equal(pidAlive(second.pid), false, "stop returns once the server has exited");
   assert.equal(existsSync(lockPath(dir)), false, "a clean exit removes the lockfile");
   assert.equal(await stopServer(repo), "no techtree server running");
 });
@@ -142,4 +142,56 @@ test("the detached server's log, which holds the token URL, is private to the us
   const server = await ensureServer(repo, dir, { cli: CLI });
   t.after(() => pidAlive(server.pid) && process.kill(server.pid, "SIGKILL"));
   assert.equal(statSync(join(dir, "server.log")).mode & 0o777, 0o600);
+});
+
+/** A fake `dist/` (complete build) whose build id the test controls; servers spawned afterwards inherit it via `TECHTREE_DIST`. */
+function fakeDist(t: TestContext, tmp: string, name: string, build: string): string {
+  const dist = join(tmp, name);
+  mkdirSync(join(dist, "web"), { recursive: true });
+  writeFileSync(join(dist, "cli.js"), "");
+  writeFileSync(join(dist, "web", "app.js"), "");
+  writeFileSync(join(dist, "build-id"), build);
+  withEnv(t, "TECHTREE_DIST", dist);
+  return dist;
+}
+
+test("a server hands over to a new build on the same port and token when dist/build-id changes", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  withCacheHome(t, cache);
+  const dir = cacheDir(repoId(repo));
+  const dist = fakeDist(t, tmp, "dist", "one");
+  const pids: number[] = [];
+  t.after(() => pids.forEach((pid) => pidAlive(pid) && process.kill(pid, "SIGKILL")));
+
+  const first = await ensureServer(repo, dir, { cli: CLI });
+  pids.push(first.pid);
+  assert.equal(first.build, "one");
+  writeFileSync(join(dist, "build-id"), "two");
+  const second = await until(async () => {
+    const live = await liveServer(dir);
+    return live?.build === "two" ? live : undefined;
+  }, "the replacement server");
+  pids.push(second.pid);
+  assert.notEqual(second.pid, first.pid);
+  assert.equal(pidAlive(first.pid), false);
+  assert.deepEqual([second.port, second.token, second.url], [first.port, first.token, first.url]);
+  assert.match(readFileSync(join(dir, "server.log"), "utf8"), /handing over/);
+});
+
+test("ensureServer restarts a live server built from another build id, keeping port and token", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  withCacheHome(t, cache);
+  const dir = cacheDir(repoId(repo));
+  const pids: number[] = [];
+  t.after(() => pids.forEach((pid) => pidAlive(pid) && process.kill(pid, "SIGKILL")));
+
+  fakeDist(t, tmp, "dist-a", "a");
+  const old = await ensureServer(repo, dir, { cli: CLI });
+  pids.push(old.pid);
+  fakeDist(t, tmp, "dist-b", "b");
+  const fresh = await ensureServer(repo, dir, { cli: CLI });
+  pids.push(fresh.pid);
+  assert.notEqual(fresh.pid, old.pid);
+  assert.equal(fresh.build, "b");
+  assert.deepEqual([fresh.port, fresh.token], [old.port, old.token]);
 });

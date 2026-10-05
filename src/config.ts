@@ -26,6 +26,7 @@ export const DEFAULT_CONFIG: Config = {
   piCommand: [process.env.TECHTREE_PI || "pi"],
   ignore: ["target", "node_modules", ".git"],
   plugins: {},
+  openBrowser: true,
 };
 
 /** Keys only the user config may set: they choose what techtree executes, so a cloned repo must not. */
