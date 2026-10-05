@@ -300,3 +300,20 @@ test("start polls at once and keeps polling until stopped", async (t) => {
 function flags(pr: PrState | undefined) {
   return { stale: pr?.stale, stuck: pr?.stuck };
 }
+
+test("a combined PR is not linked to its bundled tasks, so babysit works on the PR's own branch", async (t) => {
+  const tasks = [task({ id: "a", pr: 1, bundle: "b1" })];
+  const h = setup(t, { tasks: () => tasks });
+  h.gh.setList([ghPr(1)]);
+  await h.poller.poll();
+  assert.equal(h.poller.get(1)?.taskId, undefined);
+});
+
+test("onPolled runs after every successful poll, not after a failed one", async (t) => {
+  let polled = 0;
+  const h = setup(t, { onPolled: () => polled++ });
+  await h.poller.poll();
+  h.gh.setFail("boom");
+  await h.poller.poll();
+  assert.equal(polled, 1);
+});

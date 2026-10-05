@@ -5,7 +5,7 @@ import { chmodSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
-import { openDb, suppressSqliteWarning } from "../../src/db.ts";
+import { dbCache, openDb, suppressSqliteWarning } from "../../src/db.ts";
 import type { HttpError } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
 import type { Task } from "../../src/types.ts";
@@ -27,7 +27,8 @@ async function boot(t: TestContext) {
   writeFileSync(
     join(bin, "gh"),
     `#!/usr/bin/env node\nrequire("fs").writeFileSync(${JSON.stringify(ghLog)}, JSON.stringify(process.argv.slice(2)));\n` +
-      `if (process.argv[2] === "pr" && process.argv[3] === "create") console.log("https://github.com/o/r/pull/77");\n`,
+      `if (process.argv[2] === "pr" && process.argv[3] === "create") console.log("https://github.com/o/r/pull/77");\n` +
+      `if (process.argv[2] === "pr" && process.argv[3] === "view") { try { console.log(require("fs").readFileSync(${JSON.stringify(join(tmp, "pr-state"))}, "utf8")); } catch { process.exit(1); } }\n`,
   );
   chmodSync(join(bin, "gh"), 0o755);
   const path = process.env.PATH;
@@ -47,7 +48,7 @@ async function boot(t: TestContext) {
     const task = await backend.startTask({ node: "", findingIds: [], prompt, manualReview: true });
     return until(async () => (await backend.getState()).tasks.find((x) => x.id === task.id && x.state === "review"), `${task.id} in review`);
   };
-  return { backend, repo, origin, ghLog, reviewed };
+  return { backend, repo, origin, ghLog, reviewed, tmp, cache };
 }
 
 const status = (err: unknown) => (err as HttpError).status;
@@ -122,4 +123,21 @@ test("dismissed findings drop out of findings and suggestions, survive a rescan,
 
   await backend.undismiss([finding.id]);
   assert.deepEqual((await backend.getNode(node)).findings.map((f) => f.id), [finding.id]);
+});
+
+test("a retired bundle PR settles its tasks on a later poll, even after a failed state lookup", { timeout: 30_000 }, async (t) => {
+  const { backend, reviewed, tmp, cache } = await boot(t);
+  const a = await reviewed("first scenario:happy");
+  await backend.stage(a.id);
+  const bundle = await backend.createBundle({ taskIds: [a.id] });
+  await backend.reconcileBundles();
+  assert.equal((await backend.getState()).tasks[0].state, "pr_open", "an open bundle PR is left alone");
+
+  dbCache(openDb(cache)).set("pr-retired", String(bundle.pr), true);
+  await backend.reconcileBundles();
+  assert.equal((await backend.getState()).tasks[0].state, "pr_open", "a failed gh lookup is retried later");
+
+  writeFileSync(join(tmp, "pr-state"), "MERGED\n");
+  await backend.reconcileBundles();
+  assert.equal((await backend.getState()).tasks[0].state, "done");
 });

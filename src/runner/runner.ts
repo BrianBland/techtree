@@ -228,6 +228,7 @@ export class TaskRunner {
   resumeTask(taskId: string, prompt: string): Task {
     const task = this.require(taskId);
     if (task.state !== "pr_open" || !task.worktree) throw new Error(`task ${taskId} is ${task.state}, not pr_open with a worktree`);
+    refuseBundled(task);
     this.resume(task, prompt);
     return task;
   }
@@ -247,6 +248,7 @@ export class TaskRunner {
     }
     if (!RESUMABLE_BY_MESSAGE.includes(task.state) && task.outcome !== "no_change")
       throw new Error(`task ${taskId} is ${task.state}${task.state === "running" ? " and its worker has not started yet" : ""}`);
+    refuseBundled(task);
     if (!task.worktree) throw new Error(`task ${taskId} has no worktree`);
     if (!this.hasSession(task)) throw new Error(`task ${taskId} has no pi session`);
     Object.assign(task, { error: undefined, outcome: undefined, summary: undefined });
@@ -509,7 +511,7 @@ export class TaskRunner {
     if (record.type === "agent_settled" && worker.unacknowledgedPrompts === 0) {
       // A dialog blocks the agent, so settling proves pi already resolved it (e.g. by its timeout).
       if (worker.dialog) this.dropDialog(task, worker, "dialog resolved without an answer");
-      if (task.state === "running") void this.onSettled(task, worker);
+      if (task.state === "running") this.onSettled(task, worker).catch((err: Error) => this.log(task, `settle failed: ${err.message}`));
     }
   }
 
@@ -538,8 +540,9 @@ export class TaskRunner {
     if (checklistDone(task)) {
       if (task.pr === undefined) {
         const promptsSent = worker.promptsSent;
-        const changed = await this.hasNetDiff(task);
+        const changed = await this.hasNetDiff(task).catch((err: Error) => err);
         if (this.workers.get(task.id) !== worker || task.state !== "running" || worker.promptsSent !== promptsSent) return;
+        if (changed instanceof Error) return this.fail(task, `diff check failed: ${changed.message}`);
         if (!changed) return this.stop(task, worker, "done", worker.lastText);
       }
       const prStage = !task.manualReview || task.phase === "pr" || task.pr !== undefined;
@@ -647,6 +650,11 @@ export class TaskRunner {
     appendFileSync(task.logPath!, lines.join("\n") + "\n");
     for (const line of lines) this.opts.onEvent?.({ type: "log", taskId: task.id, line });
   }
+}
+
+/** A bundled task's worktree holds only its own change; follow-up work belongs on the combined PR's branch. */
+function refuseBundled(task: Task): void {
+  if (task.state === "pr_open" && task.bundle) throw new Error(`task ${task.id} is part of combined PR #${task.pr}; work on that PR instead`);
 }
 
 function checklistDone(task: Task): boolean {

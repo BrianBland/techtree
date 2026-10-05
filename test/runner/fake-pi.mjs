@@ -2,7 +2,7 @@
 // `scenario:<name>` in the first prompt. The scenario is kept in a fake session file so a
 // respawn with the same --session-dir/--session-id resumes it, as real pi sessions do.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { techtreeReportTool } from "../../src/runner/report-tool.ts";
 
@@ -141,6 +141,13 @@ const scenarios = {
   async explain(_message, settle) {
     await report({ plan: ["look"] });
     await report({ outcome: "no_change", summary: "Already correct.", dismiss: ["f1"], reason: "false positive" });
+    settle();
+  },
+  // Breaks the worktree's git link before finishing, so the runner's diff check fails.
+  async breakgit(_message, settle) {
+    await report({ plan: ["break"] });
+    rmSync(".git", { force: true });
+    await report({ done: 0 });
     settle();
   },
   // Overwrites README.md with the prompt, so two such tasks conflict.

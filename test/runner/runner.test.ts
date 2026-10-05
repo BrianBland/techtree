@@ -561,3 +561,20 @@ test("the agent can report no_change explicitly and propose dismissing findings"
   assert.equal(done.summary, "Already correct.");
   assert.deepEqual(done.proposedDismiss, { findingIds: ["f1"], reason: "false positive" });
 });
+
+test("a failing no-change diff check fails the task instead of crashing the server", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("breakgit"));
+  const failed = await h.waitFor(task.id, (x) => x.state === "failed");
+  assert.match(failed.error!, /^diff check failed/);
+});
+
+test("a bundled task's agent cannot be resumed on its own branch", async (t) => {
+  const h = await setup(t);
+  const task = h.runner.start(req("happy"));
+  await h.waitFor(task.id, (x) => x.state === "review");
+  h.runner.stage(task.id);
+  h.runner.bundled([task.id], "b1", 77);
+  assert.throws(() => h.runner.message(task.id, "fix CI"), /combined PR/);
+  assert.throws(() => h.runner.resumeTask(task.id, "fix CI"), /combined PR/);
+});

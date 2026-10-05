@@ -98,6 +98,7 @@ export class RepoBackend implements Backend {
   private visibleView?: { from: ScoreResult; dismissedKey: string; result: ScoreResult };
   private scoring?: Promise<void>;
   private rescoreQueued = false;
+  private reconciling = false;
   private scoreError?: string;
   private modelList?: { at: number; models: Promise<string[]> };
 
@@ -157,10 +158,8 @@ export class RepoBackend implements Backend {
       tasks: () => runner.list(),
       onEvent: (event) => this.emit(event),
       onUpdate: (prev, next) => babysitter.onUpdate(prev, next),
-      onRemove: (pr) => {
-        babysitter.onRemove(pr);
-        void this.followBundle(runner, pr.number);
-      },
+      onRemove: (pr) => babysitter.onRemove(pr),
+      onPolled: () => void this.reconcileBundles(),
     });
     const babysitter = new Babysitter({ poller, runner });
     this.opts.prs = { list: () => poller.list(), setBabysit: (n, on) => babysitter.setBabysit(n, on), onEvent: () => () => {} };
@@ -168,16 +167,32 @@ export class RepoBackend implements Backend {
     poller.start();
   }
 
-  /** A bundle's PR left the open list: its tasks follow it (DESIGN "Staging and combined PRs"). */
-  private async followBundle(runner: TaskRunner, number: number): Promise<void> {
-    const bundle = listBundles(this.opts.db).find((b) => b.pr === number);
-    if (!bundle) return;
+  /**
+   * Settle every bundle whose PR is retired (merged or closed) while its tasks are still `pr_open`;
+   * run after each poll, so a missed removal or a failed lookup is retried (DESIGN "Staging and combined PRs").
+   */
+  async reconcileBundles(): Promise<void> {
+    if (this.reconciling) return;
+    this.reconciling = true;
+    try {
+      const runner = this.runner();
+      const pending = listBundles(this.opts.db).filter(
+        (b) => prRetired(this.cache, b.pr) && b.taskIds.some((id) => runner.get(id)?.state === "pr_open"),
+      );
+      for (const bundle of pending) await this.settleBundle(runner, bundle);
+    } finally {
+      this.reconciling = false;
+    }
+  }
+
+  private async settleBundle(runner: TaskRunner, bundle: Bundle): Promise<void> {
     let state: string;
     try {
-      ({ stdout: state } = await promisify(execFile)("gh", ["pr", "view", String(number), "--json", "state", "--jq", ".state"], { cwd: this.opts.repoRoot }));
+      ({ stdout: state } = await promisify(execFile)("gh", ["pr", "view", String(bundle.pr), "--json", "state", "--jq", ".state"], { cwd: this.opts.repoRoot }));
     } catch (err) {
-      return this.opts.log(`bundle PR #${number}: ${errorText(err)}`);
+      return this.opts.log(`bundle PR #${bundle.pr}: ${errorText(err)}`);
     }
+    if (state.trim() === "OPEN") return;
     const merged = state.trim() === "MERGED";
     if (merged) {
       const findingIds = bundle.taskIds.flatMap((id) => runner.get(id)?.findingIds ?? []);
@@ -549,7 +564,8 @@ export class RepoBackend implements Backend {
   }
 
   private withProject(pr: PrState): PrState {
-    return { ...pr, project: (pr.taskId && this.taskRunner?.get(pr.taskId)?.project) || QUALITY };
+    const project = (pr.taskId && this.taskRunner?.get(pr.taskId)?.project) || listBundles(this.opts.db).find((b) => b.pr === pr.number)?.project;
+    return { ...pr, project: project || QUALITY };
   }
 
   private coverage(result: ScoreResult): ApiOverview["coverage"] {
