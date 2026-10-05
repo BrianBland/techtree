@@ -183,6 +183,9 @@ The precise rules the scorer implements:
 ## UI
 
 - **Tree:** left to right, root to deepest directory, as a tidy tree with collapse/expand and zoom/pan. Node size and edge width scale with √weight; the weight metric is selectable (loc, test_count, test_time, …). Node fill comes from the selected score: a single-hue ramp normalized to the repo's range. Siblings are sorted by a selectable key (default: alphabetical).
+  - Layout: each subtree occupies a contiguous vertical band no shorter than its children's bands or its own node, parents are centred on their children, and depth sets the column, so nodes never overlap. Layout depends only on the visible set, the weight metric and the sort; switching the score only recolours.
+  - Initially the tree is expanded breadth-first from the root up to depth 3 while at most 150 nodes are visible; deeper nodes start collapsed. Clicking a node selects it; its +/− handle expands or collapses it.
+  - Score choices: composite or the percentile of any non-neutral metric. Sort choices: name (default), score (best first), weight (largest first). Nodes without a value are drawn in neutral grey.
 - **Overlays:** running tasks appear as a research bar under the node. The bar is solid up to `plannedFrom`, then shows a loading stripe up to `plannedTo` filled to checklist completion, then empty. Its color follows the score ramp. Open PRs appear as a count bubble on the top-right corner of their anchor node. The anchor is the deepest node that contains at least 60% of the PR's changed lines.
 - **Node panel** (on click): composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, running tasks with live log tail, and suggested next tasks. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic) and lets you edit the prompt.
 - **Overview** (no selection): calls to action:
@@ -238,7 +241,7 @@ plugins:              # per-plugin options, e.g.
 
 ## HTTP API
 
-All routes are under `/api`, require the token, and return JSON. Payload types are in `src/types.ts`.
+All routes are under `/api`, require the token, and return JSON (log and diff return `text/plain`). Payload types are in `src/types.ts`. The server (`src/server/server.ts`) only parses, authenticates and routes; every route delegates to one method of the `Backend` interface in `src/server/backend.ts`, which the integration layer implements with the real scorer, runner and poller (`src/server/mock.ts` is a synthetic implementation for UI development: `node src/server/dev.ts`).
 
 | Route | Result |
 |---|---|
@@ -249,17 +252,21 @@ All routes are under `/api`, require the token, and return JSON. Payload types a
 | `GET /api/tasks/:id/log?tail=N` | last N log lines (text) |
 | `GET /api/tasks/:id/diff` | worktree diff against the base (text) |
 | `POST /api/tasks` | body `StartTaskRequest` → `Task` |
-| `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question |
-| `POST /api/tasks/:id/open-pr` | `review` → `pr_open` |
-| `POST /api/tasks/:id/cancel` | stop the child, mark `failed` |
-| `POST /api/prs/:number/babysit` | body `{ on: boolean }` |
-| `POST /api/score` | rescore the repo |
-| `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree |
-| `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`{plan}`, `{phase}`, `{done}`, `{needs_input}`) |
+| `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question → `Task` |
+| `POST /api/tasks/:id/open-pr` | `review` → `pr_open` → `Task` |
+| `POST /api/tasks/:id/cancel` | stop the child, mark `failed` → `Task` |
+| `POST /api/prs/:number/babysit` | body `{ on: boolean }` → `PrState` |
+| `POST /api/score` | rescore the repo → `{ ok: true }`; completion arrives as a `scores` event |
+| `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree → `{ ok: true }`; progress arrives as `scan` events |
+| `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`WorkerReport`: at least one of `plan: string[]`, `phase: TaskPhase`, `done: index`, `needs_input: string`) → `Task` |
+
+Errors are JSON `{ error: string }`: 400 malformed body or parameters, 401 missing or wrong token, 403 foreign `Host`/`Origin` or a non-JSON mutating request, 404 unknown route, node, task or PR, 409 the task is in the wrong state, 413 body over 1 MB, 500 anything else. Backends signal 404/409 by throwing `HttpError`.
+
+The SSE stream sends one `data: <ServerEvent JSON>` message per event and a `: ping` comment every 15 s. It has no replay, so clients refetch `/api/state` (and any open details) whenever the stream reconnects.
 
 ## Security
 
-The server binds 127.0.0.1 only and requires a random token in the URL (cookie after the first request). Every mutating endpoint requires the token. Workers inherit the user's pi configuration and sandbox, and techtree adds no privileges.
+The server binds 127.0.0.1 only and requires a random token on every request, including the static UI. The token is accepted as `?token=` (the server then sets it as an `HttpOnly; SameSite=Strict` cookie `techtree_token_<port>` (named per port because cookies are not port-scoped and each repo has its own server) and redirects page loads to the bare URL), as that cookie, or as `Authorization: Bearer <token>` (used by workers). Requests whose `Host` is not `127.0.0.1:<port>` or `localhost:<port>` are rejected (DNS rebinding). Mutating endpoints are `POST` only, must send `Content-Type: application/json`, and are rejected when an `Origin` header names another origin, so cross-site forms cannot reach them. Workers inherit the user's pi configuration and sandbox, and techtree adds no privileges.
 
 ## Out of scope for v1
 

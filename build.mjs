@@ -1,3 +1,4 @@
+import { copyFileSync } from "node:fs";
 import { build } from "esbuild";
 
 const watch = process.argv.includes("--watch");
@@ -25,3 +26,5 @@ await Promise.all([
     minify: !watch,
   }),
 ]);
+
+for (const file of ["index.html", "style.css"]) copyFileSync(`src/web/${file}`, `dist/web/${file}`);
