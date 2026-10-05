@@ -213,14 +213,15 @@ The precise rules the scorer implements:
 ## UI
 
 - **Tree:** left to right, root to deepest directory, as a tidy tree with collapse/expand and zoom/pan. It should look and feel like a game tech tree and feel alive, not like a plain graph:
+  - **Focus.** The tree renders around a focus node within a visible-node budget (default 150). Initially the focus is the root. Selecting a node makes it the focus: its descendants are expanded breadth-first and get most of the budget; the context around it is kept small — the ancestor path to the root, plus at most a few siblings of the focus and of each ancestor (uncles), nearest first, with the rest folded into a "+N more" stub that selects the parent when clicked. Manual expand/collapse still works within the focused view. Changing focus re-fits the view to the focus subtree (with its context) and animates nodes to their new places.
   - Each node is a pixel-art square tile on a dark board: a 16×16-pixel sprite (crisp edges, no anti-aliasing, chunky frame; crates get a gold frame and tab) whose side scales with √weight between 24 and 64 world units, snapped to multiples of 8. The weight metric is selectable (loc, test_count, test_time, …). Edges are orthogonal elbows whose width scales with √weight.
-  - Tile fill comes from the selected score on a diverging ramp so the worst nodes stand out. The ramp is normalized to the repo's range: t = (score − min) ÷ (max − min) over every node's score for the selected key (0.5 when all are equal). Hue runs red (t = 0) → orange → amber → green → teal (t = 1), with saturation highest at the bad end; unscored nodes are gray. The bottom decile (scores ≤ the ⌈n/10⌉-th lowest of the n scored nodes) visibly pulses.
+  - Tile fill comes from the selected score on a diverging ramp so the worst nodes stand out. The ramp is normalized to the repo's range: t = (score − min) ÷ (max − min) over every node's score for the selected key (0.5 when all are equal). Hue runs red (t = 0) → orange → amber → green → teal (t = 1), with saturation highest at the bad end; unscored nodes are gray. Bad scores stand out through colour alone (saturation and hue), not motion.
   - The tile surfaces more at a glance: a 4×2 grid of stat pips, one per weighted metric (non-neutral, weight > 0, heaviest first, at most 8), each coloured by the node's percentile on the same ramp over a fixed 0..100 range and left dark when the node lacks the metric; plus corner badges for open PRs (top right, red when CI fails), tasks needing input (top left) and own finding count (bottom right).
   - A bar along the tile's bottom shows quality as an XP bar, or the research bar of the node's first running task.
-  - Ambient motion: research bars animate, attention badges and the bottom decile pulse, hot nodes (see "Hot node") shimmer, nodes slide when the layout changes, and after a rescore every node whose selected score changed by at least 0.5 flashes and floats its signed delta. Motion respects `prefers-reduced-motion`.
+  - Motion means work or attention, never score: research bars animate on nodes with running tasks, and nodes that need you (a task in `needs_input` or `review`, a failing/stuck/stale PR) glow and pulse. Nodes slide when the layout changes, and after a rescore every node whose selected score changed by at least 0.5 flashes and floats its signed delta. Motion respects `prefers-reduced-motion`.
   - Siblings are sorted by a selectable key (default: alphabetical).
 - **Overlays:** running tasks appear as a research bar under the node. The bar is solid up to `plannedFrom`, then shows a loading stripe up to `plannedTo` filled to checklist completion, then empty. Its color follows the score ramp. Open PRs appear as a count bubble on the top-right corner of their anchor node. The anchor is the deepest node that contains at least 60% of the PR's changed lines.
-- **Node panel** (on click): first "This node": the node's own calls to action with their actions (answer a question, review the diff and Open PR, babysit toggle, Start a suggested task); then "From children": the top calls to action from its descendants, each labelled with its path relative to the node and selecting that node on click; then composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, and tasks with checklist and live log tail. Suggested tasks appear only as calls to action. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic) and lets you edit the prompt.
+- **Node panel** (on click): first "This node": the node's own calls to action with their actions (answer a question, review the diff and Open PR, babysit toggle, Start a suggested task); then "From children": the top calls to action from its descendants, each labelled with its path relative to the node and selecting that node on click; then composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, and tasks with checklist and live log tail. Suggested tasks appear only as calls to action. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic), lets you edit the prompt, and lets you pick the model from the models pi reports (`GET /api/models`), prepopulated with `config.defaultModel` or, when unset, the last model used in this repo, else pi's own default.
 - **Overview** (no selection): calls to action:
   1. tasks in `needs_input` or `review`
   2. PRs that are failing, stuck (no progress in 24h), or stale (no update in 3 days)
@@ -323,7 +324,8 @@ minLoc: 200           # smaller nodes are unscored
 workers: 3
 worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}"
 baseRef: HEAD         # ref task worktrees branch from
-piCommand: [pi]       # argv prefix for pi children; env TECHTREE_PI overrides the default
+piCommand: [pi]       # argv prefix for pi children; env TECHTREE_PI (one executable path, may contain spaces) overrides the default
+defaultModel: ""      # provider/model prefilled in the start dialog; empty = last used, else pi's default
 ignore: [target, node_modules, .git]
 plugins:              # per-plugin options, e.g.
   rust: { }
@@ -342,7 +344,8 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | `GET /api/events` | SSE stream of `ServerEvent` (including `pr_removed` for merged or closed PRs) |
 | `GET /api/tasks/:id/log?tail=N` | last N log lines (text) |
 | `GET /api/tasks/:id/diff` | worktree diff against the base (text) |
-| `POST /api/tasks` | body `StartTaskRequest` → `Task` |
+| `GET /api/models` | `ApiModels`: `{ default, models }` from the pi CLI's model list (cached), used by the start dialog |
+| `POST /api/tasks` | body `StartTaskRequest` → `Task` (optional `model`, passed to the child as `--model`) |
 | `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question → `Task` |
 | `POST /api/tasks/:id/open-pr` | `review` → `pr_open` → `Task` |
 | `POST /api/tasks/:id/cancel` | stop the child, mark `failed` → `Task` |

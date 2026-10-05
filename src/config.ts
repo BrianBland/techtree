@@ -19,7 +19,7 @@ export const DEFAULT_CONFIG: Config = {
   workers: 3,
   worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}",
   baseRef: "HEAD",
-  piCommand: process.env.TECHTREE_PI ? process.env.TECHTREE_PI.split(" ") : ["pi"],
+  piCommand: [process.env.TECHTREE_PI || "pi"],
   ignore: ["target", "node_modules", ".git"],
   plugins: {},
 };

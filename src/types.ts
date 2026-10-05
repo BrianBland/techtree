@@ -87,6 +87,7 @@ export interface Task {
   findingIds: string[];
   state: TaskState;
   manualReview: boolean;
+  model?: string;
   worktree?: string;
   branch?: string;
   pr?: number;
@@ -175,6 +176,7 @@ export interface Config {
   worktreeTemplate: string; // "{home}", "{repo}", "{task}" placeholders
   baseRef: string; // ref new task worktrees branch from
   piCommand: string[]; // argv prefix used to spawn pi children, e.g. ["pi"]
+  defaultModel?: string; // start-dialog prefill, "provider/id"
   ignore: string[]; // path prefixes or globs excluded from the tree
   plugins: Record<string, Record<string, unknown>>; // per-plugin options
 }
@@ -235,6 +237,12 @@ export interface StartTaskRequest {
   title?: string;
   prompt?: string;
   manualReview: boolean;
+  model?: string; // "provider/id"; omitted = pi's default
+}
+
+export interface ApiModels {
+  default: string | null; // prefill for the start dialog
+  models: string[]; // "provider/id"
 }
 
 export type ServerEvent =
