@@ -31,7 +31,7 @@ export function script(path: string, body: string): void {
 
 /** Directory tree of `root` (skipping .git and target), every node kind "dir". */
 export function buildTree(root: string): Tree {
-  const tree: Tree = { repoRoot: root, nodes: {} };
+  const tree: Tree = { repoRoot: root, nodes: Object.create(null) };
   const walk = (id: string, parent: string | null) => {
     const node = { id, name: id === "" ? "root" : posix.basename(id), kind: "dir", parent, children: [] as string[], files: [] as string[] };
     tree.nodes[id] = node;

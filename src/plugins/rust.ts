@@ -2,6 +2,7 @@ import { createHash } from "node:crypto";
 import { readdirSync, readFileSync, realpathSync } from "node:fs";
 import { isAbsolute, join, posix, relative, resolve } from "node:path";
 import type { CollectCtx, Effort, Finding, MetricPlugin, MetricValues, NodeId, Tree } from "../types.ts";
+import { dict } from "../core/tree.ts";
 import { findingId, nodeOfFile, readSource, run, treeFiles } from "./util/source.ts";
 
 type FileKind = "src" | "test" | "aux";
@@ -13,6 +14,7 @@ interface FileStats {
   pubFns: string[];
   branches: number;
   unwraps: number;
+  unwrapWeight: number;
   firstUnwrapLine?: number;
   tests: number;
   ignored: number;
@@ -48,17 +50,32 @@ interface RustOptions {
   exclude?: string[];
 }
 
-const TEST_ATTR = /#\[\s*(?:(?:[\w:]+::)?test|rstest)\b[^\]]*\]/g;
-const CFG_TEST_MOD = /#\[cfg\(test\)\]\s*(?:#\[[^\]]*\]\s*)*(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*([{;])/g;
+export const TEST_ATTR = /#\[\s*(?:(?:[\w:]+::)?test|rstest)\b[^\]]*\]/g;
 const IGNORE_ATTR = /#\[\s*ignore\b/g;
 const FN = /\bfn\s+[A-Za-z_]\w*/g;
 const PUB_FN = /\bpub\s+(?:const\s+|async\s+|unsafe\s+|extern\s+(?:"[^"]*"\s+)?)*fn\s+([A-Za-z_]\w*)/g;
 const BRANCH = /\b(?:if|match|while|loop)\b|&&|\|\||\bfor\s+[^{;]*?\bin\b/g;
 const UNWRAP = /\.unwrap\(\)|\.expect\(/g;
+const LOCK_GUARD = /\.(?:lock|read|write)\(\)\s*$/;
+const LITERAL_PARSE = /"[^"\n]*"\s*\.parse(?:::<[^()]*>)?\(\)\s*$/;
+const ENTRY_POINT = /(^|\/)(main|build)\.rs$|(^|\/)src\/bin\//;
 const IDENT = /[A-Za-z_]\w*/g;
+
+/** How likely an unwrap/expect at `index` is a real panic risk (DESIGN "Confidence"). */
+function unwrapWeight(code: string, index: number): number {
+  const before = code.slice(Math.max(0, index - 200), index);
+  if (LOCK_GUARD.test(before) || LITERAL_PARSE.test(before)) return 0.2;
+  return code.startsWith(".expect(", index) ? 0.6 : 1;
+}
 
 /** Rust source with comments and string/char literal contents blanked to spaces (offsets and newlines kept). */
 export function stripRust(src: string): string {
+  return lexRust(src).code;
+}
+
+/** `code` as `stripRust` returns it, plus the [start, end) offsets of every comment in `src`. */
+export function lexRust(src: string): { code: string; comments: [number, number][] } {
+  const comments: [number, number][] = [];
   const out = src.split("");
   const blank = (from: number, to: number) => {
     for (let k = from; k < to; k++) if (out[k] !== "\n") out[k] = " ";
@@ -73,6 +90,7 @@ export function stripRust(src: string): string {
       const eol = src.indexOf("\n", i);
       const end = eol < 0 ? src.length : eol;
       blank(i, end);
+      comments.push([i, end]);
       i = end;
       continue;
     }
@@ -85,6 +103,7 @@ export function stripRust(src: string): string {
         else j++;
       }
       blank(i, j);
+      comments.push([i, j]);
       i = j;
       continue;
     }
@@ -118,10 +137,11 @@ export function stripRust(src: string): string {
     }
     i++;
   }
-  return out.join("");
+  return { code: out.join(""), comments };
 }
 
-function matchingBrace(code: string, open: number): number {
+/** Offset just past the `}` closing the `{` at `open`, or the end of `code`. */
+export function matchingBrace(code: string, open: number): number {
   let depth = 0;
   for (let j = open; j < code.length; j++) {
     if (code[j] === "{") depth++;
@@ -130,33 +150,174 @@ function matchingBrace(code: string, open: number): number {
   return code.length;
 }
 
-function testRegions(code: string): [number, number][] {
-  const regions: [number, number][] = [];
-  for (const re of [TEST_ATTR, CFG_TEST_MOD]) {
-    for (const m of code.matchAll(re)) {
-      if (m[2] === ";") continue;
-      const open = code.indexOf("{", m.index);
-      if (open >= 0) regions.push([m.index, matchingBrace(code, open)]);
+const CFG_ATTR = /#(!?)\[\s*cfg\s*\(/g;
+const TEST_FEATURES = new Set(["test-utils", "test_utils", "testing", "test-helpers", "test-support"]);
+const TEST_DIRS = new Set(["tests", "test_utils", "testing", "test_helpers", "fixtures", "mock", "mocks"]);
+const TEST_FILE = /^(?:tests|test_utils|testing|test_helpers|fixtures|mocks?|test_\w+|\w+_tests?)\.rs$/;
+const TEST_SUPPORT_SEGMENT = /^(?:tests?|testing|testsuite|harness|e2e|fixtures|mocks?)$/;
+
+/** Whether a `cfg` predicate (the text inside `cfg(…)`) holds only in test or test-support builds. */
+export function testOnlyCfg(predicate: string): boolean {
+  const tokens = predicate.match(/[A-Za-z_]\w*|"[^"]*"|[(),=]/g) ?? [];
+  let i = 0;
+  const parse = (): boolean => {
+    const name = tokens[i++];
+    if (tokens[i] === "=") {
+      i++;
+      return name === "feature" && TEST_FEATURES.has(tokens[i++]?.slice(1, -1) ?? "");
     }
-  }
-  return regions;
+    if (tokens[i] !== "(") return name === "test";
+    i++;
+    const args: boolean[] = [];
+    while (i < tokens.length && tokens[i] !== ")") {
+      args.push(parse());
+      if (tokens[i] === ",") i++;
+    }
+    i++;
+    if (name === "all") return args.some(Boolean);
+    return name === "any" && args.length > 0 && args.every(Boolean);
+  };
+  return parse();
 }
 
-/** Files that an out-of-line `#[cfg(test)] mod name;` in `file` points at. */
-function outOfLineTestModules(file: string, code: string): string[] {
-  const dir = posix.dirname(file);
-  const base = posix.basename(file, ".rs");
-  const modDir = ["lib", "main", "mod"].includes(base) ? dir : posix.join(dir, base);
-  const found: string[] = [];
-  for (const m of code.matchAll(CFG_TEST_MOD)) {
-    if (m[2] === ";") found.push(posix.join(modDir, `${m[1]}.rs`), posix.join(modDir, m[1], "mod.rs"));
+/** Offset just past the bracket closing the one at `open` (`(` or `[`), or the end of `code`. */
+function closingBracket(code: string, open: number): number {
+  const [o, c] = code[open] === "[" ? ["[", "]"] : ["(", ")"];
+  let depth = 0;
+  for (let j = open; j < code.length; j++) {
+    if (code[j] === o) depth++;
+    else if (code[j] === c && --depth === 0) return j + 1;
+  }
+  return code.length;
+}
+
+/**
+ * End of the item or statement starting at `start`: past its `;` or past the `}` closing its first
+ * top-level block, unless the code after that block continues the expression (`.`, `?`, `;`, `else`, `as`).
+ */
+function itemEnd(code: string, start: number): number {
+  let depth = 0;
+  for (let j = start; j < code.length; j++) {
+    const c = code[j];
+    if (c === "(" || c === "[") depth++;
+    else if (c === ")" || c === "]") depth--;
+    else if (depth === 0 && c === ";") return j + 1;
+    else if (depth === 0 && c === "{") {
+      const end = matchingBrace(code, j);
+      const next = end + code.slice(end).search(/\S|$/);
+      if (!/^(?:[.?;]|(?:else|as)\b)/.test(code.slice(next, next + 5))) return end;
+      j = next - 1;
+    }
+  }
+  return code.length;
+}
+
+/** Offset of the `{` opening the innermost block around `index`, or -1 at file level. */
+function enclosingBrace(code: string, index: number): number {
+  const open: number[] = [];
+  for (let j = 0; j < index; j++) {
+    if (code[j] === "{") open.push(j);
+    else if (code[j] === "}") open.pop();
+  }
+  return open.at(-1) ?? -1;
+}
+
+/** The `cfg(…)` predicate opening at `open`: tokens from the stripped code, so comments drop out, with string contents from the original. */
+function cfgPredicate(code: string, src: string, open: number): string {
+  const predicate = code.slice(open + 1, closingBracket(code, open) - 1);
+  return predicate.replace(/"[^"]*"/g, (literal, at: number) => src.slice(open + 1 + at, open + 1 + at + literal.length));
+}
+
+interface TestRegions {
+  /** The file is test-only (file-level inner `#![cfg(test)]`). */
+  wholeFile: boolean;
+  regions: [number, number][];
+  /** Names of out-of-line test-only modules (`#[cfg(test)] mod name;`). */
+  modules: string[];
+}
+
+/**
+ * Test regions of a Rust file: items under a test-only `cfg` and test fns. `code` is the stripped
+ * source (see `stripRust`) and `src` the original, read at the same offsets for `cfg` predicates.
+ */
+export function testRegions(code: string, src: string): TestRegions {
+  const found: TestRegions = { wholeFile: false, regions: [], modules: [] };
+  for (const m of code.matchAll(CFG_ATTR)) {
+    const open = m.index + m[0].length - 1;
+    if (!testOnlyCfg(cfgPredicate(code, src, open))) continue;
+    if (m[1] === "!") {
+      const block = enclosingBrace(code, m.index);
+      if (block < 0) found.wholeFile = true;
+      else found.regions.push([block, matchingBrace(code, block)]);
+      continue;
+    }
+    let start = closingBracket(code, code.indexOf("[", m.index));
+    for (;;) {
+      start += code.slice(start).search(/\S|$/);
+      if (code[start] !== "#") break;
+      start = closingBracket(code, code.indexOf("[", start));
+    }
+    const end = itemEnd(code, start);
+    found.regions.push([m.index, end]);
+    const mod = /^(?:pub(?:\([^)]*\))?\s+)?mod\s+(\w+)\s*;$/.exec(code.slice(start, end));
+    if (mod) found.modules.push(mod[1]);
+  }
+  const nextFn = /\bfn\b/g;
+  for (const m of code.matchAll(TEST_ATTR)) {
+    nextFn.lastIndex = m.index;
+    const fn = nextFn.exec(code);
+    if (fn) found.regions.push([m.index, itemEnd(code, fn.index)]);
   }
   return found;
 }
 
-function fileKind(file: string, testModules: Set<string>): FileKind {
+/** Files that the out-of-line test-only `modules` declared in `file` point at. */
+function testModuleFiles(file: string, modules: string[]): string[] {
+  const dir = posix.dirname(file);
+  const base = posix.basename(file, ".rs");
+  const modDir = ["lib", "main", "mod"].includes(base) ? dir : posix.join(dir, base);
+  return modules.flatMap((m) => [posix.join(modDir, `${m}.rs`), posix.join(modDir, m, "mod.rs")]);
+}
+
+/** Whether a path names a test or test-support file by convention (directory or file name). */
+export function isTestPath(file: string): boolean {
   const segments = file.split("/");
-  if (segments.includes("tests") || testModules.has(file)) return "test";
+  return segments.slice(0, -1).some((s) => TEST_DIRS.has(s)) || TEST_FILE.test(segments.at(-1)!);
+}
+
+/** Whether a crate (directory `node`, package `name`) exists to support tests: harnesses, e2e suites, test utils. */
+export function isTestSupportCrate(node: NodeId, name: string): boolean {
+  return [node, name].some((text) => {
+    const words = text.toLowerCase().split(/[/_-]/);
+    return words.some((w, i) => TEST_SUPPORT_SEGMENT.test(w) || (w === "test" && /^(utils|helpers)$/.test(words[i + 1] ?? "")) || (w === "load" && words[i + 1]?.startsWith("test")));
+  });
+}
+
+export interface RustTestCode {
+  /** Files that are test code as a whole. */
+  testFiles: Set<string>;
+  /** Test regions of the other files, as offsets. */
+  regions: Map<string, [number, number][]>;
+}
+
+/** Classify the test code of Rust `sources` (path → original and stripped text) in `tree` (DESIGN "Test code"). */
+export function rustTestCode(tree: Tree, sources: Map<string, { text: string; code: string }>): RustTestCode {
+  const supportFiles = new Set(cratesOf(tree).crates.filter((c) => isTestSupportCrate(c.node, c.name)).flatMap((c) => c.files));
+  const testFiles = new Set<string>();
+  const regions = new Map<string, [number, number][]>();
+  for (const [file, { text, code }] of sources) {
+    const found = testRegions(code, text);
+    if (found.wholeFile || isTestPath(file) || supportFiles.has(file)) testFiles.add(file);
+    regions.set(file, found.regions);
+    for (const module of testModuleFiles(file, found.modules)) testFiles.add(module);
+  }
+  for (const file of testFiles) regions.delete(file);
+  return { testFiles, regions };
+}
+
+function fileKind(file: string, test: RustTestCode): FileKind {
+  const segments = file.split("/");
+  if (test.testFiles.has(file)) return "test";
   if (segments.includes("benches") || segments.includes("examples")) return "aux";
   return "src";
 }
@@ -167,8 +328,8 @@ function lineAt(code: string, index: number): number {
   return line;
 }
 
-function analyzeFile(file: string, code: string, kind: FileKind): FileStats {
-  const regions = kind === "test" ? [[0, code.length] as [number, number]] : testRegions(code);
+function analyzeFile(file: string, code: string, kind: FileKind, testRegions: [number, number][]): FileStats {
+  const regions = kind === "test" ? [[0, code.length] as [number, number]] : testRegions;
   const mask = code.split("");
   let testCode = "";
   for (const [from, to] of regions) {
@@ -176,15 +337,16 @@ function analyzeFile(file: string, code: string, kind: FileKind): FileStats {
     for (let k = from; k < to; k++) if (mask[k] !== "\n") mask[k] = " ";
   }
   const nonTest = kind === "src" ? mask.join("") : "";
-  const firstUnwrap = nonTest.search(UNWRAP);
+  const unwraps = ENTRY_POINT.test(file) ? [] : [...nonTest.matchAll(UNWRAP)].map((m) => m.index);
   return {
     file,
     kind,
     fns: nonTest.match(FN)?.length ?? 0,
     pubFns: [...nonTest.matchAll(PUB_FN)].map((m) => m[1]),
     branches: nonTest.match(BRANCH)?.length ?? 0,
-    unwraps: nonTest.match(UNWRAP)?.length ?? 0,
-    firstUnwrapLine: firstUnwrap >= 0 ? lineAt(nonTest, firstUnwrap) : undefined,
+    unwraps: unwraps.length,
+    unwrapWeight: unwraps.reduce((sum, i) => sum + unwrapWeight(nonTest, i), 0),
+    firstUnwrapLine: unwraps.length ? lineAt(nonTest, unwraps[0]) : undefined,
     tests: code.match(TEST_ATTR)?.length ?? 0,
     ignored: code.match(IGNORE_ATTR)?.length ?? 0,
     testCode,
@@ -438,14 +600,14 @@ function testTimes(repoRoot: string): Map<string, number> {
 }
 
 async function analyze(ctx: CollectCtx): Promise<Analysis> {
-  const sources = new Map<string, string>();
+  const sources = new Map<string, { text: string; code: string }>();
   for (const file of treeFiles(ctx.tree)) {
     if (!file.endsWith(".rs")) continue;
     const text = readSource(ctx.repoRoot, file);
-    if (text !== undefined) sources.set(file, stripRust(text));
+    if (text !== undefined) sources.set(file, { text, code: stripRust(text) });
   }
-  const testModules = new Set([...sources].flatMap(([file, code]) => outOfLineTestModules(file, code)));
-  const files = [...sources].map(([file, code]) => analyzeFile(file, code, fileKind(file, testModules)));
+  const test = rustTestCode(ctx.tree, sources);
+  const files = [...sources].map(([file, { code }]) => analyzeFile(file, code, fileKind(file, test), test.regions.get(file) ?? []));
   const { crates, crateOf } = cratesOf(ctx.tree);
   return { files, crates, crateOf, lints: await runClippy(ctx, crates) };
 }
@@ -522,7 +684,7 @@ export const rustPlugin: MetricPlugin = {
 
   async collect(ctx) {
     const { files, crates, crateOf, lints } = await analysisFor(ctx);
-    const values: MetricValues = {};
+    const values: MetricValues = dict();
     const own = (node: NodeId) => (values[node] ??= {});
     for (const f of files) {
       const v = own(nodeOfFile(f.file));
@@ -565,6 +727,7 @@ export const rustPlugin: MetricPlugin = {
         findings.push(clippyFinding(d, n));
       }
     }
+    const dependents = fanIn(ctx, crates);
     const testIdents = new Map<NodeId, Set<string>>(crates.map((c) => [c.node, new Set<string>()]));
     for (const f of files) {
       const idents = testIdents.get(crateOf.get(nodeOfFile(f.file))?.node ?? "\0");
@@ -584,10 +747,12 @@ export const rustPlugin: MetricPlugin = {
           severity: f.unwraps >= 5 ? "medium" : "low",
           effort: scaledEffort(f.unwraps, 2, 10),
           metricEffects: { unwrap_density: -f.unwraps },
+          confidence: f.unwrapWeight / f.unwraps,
         });
       }
-      const idents = testIdents.get(crateOf.get(node)?.node ?? "\0");
-      if (!idents) continue;
+      const crate = crateOf.get(node);
+      const idents = testIdents.get(crate?.node ?? "\0");
+      if (!idents || !dependents.get(crate!.name)) continue;
       const untested = [...new Set(f.pubFns)].filter((name) => !idents.has(name));
       if (untested.length === 0) continue;
       findings.push({
@@ -601,6 +766,7 @@ export const rustPlugin: MetricPlugin = {
         effort: untested.length <= 3 ? "small" : "medium",
         metricEffects: { test_count: untested.length, test_ratio: untested.length },
         tags: ["api"],
+        confidence: 0.3,
       });
     }
     return findings;

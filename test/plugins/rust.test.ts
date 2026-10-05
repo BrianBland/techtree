@@ -288,3 +288,132 @@ test("fan_in credits aliases a member inherits from [workspace.dependencies] to 
   const values = await rustPlugin.collect(makeCtx(annotated(root)));
   assert.deepEqual(values["crates/core"], { fan_in: 3 });
 });
+
+test("unwraps in binary entry points and build scripts are not counted; confidence weighs each call", async () => {
+  const root = fixture({
+    "Cargo.toml": `[package]\nname = "solo"\n`,
+    "build.rs": "fn main() { std::env::var(\"X\").unwrap(); }\n",
+    "src/main.rs": "fn main() { run().unwrap(); }\n",
+    "src/bin/tool.rs": "fn main() { run().unwrap(); }\n",
+    "src/lib.rs": [
+      "pub fn a(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "pub fn b(r: Result<u8, ()>) -> u8 { r.expect(\"validated by caller\") }",
+      "pub fn c(m: &std::sync::Mutex<u8>) -> u8 { *m.lock().unwrap() }",
+      "pub fn d() -> std::net::IpAddr { \"127.0.0.1\".parse::<std::net::IpAddr>().unwrap() }",
+      "",
+    ].join("\n"),
+  });
+  const ctx = makeCtx(annotated(root));
+  const values = await rustPlugin.collect(ctx);
+  assert.equal(values[""].unwrap_density, 0);
+  assert.equal(values.src.unwrap_density, 4);
+  assert.equal(values["src/bin"].unwrap_density, 0);
+  const unwraps = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "unwrap");
+  assert.deepEqual(unwraps.map((f) => f.file), ["src/lib.rs"]);
+  assert.equal(unwraps[0].confidence, (1 + 0.6 + 0.2 + 0.2) / 4);
+});
+
+test("test gaps are reported with low confidence, and only for crates other crates depend on", async () => {
+  const findings = (await rustPlugin.findings!(makeCtx(annotated(workspace())))).filter((f) => f.source === "test-gap");
+  assert.deepEqual(findings.map((f) => [f.file, f.confidence]), [["crates/core/src/lib.rs", 0.3]]);
+  const leaf = fixture({ "Cargo.toml": `[package]\nname = "leaf"\n`, "src/lib.rs": "pub fn untested() {}\n" });
+  const ctx = makeCtx(annotated(leaf));
+  assert.deepEqual((await rustPlugin.findings!(ctx)).filter((f) => f.source === "test-gap"), []);
+  assert.equal((await rustPlugin.collect(ctx)).src.pub_fn_count, 1, "test_ratio still counts the untested fn");
+});
+
+const UNWRAPPING = "pub fn f(r: Result<u8, ()>) -> u8 { r.unwrap() }\n";
+
+test("test-only cfg predicates on any item mark test code; other predicates do not", async () => {
+  const root = fixture({
+    "Cargo.toml": `[package]\nname = "jwt"\n`,
+    "src/secret.rs": [
+      "pub fn real(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[cfg(all(test, unix))]",
+      "mod tests { fn a(r: Result<u8, ()>) { r.unwrap(); } }",
+      "#[cfg(any(test, feature = \"test-utils\"))]",
+      "pub fn helper(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[cfg(feature = \"test-utils\")]",
+      "#[allow(dead_code)]",
+      "impl Thing { pub fn make(r: Result<u8, ()>) -> u8 { r.expect(\"x\") } }",
+      "#[cfg(feature = \"testing\")]",
+      "static S: u8 = parse().unwrap();",
+      "#[cfg(not(test))]",
+      "pub fn prod(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[cfg(any(test, unix))]",
+      "pub fn either(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "#[tokio::test]",
+      "async fn loose() { x().unwrap(); }",
+      "",
+    ].join("\n"),
+    "src/lib.rs": "#[cfg(all(test, feature = \"x\"))]\nmod helpers;\n",
+    "src/helpers.rs": UNWRAPPING,
+    "src/inner.rs": "#![cfg(test)]\n" + UNWRAPPING,
+  });
+  const ctx = makeCtx(annotated(root));
+  const values = await rustPlugin.collect(ctx);
+  assert.equal(values.src.unwrap_density, 3, "real, prod and either");
+  assert.equal(values.src.pub_fn_count, 3);
+  const unwraps = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "unwrap");
+  assert.deepEqual(unwraps.map((f) => [f.file, f.metricEffects.unwrap_density]), [["src/secret.rs", -3]]);
+});
+
+test("test-support files and crates are test code: no unwrap or test-gap findings", async () => {
+  const supportFiles = ["src/test_utils/mod.rs", "src/testing.rs", "src/test_helpers.rs", "src/fixtures.rs", "src/mocks/a.rs", "src/mock.rs",
+    "src/tests.rs", "src/test_rollup_config.rs", "src/foo_test.rs", "src/foo_tests.rs", "src/fixtures/b.rs", "src/test_helpers/c.rs"];
+  const root = fixture({
+    "Cargo.toml": `[workspace]\nmembers = ["crates/*", "crates/infra/*", "actions/*"]\n`,
+    "crates/core/Cargo.toml": `[package]\nname = "core"\n`,
+    ...Object.fromEntries(supportFiles.map((f) => [`crates/core/${f}`, UNWRAPPING])),
+    "crates/test-utils/Cargo.toml": `[package]\nname = "base-test-utils"\n`,
+    "crates/test-utils/src/lib.rs": UNWRAPPING,
+    "crates/infra/challenger-e2e/Cargo.toml": `[package]\nname = "base-challenger-e2e"\n`,
+    "crates/infra/challenger-e2e/src/lib.rs": UNWRAPPING,
+    "crates/infra/load-tests/Cargo.toml": `[package]\nname = "base-load-tests"\n`,
+    "crates/infra/load-tests/src/lib.rs": UNWRAPPING,
+    "actions/harness/Cargo.toml": `[package]\nname = "base-action-harness"\n`,
+    "actions/harness/src/lib.rs": UNWRAPPING,
+    "crates/app/Cargo.toml": `[package]\nname = "app"\n\n[dependencies]\ncore = { path = "../core" }\nbase-test-utils = { path = "../test-utils" }\nbase-action-harness = { path = "../../actions/harness" }\nbase-challenger-e2e = { path = "../infra/challenger-e2e" }\nbase-load-tests = { path = "../infra/load-tests" }\n`,
+    "crates/app/src/lib.rs": UNWRAPPING,
+  });
+  const ctx = makeCtx(annotated(root));
+  const findings = (await rustPlugin.findings!(ctx)).filter((f) => f.source === "unwrap" || f.source === "test-gap");
+  assert.deepEqual(findings.map((f) => [f.source, f.file]), [["unwrap", "crates/app/src/lib.rs"]]);
+});
+
+test("a node named __proto__ gets its own values and never touches Object.prototype", async () => {
+  const ctx = makeCtx(buildTree(fixture({ "__proto__/a.rs": UNWRAPPING })));
+  const values = await rustPlugin.collect(ctx);
+  assert.equal(Object.hasOwn(values, "__proto__"), true);
+  assert.equal(values["__proto__"].unwrap_density, 1);
+  assert.equal(Object.hasOwn(Object.prototype, "unwrap_density"), false);
+});
+
+test("a nested inner test cfg covers only its module; test-only statements are covered to their end", async () => {
+  const root = fixture({
+    "Cargo.toml": `[package]\nname = "solo"\n`,
+    "src/lib.rs": [
+      "pub fn prod(r: Result<u8, ()>) -> u8 { r.unwrap() }",
+      "mod helper {",
+      "    #![cfg(test)]",
+      "    fn h(r: Result<u8, ()>) { r.unwrap(); }",
+      "}",
+      "pub fn build() {",
+      "    #[cfg(test)]",
+      "    let x = TestFixture { value: 1 }.finish().unwrap();",
+      "}",
+      "",
+    ].join("\n"),
+  });
+  const values = await rustPlugin.collect(makeCtx(annotated(root)));
+  assert.equal(values.src.unwrap_density, 1);
+  assert.equal(values.src.fn_count, 2);
+});
+
+test("comments inside a cfg predicate do not count as predicate tokens", async () => {
+  const root = fixture({
+    "Cargo.toml": `[package]\nname = "solo"\n`,
+    "src/lib.rs": `#[cfg(all(unix, /* test builds use a different implementation */ feature = "prod"))]\n${UNWRAPPING}`,
+  });
+  assert.equal((await rustPlugin.collect(makeCtx(annotated(root)))).src.unwrap_density, 1);
+});

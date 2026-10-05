@@ -1,5 +1,6 @@
 import type { NodeId, NodeScore, ScoreResult } from "../types.ts";
-import { priority } from "./suggest.ts";
+import { diversify } from "./cta.ts";
+import { priority, sizeFactor } from "./suggest.ts";
 
 export interface ReportOptions {
   /** Nodes listed at each end of every metric (default 10). */
@@ -34,11 +35,11 @@ export function formatReport(result: ScoreResult, opts: ReportOptions = {}): str
     lines.push("", `${escapeControls(def.label)} [${escapeControls(def.key)}, ${def.direction.replace("_", " ")}]`, "  best:", ...top.map(row), "  worst:", ...bottom.map(row));
   }
 
-  const findings = result.findings
+  const ranked = result.findings
     .map((f) => ({ f, impact: result.impacts[f.id] ?? { node: 0, root: 0 } }))
-    .map((x) => ({ ...x, priority: priority(x.impact, x.f.effort, 0) }))
-    .sort((a, b) => b.priority - a.priority)
-    .slice(0, opts.findings ?? 20);
+    .map((x) => ({ ...x, priority: priority(x.impact, x.f.effort, 0, x.f.confidence, sizeFactor(result, x.f.node)) }))
+    .sort((a, b) => b.priority - a.priority);
+  const findings = diversify(ranked, (x) => x.f.source).slice(0, opts.findings ?? 20);
   if (findings.length) {
     lines.push("", `top findings (${findings.length} of ${result.findings.length})`);
     for (const { f, impact } of findings) {

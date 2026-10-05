@@ -112,3 +112,18 @@ test("score runs plugins, skips failures, and estimates every finding's impact",
   assert.match(report, /fix a lint/);
   assert.doesNotMatch(report, /\[loc,/, "neutral metrics are not ranked");
 });
+
+test("report ranks findings by confidence-weighted priority and diversifies them by source", () => {
+  const tree = treeFromFiles("/r", ["a/f", "b/f", "c/f", "d/f"]);
+  const findings = [
+    finding("u1", "a", {}, { source: "unwrap", title: "u1" }),
+    finding("u2", "a", {}, { source: "unwrap", title: "u2" }),
+    finding("u3", "a", {}, { source: "unwrap", title: "u3" }),
+    finding("g", "b", {}, { source: "test-gap", title: "gap", confidence: 0.1 }),
+    finding("d", "c", {}, { source: "duplication", title: "dup" }),
+  ];
+  const impacts = { u1: { node: 9, root: 0 }, u2: { node: 8, root: 0 }, u3: { node: 7, root: 0 }, g: { node: 50, root: 0 }, d: { node: 1, root: 0 } };
+  const report = formatReport({ sha: "", createdAt: "", tree, metricDefs: [LINT], own: {}, scores: {}, findings, impacts });
+  const order = [...report.matchAll(/ (u1|u2|u3|gap|dup)$/gm)].map((m) => m[1]);
+  assert.deepEqual(order, ["u1", "u2", "gap", "dup", "u3"]);
+});
