@@ -27,6 +27,12 @@ test("builds a node per directory with files below it, honouring .gitignore and 
   assert.deepEqual(tree.nodes["src/a"], { id: "src/a", name: "a", kind: "dir", parent: "src", children: ["src/a/b"], files: [] });
 });
 
+test("directory names that shadow Object.prototype members are ordinary nodes", () => {
+  const tree = treeFromFiles("/r", ["constructor/a.ts", "__proto__/b.ts", "toString/c.ts"]);
+  assert.deepEqual(Object.keys(tree.nodes).sort(), ["", "__proto__", "constructor", "toString"]);
+  assert.deepEqual(tree.nodes.__proto__.files, ["__proto__/b.ts"]);
+});
+
 test("ignore globs match within and across segments", () => {
   const tree = treeFromFiles("/r", ["a/gen-1/f", "a/keep/f", "b/x/y/z.snap", "b/x/f"], ["gen-*", "b/**/*.snap"]);
   assert.deepEqual(Object.keys(tree.nodes).sort(), ["", "a", "a/keep", "b", "b/x"]);

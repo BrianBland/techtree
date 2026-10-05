@@ -24,10 +24,8 @@ export function recordFindings(db: Db, findings: Finding[], now: string, full: b
         "ON CONFLICT (id) DO UPDATE SET node = excluded.node, source = excluded.source, data = excluded.data, " +
         "last_seen = excluded.last_seen, resolved_at = NULL",
     );
+    if (full) db.prepare("UPDATE findings SET resolved_at = ? WHERE resolved_at IS NULL").run(now);
     for (const f of findings) upsert.run(f.id, f.node, f.source, JSON.stringify(f), now, now);
-    if (full) {
-      db.prepare("UPDATE findings SET resolved_at = ? WHERE resolved_at IS NULL AND last_seen <> ?").run(now, now);
-    }
   });
 }
 

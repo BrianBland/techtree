@@ -51,6 +51,8 @@ test("findings keep first_seen, resolve when absent from a full run, and reopen 
   assert.equal((rows()[1] as { resolved_at: string }).resolved_at, "t3");
   recordFindings(db, [a, { ...b, title: "changed" }], "t4", true);
   assert.deepEqual(rows()[1], { id: "b", first_seen: "t1", last_seen: "t4", resolved_at: null });
+  recordFindings(db, [a], "t4", true);
+  assert.equal((rows()[1] as { resolved_at: string }).resolved_at, "t4", "resolution does not depend on a fresh timestamp");
   const data = db.prepare("SELECT data FROM findings WHERE id = 'b'").get() as { data: string };
   assert.equal(JSON.parse(data.data).title, "changed");
 });

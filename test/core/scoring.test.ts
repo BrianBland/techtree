@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildModel, commonAncestor, composite, percentile } from "../../src/core/scoring.ts";
+import { buildModel, commonAncestor, composite, findingsImpact, percentile } from "../../src/core/scoring.ts";
 import { treeFromFiles } from "../../src/core/tree.ts";
 import { config, LINT, LOC, MAX_FILE, TEST_RATIO } from "./fixture.ts";
 
@@ -23,6 +23,22 @@ test("aggregates own values up the tree per metric rule", () => {
   assert.ok(Math.abs(m.agg[""].test_ratio - 0.62) < 1e-9);
   assert.equal(m.agg.b.lint_warnings, undefined, "no own value anywhere below b");
   assert.equal(m.scores.a.metrics.lint_warnings.value, 7.5, "lints per kLOC");
+});
+
+test("scores and what-if work for directory names that shadow Object.prototype members", () => {
+  const t = treeFromFiles("/repo", ["constructor/f", "__proto__/f", "toString/f"]);
+  const own = Object.fromEntries([
+    ["constructor", { loc: 1000, lint_warnings: 1 }],
+    ["__proto__", { loc: 1000, lint_warnings: 5 }],
+    ["toString", { loc: 1000, lint_warnings: 9 }],
+  ]);
+  const m = buildModel(t, [LOC, LINT], own, config());
+  assert.deepEqual(Object.keys(m.scores).sort(), ["", "__proto__", "constructor", "toString"]);
+  assert.equal(m.agg[""].lint_warnings, 15);
+  const pct = (id: string) => m.scores[id].metrics.lint_warnings.pct!;
+  assert.ok(pct("constructor") > pct("__proto__"));
+  const impact = findingsImpact(m, [{ id: "f", node: "__proto__", source: "s", title: "", detail: "", severity: "low", effort: "trivial", metricEffects: { lint_warnings: -1 } }]);
+  assert.ok(impact.node > 0);
 });
 
 test("mean_by_loc falls back to the plain mean without loc", () => {

@@ -1,7 +1,7 @@
 import { execFileSync } from "node:child_process";
 import type { Cache, CollectCtx, Config, Finding, MetricDef, MetricPlugin, MetricValues, ScoreResult } from "../types.ts";
 import { buildModel, findingImpact } from "./scoring.ts";
-import { buildTree } from "./tree.ts";
+import { buildTree, dict } from "./tree.ts";
 
 export interface ScoreOptions {
   repoRoot: string;
@@ -41,7 +41,7 @@ export async function score(opts: ScoreOptions): Promise<ScoreResult> {
   );
 
   const metricDefs: MetricDef[] = [];
-  const own: MetricValues = {};
+  const own: MetricValues = dict();
   const findings = new Map<string, Finding>();
   for (const { plugin, values, findings: found } of outputs) {
     if (values) {

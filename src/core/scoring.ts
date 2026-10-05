@@ -10,7 +10,7 @@ import type {
   NodeScore,
   Tree,
 } from "../types.ts";
-import { depth } from "./tree.ts";
+import { depth, dict } from "./tree.ts";
 
 const LOC = "loc";
 
@@ -31,11 +31,11 @@ export interface Model {
 /** Aggregate own values up the tree, normalize, rank against peers and compute composites. */
 export function buildModel(tree: Tree, defs: MetricDef[], own: MetricValues, config: Config): Model {
   const bottomUp = Object.keys(tree.nodes).sort((a, b) => depth(b) - depth(a));
-  const agg: MetricValues = {};
+  const agg: MetricValues = dict();
   for (const id of bottomUp) {
-    agg[id] = aggregateNode(defs, own[id], tree.nodes[id].children.map((c) => agg[c]));
+    agg[id] = aggregateNode(defs, ownOf(own, id), tree.nodes[id].children.map((c) => agg[c]));
   }
-  const m: Model = { tree, defs, config, own, agg, scores: {}, ranked: new Set(), peers: new Map(), hasLoc: defs.some((d) => d.key === LOC) };
+  const m: Model = { tree, defs, config, own, agg, scores: dict(), ranked: new Set(), peers: new Map(), hasLoc: defs.some((d) => d.key === LOC) };
   for (const id of bottomUp) {
     if (!isRanked(m, agg[id])) continue;
     m.ranked.add(id);
@@ -62,7 +62,7 @@ export function findingImpact(m: Model, finding: Finding): Impact {
 
 /** Δquality from fixing several findings together, at `focus` (default: their deepest common ancestor). */
 export function findingsImpact(m: Model, findings: Finding[], focus?: NodeId): Impact {
-  const effects: MetricValues = {};
+  const effects: MetricValues = dict();
   for (const f of findings) {
     const node = (effects[f.node] ??= {});
     for (const [key, delta] of Object.entries(f.metricEffects)) node[key] = (node[key] ?? 0) + delta;
@@ -86,7 +86,7 @@ export function whatIf(m: Model, effects: MetricValues, focus: NodeId): Impact {
   const agg = new Map<NodeId, Record<string, number>>();
   for (const id of bottomUp) {
     const kids = m.tree.nodes[id].children.map((c) => agg.get(c) ?? m.agg[c]);
-    agg.set(id, aggregateNode(m.defs, applyEffects(m.own[id], effects[id]), kids));
+    agg.set(id, aggregateNode(m.defs, applyEffects(ownOf(m.own, id), ownOf(effects, id)), kids));
   }
   const scores = new Map<NodeId, NodeScore>();
   for (const id of bottomUp.reverse()) {
@@ -162,6 +162,10 @@ export function commonAncestor(ids: NodeId[]): NodeId {
     parts = parts.slice(0, i);
   }
   return parts.join("/");
+}
+
+function ownOf(values: MetricValues, id: NodeId): Record<string, number> | undefined {
+  return Object.hasOwn(values, id) ? values[id] : undefined;
 }
 
 function aggregateNode(

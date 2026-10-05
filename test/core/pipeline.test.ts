@@ -5,6 +5,7 @@ import { join } from "node:path";
 import { score } from "../../src/core/pipeline.ts";
 import { formatReport } from "../../src/core/report.ts";
 import type { Cache, MetricPlugin } from "../../src/types.ts";
+import { treeFromFiles } from "../../src/core/tree.ts";
 import { config, finding, fixtureRepo, LINT, LOC } from "./fixture.ts";
 
 const cache: Cache = { get: () => undefined, set: () => {} };
@@ -54,6 +55,31 @@ const broken: MetricPlugin = {
     throw new Error("no findings");
   },
 };
+
+function reportFor(nodeCount: number, title = "t"): string {
+  const ids = Array.from({ length: nodeCount }, (_, i) => `n${String(i).padStart(2, "0")}`);
+  const tree = treeFromFiles("/r", ids.map((id) => `${id}/f`));
+  const scores = Object.fromEntries(
+    ids.map((id, i) => [id, { node: id, quality: i, metrics: { lint_warnings: { raw: i, value: i, pct: 100 - i } } }]),
+  );
+  const findings = [finding("f", ids[0], {}, { title })];
+  return formatReport({ sha: "", createdAt: "", tree, metricDefs: [LINT], own: {}, scores, findings, impacts: { f: { node: 1, root: 0 } } });
+}
+
+test("report lists the top and bottom ten independently, even with fewer than twenty nodes", () => {
+  for (const count of [15, 8]) {
+    const report = reportFor(count);
+    const worst = report.split("  worst:\n")[1].split("\n\n")[0].trim().split("\n");
+    assert.equal(worst.length, Math.min(10, count), `${count} nodes`);
+    assert.match(worst[0], new RegExp(`n${String(count - 1).padStart(2, "0")}$`), "worst first");
+  }
+});
+
+test("report escapes control characters from repository text", () => {
+  const report = reportFor(2, "evil\x1b]52;c;aGk=\x07title");
+  assert.doesNotMatch(report, /[\x00-\x09\x0b-\x1f\x7f-\x9f]/);
+  assert.match(report, /evil\\x1b\]52;c;aGk=\\x07title/);
+});
 
 test("score runs plugins, skips failures, and estimates every finding's impact", async () => {
   const root = fixtureRepo({

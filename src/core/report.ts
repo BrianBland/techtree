@@ -13,7 +13,7 @@ export function formatReport(result: ScoreResult, opts: ReportOptions = {}): str
   const perEnd = opts.nodes ?? 10;
   const label = (id: NodeId) => {
     const node = result.tree.nodes[id];
-    return (id || ".") + (node.kind === "dir" ? "" : ` (${node.kind} ${node.name})`);
+    return escapeControls((id || ".") + (node.kind === "dir" ? "" : ` (${node.kind} ${node.name})`));
   };
   const lines = [`techtree report  ${result.sha.slice(0, 12) || "(no commit)"}  ${result.createdAt}`];
   const root = result.scores[""];
@@ -26,13 +26,12 @@ export function formatReport(result: ScoreResult, opts: ReportOptions = {}): str
       .sort((a, b) => pctOf(b, def.key) - pctOf(a, def.key) || a.node.localeCompare(b.node));
     if (ranked.length === 0) continue;
     const top = ranked.slice(0, perEnd);
-    const bottom = ranked.slice(Math.max(perEnd, ranked.length - perEnd)).reverse();
+    const bottom = ranked.slice(-perEnd).reverse();
     const row = (s: NodeScore) => {
       const m = s.metrics[def.key];
       return `  ${fmt(m.pct).padStart(5)}  ${num(m.raw).padStart(10)}  ${label(s.node)}`;
     };
-    lines.push("", `${def.label} [${def.key}, ${def.direction.replace("_", " ")}]`, "  best:", ...top.map(row));
-    if (bottom.length) lines.push("  worst:", ...bottom.map(row));
+    lines.push("", `${escapeControls(def.label)} [${escapeControls(def.key)}, ${def.direction.replace("_", " ")}]`, "  best:", ...top.map(row), "  worst:", ...bottom.map(row));
   }
 
   const findings = result.findings
@@ -43,10 +42,15 @@ export function formatReport(result: ScoreResult, opts: ReportOptions = {}): str
   if (findings.length) {
     lines.push("", `top findings (${findings.length} of ${result.findings.length})`);
     for (const { f, impact } of findings) {
-      lines.push(`  +${fmt(impact.node)} node  +${fmt(impact.root, 2)} root  ${f.effort.padEnd(7)} ${label(f.node)}  ${f.title}`);
+      lines.push(`  +${fmt(impact.node)} node  +${fmt(impact.root, 2)} root  ${f.effort.padEnd(7)} ${label(f.node)}  ${escapeControls(f.title)}`);
     }
   }
   return lines.join("\n") + "\n";
+}
+
+/** Repository text may contain terminal escape sequences; render control characters inert. */
+function escapeControls(text: string): string {
+  return text.replace(/[\u0000-\u001f\u007f-\u009f]/g, (c) => `\\x${c.charCodeAt(0).toString(16).padStart(2, "0")}`);
 }
 
 function pctOf(s: NodeScore, key: string): number {

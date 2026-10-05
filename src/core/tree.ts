@@ -15,7 +15,7 @@ export function buildTree(repoRoot: string, config: Config): Tree {
 /** Build the tree for an explicit list of repo-relative file paths. */
 export function treeFromFiles(repoRoot: string, files: string[], ignore: string[] = []): Tree {
   const ignored = ignore.map(ignoreMatcher);
-  const nodes: Record<NodeId, TreeNode> = {};
+  const nodes = dict<TreeNode>();
   const nodeFor = (id: NodeId): TreeNode => {
     let node = nodes[id];
     if (node) return node;
@@ -46,6 +46,11 @@ function ignoreMatcher(entry: string): RegExp {
     .map((part) => (part === "**" ? ".*" : part === "*" ? "[^/]*" : part.replace(/[.+?^${}()|[\]\\]/g, "\\$&")))
     .join("");
   return new RegExp(trimmed.includes("/") ? `^${body}(/|$)` : `(^|/)${body}(/|$)`);
+}
+
+/** An empty node-keyed record without a prototype, so ids like "constructor" are plain keys. */
+export function dict<T>(): Record<string, T> {
+  return Object.create(null) as Record<string, T>;
 }
 
 /** Depth of a node id: 0 for the root. */

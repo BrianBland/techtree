@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { buildModel, findingImpact } from "../../src/core/scoring.ts";
+import { buildModel, findingImpact, findingsImpact } from "../../src/core/scoring.ts";
 import { conflict, hotNodes, needsManualReview, priority, suggestTasks } from "../../src/core/suggest.ts";
 import { treeFromFiles } from "../../src/core/tree.ts";
 import type { Finding, MetricDef, ScoreResult } from "../../src/types.ts";
@@ -80,4 +80,22 @@ test("suggestions group trivial same-file findings and sort by priority", () => 
   assert.equal(busy.conflict, 1);
   assert.equal(busy.priority, 0);
   assert.equal(busy.manualReview, true, "large effort");
+});
+
+test("a group spanning nodes is anchored at their common ancestor, matching its impact", () => {
+  const tree = treeFromFiles("/repo", ["a/f.rs", "a/sub/g.rs", "b/f.rs"]);
+  const own = { a: { loc: 500, lint_warnings: 5 }, "a/sub": { loc: 500, lint_warnings: 5 }, b: { loc: 1000, lint_warnings: 1 } };
+  const cfg = config({ weights: { lint_warnings: 1 } });
+  const findings = [
+    finding("x", "a/sub", { lint_warnings: -1 }, { file: "a/gen.rs" }),
+    finding("y", "a", { lint_warnings: -1 }, { file: "a/gen.rs" }),
+  ];
+  const model = buildModel(tree, [LOC, LINT], own, cfg);
+  const result: ScoreResult = {
+    sha: "", createdAt: "", tree, metricDefs: [LOC, LINT], own, scores: model.scores, findings,
+    impacts: Object.fromEntries(findings.map((f) => [f.id, findingImpact(model, f)])),
+  };
+  const [group] = suggestTasks(result, cfg);
+  assert.equal(group.node, "a");
+  assert.deepEqual(group.impact, findingsImpact(model, findings, "a"));
 });

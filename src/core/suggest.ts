@@ -1,5 +1,5 @@
 import type { Config, Effort, Finding, Impact, NodeId, NodeScore, ScoreResult, Suggestion, Tree } from "../types.ts";
-import { buildModel, findingsImpact } from "./scoring.ts";
+import { buildModel, commonAncestor, findingsImpact } from "./scoring.ts";
 
 /** Relative cost of each effort level, the divisor in priority. */
 export const EFFORT_COST: Record<Effort, number> = { trivial: 1, small: 2, medium: 5, large: 13 };
@@ -63,18 +63,19 @@ export function suggestTasks(result: ScoreResult, config: Config, busyPaths: str
   }
   const suggestions = [...groups.values()].map((findings): Suggestion => {
     const [first] = findings;
-    const impact = findings.length === 1 ? result.impacts[first.id] : findingsImpact(model, findings);
+    const node = commonAncestor(findings.map((f) => f.node));
+    const impact = findings.length === 1 ? result.impacts[first.id] : findingsImpact(model, findings, node);
     const files = [...new Set(findings.flatMap((f) => (f.file ? [f.file] : [])))];
-    const c = conflict(files.length ? files : [first.node], busyPaths);
+    const c = conflict(files.length ? files : [node], busyPaths);
     return {
-      node: first.node,
+      node,
       title: findings.length === 1 ? first.title : `${findings.length} ${first.source} fixes in ${first.file}`,
       findingIds: findings.map((f) => f.id),
       impact,
       effort: first.effort,
       conflict: c,
       priority: priority(impact, first.effort, c),
-      manualReview: needsManualReview(findings, hot.has(first.node)),
+      manualReview: needsManualReview(findings, hot.has(node)),
     };
   });
   return suggestions.sort((a, b) => b.priority - a.priority);
