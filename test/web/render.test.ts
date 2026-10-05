@@ -69,7 +69,9 @@ test("the UI boots against the server and mock backend, opens nodes and answers 
     assert.match(await backend.taskLog(asking.id, 5), /answer: keep the old error type/);
 
     const before = state.tasks.length;
-    const start = app.find((n) => n.localName === "button" && n.textContent === "Start")[0];
+    const startButtons = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
+    await app.waitFor(() => startButtons().length > 0, "suggestions with Start buttons");
+    const start = startButtons()[0];
     start.dispatch("click");
     await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
     byClass("dialog")[0].dispatch("submit");
