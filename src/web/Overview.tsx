@@ -1,6 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import type { ApiOverview, ApiState, NodeId, Suggestion } from "../types.ts";
 import { get } from "./api.ts";
+import { linkify } from "./linkify.ts";
 import { PrRow, Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
 
 export interface OverviewProps {
@@ -41,7 +42,7 @@ export function Overview({ state, version, onSelect, onStart, onError }: Overvie
                 <span class={`state ${task.state}`}>{task.state === "review" ? "ready for review" : "question"}</span> ·{" "}
                 {nodeName(task.node)}
               </div>
-              {task.question && <div class="small">{task.question}</div>}
+              {task.question && <div class="small">{linkify(task.question)}</div>}
             </div>
           </li>
         )}

@@ -1,6 +1,6 @@
 import { execFile, execFileSync } from "node:child_process";
 import { promisify } from "node:util";
-import { readFileSync } from "node:fs";
+import { existsSync, readFileSync } from "node:fs";
 import { basename } from "node:path";
 import { nodeCtas, rankCtas } from "../core/cta.ts";
 import { score } from "../core/pipeline.ts";
@@ -13,6 +13,7 @@ import { repoId } from "../paths.ts";
 import { defaultPlugins } from "../plugins/index.ts";
 import { llmScanPlugin, scanCoverage, scanNode } from "../plugins/llm-scan.ts";
 import { listModels } from "./models.ts";
+import { launchDetached, shellQuote, terminalArgv } from "./terminal.ts";
 import { Babysitter } from "../prs/babysit.ts";
 import { PrPoller } from "../prs/poller.ts";
 import { TaskRunner } from "../runner/runner.ts";
@@ -24,6 +25,7 @@ import type {
   ApiSource,
   ApiState,
   Cache,
+  ChatEntry,
   CollectCtx,
   Config,
   Finding,
@@ -35,6 +37,7 @@ import type {
   StartTaskRequest,
   Suggestion,
   Task,
+  TerminalMode,
 } from "../types.ts";
 
 /** Open pull requests and their babysit switch; the PR poller implements this. */
@@ -277,6 +280,23 @@ export class RepoBackend implements Backend {
 
   async cancel(taskId: string): Promise<Task> {
     return this.runnerCall(() => this.runner().cancel(taskId));
+  }
+
+  async message(taskId: string, text: string): Promise<Task> {
+    return this.runnerCall(() => this.runner().message(taskId, text));
+  }
+
+  async chat(taskId: string): Promise<ChatEntry[]> {
+    return this.runnerCall(() => this.runner().chat(taskId));
+  }
+
+  async openTerminal(taskId: string, mode: TerminalMode): Promise<void> {
+    const task = this.task(taskId);
+    if (!task.worktree || !existsSync(task.worktree)) throw new HttpError(409, `task ${taskId} has no worktree`);
+    const command = mode === "agent" ? shellQuote(this.runnerCall(() => this.runner().agentCommand(taskId))) : "";
+    const argv = terminalArgv({ template: this.opts.config.terminal, platform: process.platform, cwd: task.worktree, command });
+    if (!argv) throw new HttpError(501, `no default terminal on ${process.platform}; set "terminal" in .techtree.yaml`);
+    await launchDetached(argv);
   }
 
   async report(taskId: string, report: WorkerReport): Promise<Task> {

@@ -1,7 +1,9 @@
 import type { ComponentChildren } from "preact";
 import { useEffect, useRef, useState } from "preact/hooks";
-import type { ApiModels, ApiNode, ApiSource, ApiState, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task } from "../types.ts";
+import type { ApiModels, ApiNode, ApiSource, ApiState, ChatEntry, Cta, Finding, NodeId, PrState, StartTaskRequest, Suggestion, Task, TerminalMode } from "../types.ts";
 import { get, onServerEvent, post } from "./api.ts";
+import { linkify } from "./linkify.ts";
+import { hasLiveWorker, messageBlocked } from "./task-actions.ts";
 import { sparkline, taskCompletion } from "./visual.ts";
 
 const LOG_TAIL = 200;
@@ -51,22 +53,22 @@ export function NodePanel({ id, state, version, onStart, onSelect, onError, onCl
       <div class="actions">
         <button onClick={scan}>Scan subtree</button>
       </div>
-      {detail ? <Detail id={id} detail={detail} state={state} onStart={onStart} onSelect={onSelect} onError={onError} /> : <p class="muted">Loading…</p>}
+      {detail ? <Detail id={id} detail={detail} state={state} version={version} onStart={onStart} onSelect={onSelect} onError={onError} /> : <p class="muted">Loading…</p>}
       <Section title="Pull requests" items={prs}>
         {(pr) => <PrRow key={pr.number} pr={pr} onError={onError} />}
       </Section>
       <Section title="Tasks" items={tasks}>
-        {(task) => <TaskCard key={task.id} task={task} version={version} onError={onError} />}
+        {(task) => <TaskCard key={task.id} task={task} prs={state.prs} version={version} onError={onError} />}
       </Section>
     </aside>
   );
 }
 
-interface DetailProps extends Pick<NodePanelProps, "id" | "state" | "onStart" | "onSelect" | "onError"> {
+interface DetailProps extends Pick<NodePanelProps, "id" | "state" | "version" | "onStart" | "onSelect" | "onError"> {
   detail: ApiNode;
 }
 
-function Detail({ id, detail, state, onStart, onSelect, onError }: DetailProps) {
+function Detail({ id, detail, state, version, onStart, onSelect, onError }: DetailProps) {
   const findingsById = new Map(detail.findings.map((f) => [f.id, f]));
   const start = (s: Suggestion) => onStart(s, s.findingIds.map((fid) => findingsById.get(fid)!).filter(Boolean));
   return (
@@ -74,7 +76,7 @@ function Detail({ id, detail, state, onStart, onSelect, onError }: DetailProps) 
       <section class="ctas">
         <h3>This node</h3>
         {detail.ownCtas.length ? (
-          <ul class="list">{detail.ownCtas.map((cta) => <OwnCta key={ctaKey(cta)} cta={cta} state={state} onStart={start} onError={onError} />)}</ul>
+          <ul class="list">{detail.ownCtas.map((cta) => <OwnCta key={ctaKey(cta)} cta={cta} state={state} version={version} onStart={start} onError={onError} />)}</ul>
         ) : (
           <p class="muted small">Nothing to do here.</p>
         )}
@@ -112,7 +114,7 @@ function Detail({ id, detail, state, onStart, onSelect, onError }: DetailProps) 
       <Section title="Findings" items={[...detail.findings].sort((a, b) => b.impact.node - a.impact.node)}>
         {(f) => (
           <li key={f.id}>
-            <span class={`sev ${f.severity}`}>{f.severity}</span> {f.title}
+            <span class={`sev ${f.severity}`}>{f.severity}</span> {linkify(f.title)}
             <div class="muted small">
               {f.source} · {f.file}
               {f.line ? `:${f.line}` : ""} · {f.effort} · +{fmt(f.impact.node)} here, +{fmt(f.impact.root)} root
@@ -129,7 +131,7 @@ function ctaKey(cta: Cta): string {
 }
 
 /** A call to action at the selected node, with its action; tasks and PRs are read live from `state`. */
-function OwnCta({ cta, state, onStart, onError }: { cta: Cta; state: ApiState; onStart(s: Suggestion): void; onError(message: string): void }) {
+function OwnCta({ cta, state, version, onStart, onError }: { cta: Cta; state: ApiState; version: number; onStart(s: Suggestion): void; onError(message: string): void }) {
   if (cta.suggestion) {
     const s = cta.suggestion;
     return (
@@ -144,7 +146,7 @@ function OwnCta({ cta, state, onStart, onError }: { cta: Cta; state: ApiState; o
     <li class="cta">
       <Reason cta={cta} /> <strong>{task.title}</strong>
       {task.state === "needs_input" && <AnswerForm task={task} onError={onError} />}
-      {task.state === "review" && <ReviewDiff task={task} onError={onError} />}
+      <TaskActions task={task} prs={state.prs} version={version} onError={onError} />
     </li>
   );
 }
@@ -162,7 +164,7 @@ function ChildCta({ cta, from, onSelect }: { cta: Cta; from: NodeId; onSelect(id
 }
 
 function Reason({ cta }: { cta: Pick<Cta, "kind" | "reason"> }) {
-  return <span class={`reason ${cta.kind}`}>{cta.reason}</span>;
+  return <span class={`reason ${cta.kind}`}>{linkify(cta.reason)}</span>;
 }
 
 /** POST a task action; resolves to whether it succeeded, reporting failures through `onError`. */
@@ -186,33 +188,12 @@ function AnswerForm({ task, onError }: { task: Task; onError(message: string): v
         void taskAction(task, "answer", onError, { text: answer }).then((ok) => ok && setAnswer(""));
       }}
     >
-      <p>{task.question}</p>
+      <p>{linkify(task.question ?? "")}</p>
       <textarea value={answer} onInput={(e) => setAnswer((e.currentTarget as HTMLTextAreaElement).value)} rows={3} />
       <button type="submit" disabled={!answer.trim()}>
         Answer
       </button>
     </form>
-  );
-}
-
-function ReviewDiff({ task, onError }: { task: Task; onError(message: string): void }) {
-  const [diff, setDiff] = useState<string | null>(null);
-  useEffect(() => {
-    get<string>(`/api/tasks/${task.id}/diff`).then(setDiff, (e: Error) => onError(e.message));
-  }, [task.id]);
-  return (
-    <div>
-      <pre class="diff">
-        {(diff ?? "").split("\n").map((line, i) => (
-          <div key={i} class={line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : undefined}>
-            {line || " "}
-          </div>
-        ))}
-      </pre>
-      <button class="primary" onClick={() => taskAction(task, "open-pr", onError)}>
-        Open PR
-      </button>
-    </div>
   );
 }
 
@@ -230,7 +211,7 @@ export function SuggestionRow({ suggestion: s, onStart }: { suggestion: Suggesti
   return (
     <div class="row">
       <div>
-        {s.title}
+        {linkify(s.title)}
         <div class="muted small">
           +{fmt(s.impact.node)} here · {s.effort} · priority {fmt(s.priority)}
           {s.conflict > 0 ? ` · conflict ${Math.round(s.conflict * 100)}%` : ""}
@@ -270,58 +251,17 @@ export function PrRow({ pr, reason, onError }: { pr: PrState; reason?: string; o
   );
 }
 
-export function TaskCard({ task, version, onError }: { task: Task; version: number; onError(message: string): void }) {
-  const [log, setLog] = useState<string[]>([]);
-  const logEl = useRef<HTMLPreElement>(null);
-  const showLog = ["running", "needs_input", "review", "failed"].includes(task.state);
-
-  useEffect(() => {
-    if (!showLog) return;
-    let live = true;
-    get<string>(`/api/tasks/${task.id}/log?tail=${LOG_TAIL}`).then((text) => live && setLog(text ? text.split("\n") : []), () => {});
-    const unsubscribe = onServerEvent((e) => {
-      if (e.type === "log" && e.taskId === task.id) setLog((lines) => [...lines.slice(1 - LOG_TAIL), e.line]);
-    });
-    return () => {
-      live = false;
-      unsubscribe();
-    };
-  }, [task.id, showLog, version]);
-
-  useEffect(() => {
-    logEl.current?.scrollTo(0, logEl.current.scrollHeight);
-  }, [log]);
-
-
+export function TaskCard({ task, prs, version, onError }: { task: Task; prs: PrState[]; version: number; onError(message: string): void }) {
   return (
     <li class="task">
-      <div class="row">
-        <div>
-          <strong>{task.title}</strong>
-          <div class="muted small">
-            <span class={`state ${task.state}`}>{task.state.replace("_", " ")}</span> · {task.phase} ·{" "}
-            {Math.round(taskCompletion(task) * 100)}% · {fmt(task.plannedFrom)} → {fmt(task.plannedTo)}
-            {task.manualReview ? " · manual review" : ""}
-            {task.model ? ` · ${task.model}` : ""}
-            {task.pr ? ` · PR #${task.pr}` : ""}
-          </div>
+      <div>
+        <strong>{task.title}</strong>
+        <div class="muted small">
+          <span class={`state ${task.state}`}>{task.state.replace("_", " ")}</span> · {task.phase} ·{" "}
+          {Math.round(taskCompletion(task) * 100)}% · {fmt(task.plannedFrom)} → {fmt(task.plannedTo)}
+          {task.manualReview ? " · manual review" : ""}
+          {task.model ? ` · ${task.model}` : ""}
         </div>
-        <span>
-          {["queued", "running", "needs_input", "review"].includes(task.state) && (
-            <button class="link" onClick={() => taskAction(task, "cancel", onError)}>
-              cancel
-            </button>
-          )}
-          {task.state !== "pr_open" && (
-            <button
-              class="link"
-              title="Delete the worktree, local branch and task without opening a PR"
-              onClick={() => confirm(`Discard "${task.title}"? Its worktree and local branch are deleted.`) && taskAction(task, "discard", onError)}
-            >
-              discard
-            </button>
-          )}
-        </span>
       </div>
       {task.checklist.length > 0 && (
         <ul class="checklist">
@@ -332,13 +272,185 @@ export function TaskCard({ task, version, onError }: { task: Task; version: numb
           ))}
         </ul>
       )}
-      {task.error && <p class="error small">{task.error}</p>}
-      {showLog && log.length > 0 && (
-        <pre class="log" ref={logEl}>
-          {log.join("\n")}
-        </pre>
-      )}
+      {task.error && <p class="error small">{linkify(task.error)}</p>}
+      <TaskActions task={task} prs={prs} version={version} onError={onError} />
     </li>
+  );
+}
+
+type Pane = "log" | "diff" | "chat";
+
+/** The task's action bar (see docs/DESIGN.md "Task actions") and the panes it toggles. */
+function TaskActions({ task, prs, version, onError }: { task: Task; prs: PrState[]; version: number; onError(message: string): void }) {
+  const [open, setOpen] = useState<Set<Pane>>(() => new Set(task.state === "review" ? ["diff"] : []));
+  const toggle = (pane: Pane) =>
+    setOpen((panes) => {
+      const next = new Set(panes);
+      if (!next.delete(pane)) next.add(pane);
+      return next;
+    });
+  const live = hasLiveWorker(task);
+  const openTerminal = (mode: TerminalMode) => taskAction(task, "open-terminal", onError, { mode });
+  const prUrl = prs.find((p) => p.number === task.pr)?.url;
+  return (
+    <div>
+      <div class="action-bar">
+        {task.state === "review" && (
+          <button class="primary" onClick={() => taskAction(task, "open-pr", onError)}>
+            Open PR
+          </button>
+        )}
+        {(live || task.state === "review") && <button onClick={() => taskAction(task, "cancel", onError)}>Cancel</button>}
+        {task.state !== "pr_open" && (
+          <button
+            title="Delete the worktree, local branch and task without opening a PR"
+            onClick={() => confirm(`Discard "${task.title}"? Its worktree and local branch are deleted.`) && taskAction(task, "discard", onError)}
+          >
+            Discard
+          </button>
+        )}
+        <PaneToggle pane="log" open={open} toggle={toggle} />
+        {task.worktree && (
+          <>
+            <PaneToggle pane="diff" open={open} toggle={toggle} />
+            <PaneToggle pane="chat" open={open} toggle={toggle} />
+            <button title="Open a terminal window with a shell in the task's worktree" onClick={() => openTerminal("shell")}>
+              Open shell
+            </button>
+            <button
+              title={live ? "The worker is using the session; cancel it first" : "Open a terminal window running pi on the task's session"}
+              disabled={live}
+              onClick={() => openTerminal("agent")}
+            >
+              Open agent
+            </button>
+          </>
+        )}
+        {task.pr !== undefined &&
+          (prUrl ? (
+            <a href={prUrl} target="_blank" rel="noreferrer">
+              PR #{task.pr}
+            </a>
+          ) : (
+            <span class="muted">PR #{task.pr}</span>
+          ))}
+      </div>
+      {open.has("log") && <LogPane task={task} version={version} />}
+      {open.has("diff") && <DiffPane task={task} onError={onError} />}
+      {open.has("chat") && <ChatPane task={task} version={version} onError={onError} />}
+    </div>
+  );
+}
+
+const PANE_LABELS: Record<Pane, string> = { log: "Log", diff: "Diff", chat: "Chat" };
+
+function PaneToggle({ pane, open, toggle }: { pane: Pane; open: Set<Pane>; toggle(pane: Pane): void }) {
+  return (
+    <button class={open.has(pane) ? "toggled" : undefined} aria-pressed={open.has(pane)} onClick={() => toggle(pane)}>
+      {PANE_LABELS[pane]}
+    </button>
+  );
+}
+
+function LogPane({ task, version }: { task: Task; version: number }) {
+  const [log, setLog] = useState<string[]>([]);
+  const logEl = useRef<HTMLPreElement>(null);
+  useEffect(() => {
+    let live = true;
+    get<string>(`/api/tasks/${task.id}/log?tail=${LOG_TAIL}`).then((text) => live && setLog(text ? text.split("\n") : []), () => {});
+    const unsubscribe = onServerEvent((e) => {
+      if (e.type === "log" && e.taskId === task.id) setLog((lines) => [...lines.slice(1 - LOG_TAIL), e.line]);
+    });
+    return () => {
+      live = false;
+      unsubscribe();
+    };
+  }, [task.id, version]);
+  useEffect(() => {
+    logEl.current?.scrollTo(0, logEl.current.scrollHeight);
+  }, [log]);
+  return (
+    <pre class="log" ref={logEl}>
+      {log.length ? log.map((line, i) => <div key={i}>{linkify(line)}</div>) : <span class="muted">No log yet.</span>}
+    </pre>
+  );
+}
+
+function DiffPane({ task, onError }: { task: Task; onError(message: string): void }) {
+  const [diff, setDiff] = useState<string | null>(null);
+  useEffect(() => {
+    get<string>(`/api/tasks/${task.id}/diff`).then(setDiff, (e: Error) => onError(e.message));
+  }, [task.id, task.state]);
+  return (
+    <pre class="diff">
+      {diff === null
+        ? "Loading diff…"
+        : diff === ""
+          ? "No changes yet."
+          : diff.split("\n").map((line, i) => (
+              <div key={i} class={line.startsWith("+") ? "add" : line.startsWith("-") ? "del" : undefined}>
+                {line || " "}
+              </div>
+            ))}
+    </pre>
+  );
+}
+
+/** The snapshot followed by every shown entry it lacks (events that arrived while it loaded). */
+function mergeChat(snapshot: ChatEntry[], shown: ChatEntry[]): ChatEntry[] {
+  const key = (e: ChatEntry) => `${e.at}\0${e.role}\0${e.text}`;
+  const known = new Set(snapshot.map(key));
+  return [...snapshot, ...shown.filter((e) => !known.has(key(e)))];
+}
+
+function ChatPane({ task, version, onError }: { task: Task; version: number; onError(message: string): void }) {
+  const [entries, setEntries] = useState<ChatEntry[]>([]);
+  const [text, setText] = useState("");
+  const listEl = useRef<HTMLDivElement>(null);
+  useEffect(() => {
+    let live = true;
+    get<ChatEntry[]>(`/api/tasks/${task.id}/chat`).then((snapshot) => live && setEntries((shown) => mergeChat(snapshot, shown)), (e: Error) => onError(e.message));
+    const unsubscribe = onServerEvent((e) => {
+      if (e.type === "chat" && e.taskId === task.id) setEntries((list) => [...list, e.entry]);
+    });
+    return () => {
+      live = false;
+      unsubscribe();
+    };
+  }, [task.id, version]);
+  useEffect(() => {
+    listEl.current?.scrollTo(0, listEl.current.scrollHeight);
+  }, [entries]);
+  const blocked = messageBlocked(task);
+  const send = (e: Event) => {
+    e.preventDefault();
+    if (blocked || !text.trim()) return;
+    void taskAction(task, "message", onError, { text }).then((ok) => ok && setText(""));
+  };
+  return (
+    <div class="chat">
+      <div class="chat-log" ref={listEl}>
+        {entries.length ? (
+          entries.map((entry, i) => (
+            <div key={i} class={`chat-entry ${entry.role}`}>
+              <span class="muted small">
+                {entry.at.slice(11, 19)} {entry.role}
+              </span>{" "}
+              {linkify(entry.text)}
+            </div>
+          ))
+        ) : (
+          <p class="muted small">No messages yet.</p>
+        )}
+      </div>
+      <form onSubmit={send}>
+        <textarea rows={2} value={text} placeholder="Message the agent" onInput={(e) => setText((e.currentTarget as HTMLTextAreaElement).value)} />
+        <button type="submit" disabled={Boolean(blocked) || !text.trim()} title={blocked}>
+          Send
+        </button>
+        {blocked && <span class="small muted">{blocked}</span>}
+      </form>
+    </div>
   );
 }
 
@@ -357,9 +469,9 @@ function FindingPreview({ finding, open }: { finding: Finding; open: boolean }) 
   return (
     <details class="preview" open={open} onToggle={(e) => (e.currentTarget as HTMLDetailsElement).open && load()}>
       <summary>
-        <span class="small muted">{finding.source}</span> {finding.title}
+        <span class="small muted">{finding.source}</span> {linkify(finding.title)}
       </summary>
-      {finding.detail && <p class="small">{finding.detail}</p>}
+      {finding.detail && <p class="small">{linkify(finding.detail)}</p>}
       {finding.file && (
         <div class="small muted">
           {finding.file}

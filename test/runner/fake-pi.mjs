@@ -93,6 +93,16 @@ const scenarios = {
     say("thinking");
     settle();
   },
+  // Replies to every later message; one containing "finish" completes the checklist.
+  async chat(message, settle) {
+    if (prompts === 1 && !resumed) return report({ plan: ["reply"] });
+    emit({ type: "tool_execution_start", toolName: "read", args: { path: "README.md" } });
+    say(`heard: ${message}`);
+    if (!message.includes("finish")) return;
+    commit();
+    await report({ done: 0 });
+    settle();
+  },
   async hang() {
     if (prompts === 1) await report({ plan: ["wait"] });
   },
@@ -100,6 +110,10 @@ const scenarios = {
   timeout: (_message, settle) => timedDialog({ advertised: 100, resolvesAfter: 100, workAfter: 300 }, settle),
   // pi's clock resolves the dialog before the runner's timer would, and the agent settles at once.
   expired: (_message, settle) => timedDialog({ advertised: 60_000, resolvesAfter: 20, workAfter: 0 }, settle),
+  async stubborn() {
+    process.on("SIGTERM", () => {});
+    await report({ plan: ["ignore SIGTERM"] });
+  },
   async late() {
     process.on("SIGTERM", () => {
       emit({ type: "extension_ui_request", id: "late", method: "confirm", title: "Still there?" });
@@ -123,6 +137,7 @@ const scenarios = {
 function onCommand(command) {
   if (command.type === "extension_ui_response") return dialogs.get(command.id)?.(command);
   if (command.type !== "prompt") return emit({ type: "response", id: command.id, command: command.type, success: false, error: "unsupported" });
+  if (command.streamingBehavior === "steer") process.stderr.write("streamed as steer\n");
   // The asking run's settle crossing the answer on the wire: it must not count as the answered run settling.
   if (scenario === "ask" && prompts === 1) emit({ type: "agent_settled" });
   if (!scenario) {

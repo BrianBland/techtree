@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
@@ -268,4 +268,38 @@ test("source returns lines around a line at the scored commit and rejects bad pa
   assert.equal(status(await backend.source("../etc/passwd").catch((e) => e)), 400);
   assert.equal(status(await backend.source("-p").catch((e) => e)), 400);
   assert.equal(status(await backend.source("nope.ts").catch((e) => e)), 404);
+});
+
+test("open in terminal runs the configured template detached in the worktree; agent mode waits for the worker", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  const out = join(tmp, "opened.json");
+  const record = `require("fs").writeFileSync(${JSON.stringify(out)}, JSON.stringify(process.argv.slice(1)))`;
+  const { backend } = await boot(t, repo, cache, tmp, undefined, { terminal: [process.execPath, "-e", record, "{cwd}", "{command}"] });
+  assert.equal(status(await backend.openTerminal("nope", "shell").catch((e) => e)), 404);
+  assert.equal(status(await backend.chat("nope").catch((e) => e)), 404);
+
+  const task = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:happy", manualReview: true });
+  assert.equal(status(await backend.openTerminal(task.id, "agent").catch((e) => e)), 409, "agent mode while the worker is live");
+  const reviewed = await until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.state === "review")), "review");
+
+  await until(() => backend.openTerminal(task.id, "agent").then(() => true, (e) => (status(e) === 409 ? undefined : Promise.reject(e))), "the finished worker to exit");
+  const [cwd, command] = await until(() => (existsSync(out) ? (JSON.parse(readFileSync(out, "utf8")) as string[]) : undefined), "terminal to run");
+  assert.equal(cwd, reviewed.worktree);
+  assert.ok(command.startsWith(`'${process.execPath}' '${FAKE_PI}' '--session-dir'`), command);
+  assert.ok(command.endsWith(`'--session-id' '${task.id}'`), command);
+
+  rmSync(out);
+  await backend.openTerminal(task.id, "shell");
+  assert.deepEqual(await until(() => existsSync(out) && JSON.parse(readFileSync(out, "utf8")), "shell terminal"), [reviewed.worktree]);
+  assert.ok((await backend.chat(task.id)).some((e) => e.role === "user" && e.text.includes("scenario:happy")));
+});
+
+test("a terminal program that cannot start is a 501", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  const { backend } = await boot(t, repo, cache, tmp, undefined, { terminal: [join(tmp, "no-such-terminal"), "{cwd}"] });
+  const task = await backend.startTask({ node: "", findingIds: [], prompt: "scenario:happy", manualReview: true });
+  await until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.state === "review")), "review");
+  const err = await backend.openTerminal(task.id, "shell").catch((e) => e);
+  assert.equal(status(err), 501);
+  assert.match(err.message, /no-such-terminal/);
 });

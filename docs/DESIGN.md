@@ -67,7 +67,7 @@ It is `index.ts` so that both `-e <package>/extensions` (a directory loads its `
 
 ## Data model (contract for all subtasks)
 
-`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`, and the optional poller fields `mergeable`, `branch`, `head`, `reviewCount`, `babysitStatus` (see "PRs"); the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config`; and the HTTP API payloads below.
+`src/types.ts` is the authoritative copy of these contracts. Beyond the summary below it adds: `TreeNode.parent`; `Tree` (`repoRoot` + `nodes` by id); `CollectCtx` (repo root, tree, config, a `Cache` keyed by kind and key, logger, abort signal); `Finding.tags` (used by the complexity heuristic); `Task.prompt`, `question`, `error`, `pid`, `logPath`, timestamps; `PrState.title`, `author`, `taskId`, and the optional poller fields `mergeable`, `branch`, `head`, `reviewCount`, `babysitStatus` (see "PRs"); the scoring output (`MetricScore`, `NodeScore`, `Impact`, `ScoreResult`, `Suggestion`); `Config` (including the optional `terminal` template); `ChatEntry` (a chat transcript turn); and the HTTP API payloads below.
 
 ```ts
 type NodeId = string;              // repo-relative dir path, "" = root
@@ -259,12 +259,30 @@ The precise rules the scorer implements:
   - Motion means work or attention, never score: research bars animate on nodes with running tasks, and nodes that need you (a task in `needs_input` or `review`, a failing/stuck/stale PR) glow and pulse. Nodes slide when the layout changes, and after a rescore every node whose selected score changed by at least 0.5 flashes and floats its signed delta. Motion respects `prefers-reduced-motion`.
   - Siblings are sorted by a selectable key (default: alphabetical).
 - **Overlays:** running tasks appear as a research bar under the node. The bar is solid up to `plannedFrom`, then shows a loading stripe up to `plannedTo` filled to checklist completion, then empty. Its color follows the score ramp. Open PRs appear as a count bubble on the top-right corner of their anchor node. The anchor is the deepest node that contains at least 60% of the PR's changed lines.
-- **Node panel** (on click): first "This node": the node's own calls to action with their actions (answer a question, review the diff and Open PR, babysit toggle, Start a suggested task); then "From children": the top calls to action from its descendants, each labelled with its path relative to the node and selecting that node on click; then composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, and tasks with checklist and live log tail. Suggested tasks appear only as calls to action. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic), lets you edit the prompt, and lets you pick the model from the models pi reports (`GET /api/models`), prepopulated with `config.defaultModel` or, when unset, the last model used in this repo, else pi's own default. Start stays disabled until that list has loaded, so a task never silently skips the default; if loading fails, the dialog says so and starts with pi's default.
+- **Node panel** (on click): first "This node": the node's own calls to action with their actions (answer a question, review the diff and Open PR, babysit toggle, Start a suggested task); then "From children": the top calls to action from its descendants, each labelled with its path relative to the node and selecting that node on click; then composite score and per-metric breakdown with percentiles and sparklines, findings ranked by impact, open PRs with a babysit toggle, and tasks with their checklist and action bar (see "Task actions"). Suggested tasks appear only as calls to action. Starting a task asks for the manual-review checkbox (pre-ticked by the heuristic), lets you edit the prompt, and lets you pick the model from the models pi reports (`GET /api/models`), prepopulated with `config.defaultModel` or, when unset, the last model used in this repo, else pi's own default. Start stays disabled until that list has loaded, so a task never silently skips the default; if loading fails, the dialog says so and starts with pi's default.
 - **Overview** (no selection): calls to action:
   1. tasks in `needs_input` or `review`
   2. PRs that are failing, stuck (no progress in 24h), or stale (no update in 3 days)
   3. the top suggested tasks by priority, favouring low conflict and diversified by source
   4. a scan-coverage summary
+
+**Task actions.** Every task row (in "This node" and under "Tasks") has one action bar; each action shows only in the states listed:
+
+| Action | Shown when | Does |
+|---|---|---|
+| Open PR | `review` | `POST /api/tasks/:id/open-pr` |
+| Cancel | `queued`, `running`, `needs_input`, `review` | `POST /api/tasks/:id/cancel` (a babysit or fix run returns to `pr_open`, see "Agents") |
+| Discard | every state except `pr_open` | asks for confirmation, then `POST /api/tasks/:id/discard` |
+| Log | always | toggles the log pane: the last 200 lines of `GET /api/tasks/:id/log`, followed live through `log` events |
+| Diff | the task has a worktree | toggles the diff pane (`GET /api/tasks/:id/diff`); open by default in `review` |
+| Chat | the task has a worktree | toggles the chat pane (below) |
+| Open in terminal: shell / agent | the task has a worktree | `POST /api/tasks/:id/open-terminal`; agent is disabled, with the reason as its tooltip, while the task is `queued`, `running` or `needs_input` |
+
+The task's PR shows as a `PR #N` link to the PR's URL when the poller knows the PR, else as plain text.
+
+**Chat pane.** The task's transcript (`GET /api/tasks/:id/chat`, then live `chat` events): user messages, assistant messages and one-line tool calls, each with its time, in order. Below it a textarea and Send post `POST /api/tasks/:id/message`. Send is disabled with the reason shown when the server would refuse the message: the task is `queued` ("waiting for a worker slot"), `running` without a worker yet ("starting"), or `done`. Assistant markdown is shown as plain text.
+
+**Links.** URLs (`http://`, `https://`) in task questions and errors, log and chat lines, finding titles and details, call-to-action reasons and suggestion titles are clickable links opening in a new tab (`rel="noreferrer"`). Trailing punctuation (`.,;:!?'"`, and a closing `)`/`]` without its opener in the URL) stays outside the link; trimming is linear in the URL's length. Text is rendered as text nodes, never as HTML.
 
 **Calls to action** (`Cta`, used by the node panel and overview), ranked highest first:
 1. tasks in `needs_input`, then `review`;
@@ -290,11 +308,19 @@ A node's `ownCtas` are those anchored at the node; `childCtas` are the top 10 an
   - If pi rejects a prompt (`response` with `success: false`), the task becomes `failed` with pi's error, because no run will follow.
   - Records from a child that is no longer the task's current worker (after cancel, replacement or shutdown) are ignored.
   - If the child exits while the task is `queued`, `running` or `needs_input`, the task becomes `failed` with the exit code and log path.
-- **Finish:** a task is finished when its checklist is non-empty and fully ticked and, in the PR stage, `gh pr view <branch> --json number` finds the PR (run asynchronously, with a 60 s timeout); when that lookup fails (e.g. GitHub rate limits), the last `…/pull/<n>` URL in the worker's final message is used instead. The PR stage is every task without `manualReview`, and a `manualReview` task after "Open PR".
+- **Finish:** a task is finished when its checklist is non-empty and fully ticked and, in the PR stage, `gh pr view <branch> --json number` finds the PR (run asynchronously, with a 60 s timeout); when that lookup fails (e.g. GitHub rate limits), the last `…/pull/<n>` URL in the worker's final message is used instead. The PR stage is every task without `manualReview`, a `manualReview` task after "Open PR", and every task that already has a PR. A PR lookup still in flight is ignored when another prompt has been sent to the worker meanwhile (a chat message, an answer) or the checklist is no longer complete; the next settle decides.
   - With `manualReview`, the worker commits and stops; the runner moves the task to `review` and ends the child. The diff is `git diff <baseRef>...HEAD` in the worktree, where `baseRef` is resolved in the main checkout. The UI shows it with an "Open PR" button.
   - "Open PR" (`review` → `queued` → `running`, phase `pr`) resumes the same pi session with an instruction to push to the upstream remote and open the PR with `gh`, following the repo's PR template.
   - Otherwise the worker opens the PR itself in one go. Once the PR number is found the task records it, moves to `pr_open` and the child is ended. Nothing ever merges.
-- **Cancel:** stops the child (if any) and marks the task `failed` with error `cancelled`. The worktree is kept.
+- **Stopping a worker** (cancel, discard, failure, finish): the child gets SIGTERM (on finish, its stdin is closed instead) and SIGKILL if it is still alive 1 s later (5 s on finish). Until it has exited, its session counts as busy: a queued resume of the task waits, and agent mode in "Open in terminal" is refused with 409.
+- **Cancel:** stops the child (if any) and marks the task `failed` with error `cancelled`. The worktree is kept. A task that already has a PR (a babysit or fix run, `pr` set) returns to `pr_open` instead, so the PR stays tracked and babysit can resume it later; nothing happens to the PR itself.
+- **Message** (`POST /api/tasks/:id/message`, the chat pane) routes by state:
+  - `running` with a live worker: sent as a `prompt` with `streamingBehavior: "steer"`, delivered to pi after the current tool calls (or starting a run when pi is idle); it re-arms the nudge.
+  - `needs_input`: an answer (see above).
+  - `review`, `failed` or `pr_open` with a worktree and a pi session: resumed through the queue on its session with the message as the prompt (like "Open PR"); a `failed` task's error is cleared. The finish rules apply as usual, so a `review` task returns to `review` and a `pr_open` task to `pr_open` (its PR number is kept) once its checklist is done again.
+  - anything else (`queued`, `running` before its worker has spawned, `done`, no worktree or no session): rejected with 409.
+- **Chat transcript:** besides the log, the runner appends one JSON line `{ role, text, at }` (`ChatEntry`) per conversation turn to `<cache>/tasks/<task>.chat.jsonl` and emits it as a `chat` event (`{ type: "chat", taskId, entry }`): `user` for every prompt it sends (the initial prompt, answers, messages, nudges and resume prompts, as sent) and every dialog answer, `assistant` for each assistant message with text, `tool` for each tool call (`<tool> <args>`, args truncated to 200 characters). `GET /api/tasks/:id/chat` returns the file's entries in order (empty for tasks started before this existed; 404 for unknown tasks). The chat pane merges the snapshot with `chat` events that arrived while it loaded, so none is lost. Discard deletes the file.
+- **Open in terminal** (`POST /api/tasks/:id/open-terminal`, body `{ mode: "shell" | "agent" }`): opens a real terminal window in the task's worktree, detached from the server. `shell` opens a shell there; `agent` runs interactive pi on the task's session: `piCommand --session-dir <cache>/sessions/<task> --session-id <task>` plus `--model <model>` when the task has one, refused with 409 while the task is `queued`, `running` or `needs_input` (cancel first, because two pi processes would write the same session). Both need an existing worktree (409 otherwise). The window comes from `config.terminal`, an argv template in which `{cwd}` is replaced by the worktree path and `{command}` by the command as one shell-quoted string (literally, in one pass, so `$` sequences and placeholder text inside the values stay as they are) (empty in shell mode; argv elements left empty are dropped). Without `terminal`: on macOS `osascript` tells Terminal.app to `do script "cd '<cwd>' && <command>"` and activates it; on Linux `x-terminal-emulator -e sh -c "cd '<cwd>' && <command>; exec \"${SHELL:-/bin/sh}\""`; elsewhere 501. Every path and argv word is single-quoted for the shell (and the macOS script escaped for AppleScript), so no text reaches a shell unquoted. A terminal program that cannot be started is a 501 naming it.
 - **Discard:** for junk work that should never become a PR. Allowed in every state except `pr_open` (close the PR on GitHub first). Stops the child (if any), force-removes the worktree, deletes the local `techtree/<task>` branch (never a remote branch), deletes the task row, its log and its session, and emits `task_removed`. Its findings become suggestions again.
 - **Babysit tasks:** a task started with `pr: <number>` (runner-only `StartTask` field) adopts that existing PR instead of opening one: its worktree is created detached at `baseRef` and then switched with `gh pr checkout <number> --branch techtree/<task>`, run asynchronously with a 5-minute timeout while the task holds a worker slot (a task cancelled meanwhile never spawns a worker), its prompt is sent as given (the caller includes `/skill:techtree-babysit`), and its PR lookup uses the PR number. `resumeTask(task, prompt)` queues a `pr_open` task that has a worktree to respawn on its session with `prompt`. Babysit itself is described under "PRs".
 - **Recovery:** task state lives in SQLite. RPC runs over the child's stdio, so a new server cannot reattach to an old child; and when the server dies, the child's stdin closes and pi shuts down. On start, for each task persisted as `running`, `needs_input`, or `queued` with a worktree, the runner stops any process still alive at the recorded pid.
@@ -355,7 +381,7 @@ flowchart TD
 
 ## Configuration
 
-Layers, later winning: defaults, the user config (`$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`), then `.techtree.yaml` at the repo root. `weights` and `plugins` merge per key. `piCommand`, `piLoadsExtension` and `worktreeTemplate` choose what techtree executes and where it writes, so they are read from the user config only; a repo file setting them is ignored with a warning. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
+Layers, later winning: defaults, the user config (`$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`), then `.techtree.yaml` at the repo root. `weights` and `plugins` merge per key. `piCommand`, `piLoadsExtension`, `terminal` and `worktreeTemplate` choose what techtree executes and where it writes, so they are read from the user config only; a repo file setting them is ignored with a warning. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
 
 ```yaml
 weights: { }          # metric key → composite weight (defaults in src/config.ts)
@@ -365,6 +391,7 @@ worktreeTemplate: "{home}/code/worktrees/{repo}/techtree-{task}"
 baseRef: HEAD         # ref task worktrees branch from
 piCommand: [pi]       # user config only. argv prefix for pi children; env TECHTREE_PI (one executable path, may contain spaces) overrides the default
 piLoadsExtension: false # user config only. true when pi already loads techtree's extension (installed in pi's extensions dir); workers then get no `-e` flag, for hosts that reject it
+terminal: []          # user config only. argv template for "Open in terminal", e.g. [open, -a, iTerm, "{cwd}"]; {cwd}, {command}; empty = platform default
 defaultModel: ""      # provider/model prefilled in the start dialog; empty = last used, else pi's default
 ignore: [target, node_modules, .git]
 plugins:              # per-plugin options, e.g.
@@ -390,13 +417,16 @@ All routes are under `/api`, require the token (except `/api/health`), and retur
 | `POST /api/tasks/:id/answer` | body `{ text }`: answer a `needs_input` question → `Task` |
 | `POST /api/tasks/:id/open-pr` | `review` → `pr_open` → `Task` |
 | `POST /api/tasks/:id/cancel` | stop the child, mark `failed` → `Task` |
+| `POST /api/tasks/:id/message` | body `{ text }`: message the task's agent, routed by state (see "Agents") → `Task` |
+| `GET /api/tasks/:id/chat` | `ChatEntry[]`: the task's transcript |
+| `POST /api/tasks/:id/open-terminal` | body `{ mode: "shell" \| "agent" }`: open a terminal window in the worktree → `{ ok: true }`; 409 agent mode while a worker is live or without a worktree, 501 no terminal for this platform |
 | `POST /api/tasks/:id/discard` | stop the child, delete worktree, local branch and task (not for `pr_open`) → `{ ok: true }` |
 | `POST /api/prs/:number/babysit` | body `{ on: boolean }` → `PrState` |
 | `POST /api/score` | rescore the repo → `{ ok: true }`; completion arrives as a `scores` event |
 | `POST /api/scan` | body `{ node }`: run the LLM scan on a subtree → `{ ok: true }`; progress arrives as `scan` events |
 | `POST /api/tasks/:id/report` | worker progress from `techtree_report` (`WorkerReport`: at least one of `plan: string[]`, `phase: TaskPhase`, `done: index`, `needs_input: string`) → `Task` |
 
-Errors are JSON `{ error: string }`: 400 malformed body or parameters, 401 missing or wrong token, 403 foreign `Host`/`Origin` or a non-JSON mutating request, 404 unknown route, node, task or PR, 409 the task is in the wrong state, 413 body over 1 MB, 500 anything else. Backends signal 404/409 by throwing `HttpError`.
+Errors are JSON `{ error: string }`: 400 malformed body or parameters, 401 missing or wrong token, 403 foreign `Host`/`Origin` or a non-JSON mutating request, 404 unknown route, node, task or PR, 409 the task is in the wrong state, 413 body over 1 MB, 500 anything else, 501 a platform feature that is unavailable (no terminal program). Backends signal 404/409 by throwing `HttpError`.
 
 The SSE stream sends one `data: <ServerEvent JSON>` message per event and a `: ping` comment every 15 s. It has no replay, so clients refetch `/api/state` (and any open details) whenever the stream reconnects.
 

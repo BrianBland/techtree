@@ -142,6 +142,18 @@ function apiRoutes(backend: Backend): Route[] {
     }),
     post(/^\/api\/tasks\/([^/]+)\/open-pr$/, (_req, _url, [id]) => backend.openPr(id)),
     post(/^\/api\/tasks\/([^/]+)\/cancel$/, (_req, _url, [id]) => backend.cancel(id)),
+    post(/^\/api\/tasks\/([^/]+)\/message$/, async (req, _url, [id]) => {
+      const { text } = await readJson(req);
+      if (typeof text !== "string") throw new HttpError(400, "text must be a string");
+      return backend.message(id, text);
+    }),
+    get(/^\/api\/tasks\/([^/]+)\/chat$/, (_req, _url, [id]) => backend.chat(id)),
+    post(/^\/api\/tasks\/([^/]+)\/open-terminal$/, async (req, _url, [id]) => {
+      const { mode } = await readJson(req);
+      if (mode !== "shell" && mode !== "agent") throw new HttpError(400, 'mode must be "shell" or "agent"');
+      await backend.openTerminal(id, mode);
+      return OK;
+    }),
     post(/^\/api\/tasks\/([^/]+)\/discard$/, async (_req, _url, [id]) => {
       await backend.discard(id);
       return { ok: true };

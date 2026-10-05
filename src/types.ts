@@ -187,6 +187,7 @@ export interface Config {
   piCommand: string[]; // argv prefix used to spawn pi children, e.g. ["pi"]
   piLoadsExtension?: boolean; // pi already loads techtree's extension (installed in its extensions dir): don't pass `-e`
   defaultModel?: string; // start-dialog prefill, "provider/id"
+  terminal?: string[]; // "Open in terminal" argv template with {cwd} and {command}; unset = platform default
   ignore: string[]; // path prefixes or globs excluded from the tree
   plugins: Record<string, Record<string, unknown>>; // per-plugin options
 }
@@ -255,11 +256,22 @@ export interface ApiModels {
   models: string[]; // "provider/id"
 }
 
+/** One turn of a task's conversation with its agent, for the chat pane. */
+export interface ChatEntry {
+  role: "user" | "assistant" | "tool";
+  text: string;
+  at: string; // ISO timestamp
+}
+
+/** "Open in terminal": a shell in the worktree, or interactive pi on the task's session. */
+export type TerminalMode = "shell" | "agent";
+
 export type ServerEvent =
   | { type: "task"; task: Task }
   | { type: "pr"; pr: PrState }
   | { type: "pr_removed"; number: number } // merged or closed; drop it from the PR list
   | { type: "task_removed"; taskId: string } // discarded
   | { type: "log"; taskId: string; line: string }
+  | { type: "chat"; taskId: string; entry: ChatEntry }
   | { type: "scores"; snapshot: { sha: string; createdAt: string } }
   | { type: "scan"; node: NodeId; status: "running" | "done" | "failed"; message?: string };

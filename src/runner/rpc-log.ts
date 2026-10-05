@@ -38,7 +38,7 @@ export function describeRpcRecord(r: RpcRecord): string | undefined {
     case "message_end":
       return isAssistantMessageEnd(r) ? `assistant: ${assistantText(r.message)}` : undefined;
     case "tool_execution_start":
-      return `tool ${r.toolName} ${truncate(JSON.stringify(r.args ?? {}), 200)}`;
+      return `tool ${toolCall(r)}`;
     case "tool_execution_end":
       return r.isError ? `tool ${r.toolName} failed` : undefined;
     case "auto_retry_start":
@@ -59,7 +59,12 @@ export function describeRpcRecord(r: RpcRecord): string | undefined {
   }
 }
 
-function assistantText(message: AgentMessage): string {
+/** `<tool> <args JSON, truncated>` for a `tool_execution_start` record. */
+export function toolCall(r: RpcRecord): string {
+  return `${r.toolName} ${truncate(JSON.stringify(r.args ?? {}), 200)}`;
+}
+
+export function assistantText(message: AgentMessage): string {
   const blocks = Array.isArray(message.content) ? (message.content as { type: string; text?: string }[]) : [];
   const text = blocks
     .filter((b) => b.type === "text")

@@ -29,7 +29,7 @@ export const DEFAULT_CONFIG: Config = {
 };
 
 /** Keys only the user config may set: they choose what techtree executes, so a cloned repo must not. */
-export const USER_ONLY_KEYS = ["piCommand", "piLoadsExtension", "worktreeTemplate"] as const;
+export const USER_ONLY_KEYS = ["piCommand", "piLoadsExtension", "terminal", "worktreeTemplate"] as const;
 
 /** The user config: `$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`. */
 export function userConfigPath(): string {
