@@ -3,7 +3,7 @@ import { useCallback, useEffect, useMemo, useRef, useState } from "preact/hooks"
 import type { ApiState, Finding, NodeId, Suggestion } from "../types.ts";
 import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { focusView, layoutTree, siblingOrder, stubId, toggleOverride, type Overrides, type SortKey } from "./layout.ts";
-import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, tileLooks, tileSize } from "./visual.ts";
+import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
 import { NodePanel, StartDialog } from "./Panel.tsx";
 import { Overview } from "./Overview.tsx";
@@ -80,10 +80,11 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const sortBasis = sortKey === "score" ? scoreOf : sortKey === "weight" ? weightOf : null;
   const order = useMemo(() => siblingOrder(sortKey, scoreOf, weightOf), [sortKey, sortBasis]);
   const attention = useMemo(() => attentionNodes(state.tasks, state.prs), [state.tasks, state.prs]);
+  const values = useMemo(() => subtreeValues(state), [tree, scores, state.tasks, state.prs, state.findingCounts]);
   const liveFocus = Object.hasOwn(tree.nodes, focus) ? focus : "";
   const shown = useMemo(
-    () => focusView({ tree, focus: liveFocus, order, overrides, attention }),
-    [tree, liveFocus, order, overrides, attention],
+    () => focusView({ tree, focus: liveFocus, order, overrides, attention, values }),
+    [tree, liveFocus, order, overrides, attention, values],
   );
   const layout = useMemo(() => layoutTree({ tree, shown, radius }), [tree, shown, radius]);
 
@@ -117,6 +118,10 @@ function Main({ state, version, error, notice, setError }: MainProps) {
   const onToggle = (id: NodeId) => {
     const hiding = (layout.byId.get(id)?.hiddenChildren ?? 0) > 0 || layout.byId.has(stubId(id));
     setOverrides((o) => toggleOverride(o, id, hiding, isAncestor(tree, id, liveFocus)));
+  };
+  const onStub = (parent: NodeId) => {
+    if (parent === liveFocus || isAncestor(tree, liveFocus, parent)) setOverrides((o) => toggleOverride(o, parent, true, false));
+    else select(parent);
   };
   const scoreChoices = metricDefs.filter((d) => d.direction !== "neutral");
   const weightChoices = metricDefs.filter((d) => d.aggregate === "sum" || d.aggregate === "max");
@@ -181,6 +186,7 @@ function Main({ state, version, error, notice, setError }: MainProps) {
           fitRequest={fitRequest}
           onSelect={select}
           onToggle={onToggle}
+          onStub={onStub}
         />
         {selected === null ? (
           <Overview state={state} version={version} onSelect={select} onStart={(s) => setStarting({ suggestion: s, findings: [] })} onError={setError} />

@@ -31,59 +31,85 @@ export interface LayoutInput {
   radius: (id: NodeId) => number;
 }
 
-export const COLUMN_WIDTH = 200;
+export const ROW_HEIGHT = 120;
 export const STUB_RADIUS = 12;
-const NODE_GAP = 10;
+/** Half the width of a tile with its side badges, in tile radii (badges reach 5/16 of the side past each edge). */
+export const DECORATED_HALF_WIDTH = 13 / 8;
+/** Advance of one label character: 12px monospace. */
+export const CHAR_WIDTH = 7.25;
+/** Room for the expand handle before a label. */
+export const HANDLE_WIDTH = 14;
+const LABEL_CHARS = 14;
+const NODE_GAP = 12;
+/** Height of the label line under a tile. */
+export const LABEL_HEIGHT = 20;
 
 /** Id of the "+N more" stub under `parent`; NUL never occurs in a path, so it cannot clash with a node. */
 export function stubId(parent: NodeId): string {
   return `${parent}\0more`;
 }
 
+/** The name as drawn under a tile: cut to LABEL_CHARS characters with an ellipsis. */
+export function labelName(name: string): string {
+  return name.length > LABEL_CHARS ? `${name.slice(0, LABEL_CHARS - 1)}…` : name;
+}
+
+/** Width of a tile's label line: the expand handle, the cut name and the hidden-children count. */
+export function labelWidth(name: string, expandable: boolean, hiddenChildren: number): number {
+  const chars = labelName(name).length + (hiddenChildren > 0 ? 1 + String(hiddenChildren).length : 0);
+  return (expandable ? HANDLE_WIDTH : 0) + chars * CHAR_WIDTH;
+}
+
 /**
- * Left-to-right tree layout: depth picks the column; each subtree gets a contiguous vertical
- * band at least as tall as its children's bands and its own node; parents are centred on their
- * children. Bands never intersect, so nodes never overlap. An open node showing only some of its
- * children gets a "+N more" stub after them.
+ * Top-to-bottom tree layout: depth picks the row; each subtree gets a contiguous horizontal band at
+ * least as wide as its children's bands and its own slot (tile with badges, or label, whichever is
+ * wider); parents are centred over their children. Bands never intersect, so nothing overlaps. An
+ * open node showing only some of its children gets a "+N more" stub after them.
  */
 export function layoutTree({ tree, shown, radius }: LayoutInput): Layout {
   const nodes: PlacedNode[] = [];
   const byId = new Map<NodeId, PlacedNode>();
   const edges: Layout["edges"] = [];
+  const halfWidths = new Map<NodeId, number>();
 
-  function leaf(placed: PlacedNode, top: number): number {
-    const own = 2 * placed.r + NODE_GAP;
+  function slot(placed: PlacedNode, label: number): number {
+    const half = Math.max(DECORATED_HALF_WIDTH * placed.r, label / 2);
+    halfWidths.set(placed.id, half);
+    return 2 * half + NODE_GAP;
+  }
+
+  function leaf(placed: PlacedNode, own: number, left: number): number {
     nodes.push(placed);
     byId.set(placed.id, placed);
-    placed.y = top + own / 2;
+    placed.x = left + own / 2;
     return own;
   }
 
-  function place(node: TreeNode, depth: number, top: number): number {
+  function place(node: TreeNode, depth: number, left: number): number {
     const kids = shown.get(node.id);
-    const placed: PlacedNode = { id: node.id, x: depth * COLUMN_WIDTH, y: 0, r: radius(node.id), depth, hiddenChildren: kids ? 0 : node.children.length };
-    if (!kids || node.children.length === 0) return leaf(placed, top);
-    const own = 2 * placed.r + NODE_GAP;
+    const placed: PlacedNode = { id: node.id, x: 0, y: depth * ROW_HEIGHT, r: radius(node.id), depth, hiddenChildren: kids ? 0 : node.children.length };
+    const own = slot(placed, labelWidth(node.name, node.children.length > 0, placed.hiddenChildren));
+    if (!kids || node.children.length === 0) return leaf(placed, own, left);
     nodes.push(placed);
     byId.set(node.id, placed);
     const start = nodes.length;
     const children: PlacedNode[] = [];
-    let childTop = top;
+    let childLeft = left;
     for (const id of kids) {
-      childTop += place(tree.nodes[id], depth + 1, childTop);
+      childLeft += place(tree.nodes[id], depth + 1, childLeft);
       children.push(byId.get(id)!);
     }
     const folded = node.children.length - kids.length;
     if (folded > 0) {
-      const stub: PlacedNode = { id: stubId(node.id), x: (depth + 1) * COLUMN_WIDTH, y: 0, r: STUB_RADIUS, depth: depth + 1, hiddenChildren: folded, stubOf: node.id };
-      childTop += leaf(stub, childTop);
+      const stub: PlacedNode = { id: stubId(node.id), x: 0, y: (depth + 1) * ROW_HEIGHT, r: STUB_RADIUS, depth: depth + 1, hiddenChildren: folded, stubOf: node.id };
+      childLeft += leaf(stub, slot(stub, labelWidth(`+${folded} more`, false, 0)), childLeft);
       children.push(stub);
     }
-    const childBand = childTop - top;
+    const childBand = childLeft - left;
     const band = Math.max(own, childBand);
     const shift = (band - childBand) / 2;
-    if (shift > 0) for (let i = start; i < nodes.length; i++) nodes[i].y += shift;
-    placed.y = (children[0].y + children[children.length - 1].y) / 2;
+    if (shift > 0) for (let i = start; i < nodes.length; i++) nodes[i].x += shift;
+    placed.x = (children[0].x + children[children.length - 1].x) / 2;
     for (const child of children) edges.push([placed, child]);
     return band;
   }
@@ -91,10 +117,10 @@ export function layoutTree({ tree, shown, radius }: LayoutInput): Layout {
   place(tree.nodes[""], 0, 0);
   const bounds = { minX: Infinity, minY: Infinity, maxX: -Infinity, maxY: -Infinity };
   for (const n of nodes) {
-    bounds.minX = Math.min(bounds.minX, n.x - n.r);
+    bounds.minX = Math.min(bounds.minX, n.x - halfWidths.get(n.id)!);
     bounds.minY = Math.min(bounds.minY, n.y - n.r);
-    bounds.maxX = Math.max(bounds.maxX, n.x + n.r);
-    bounds.maxY = Math.max(bounds.maxY, n.y + n.r);
+    bounds.maxX = Math.max(bounds.maxX, n.x + halfWidths.get(n.id)!);
+    bounds.maxY = Math.max(bounds.maxY, n.y + n.r + LABEL_HEIGHT);
   }
   return { nodes, byId, edges, bounds };
 }
@@ -125,56 +151,94 @@ export interface FocusInput {
   overrides: Overrides;
   /** Nodes with an attention item; siblings whose subtree holds one are preferred as context. */
   attention: ReadonlySet<NodeId>;
+  /** Subtree value per node (see `subtreeValues`); missing nodes are worth 0. */
+  values: ReadonlyMap<NodeId, number>;
   budget?: number;
   /** Siblings kept around the focus and around each ancestor. */
   context?: number;
 }
 
+const MAX_FOCUS_CHILDREN = 40;
+const CHAIN_CHILDREN = 2;
+
 /**
  * The children to draw when the tree is focused on `focus` (see DESIGN "UI → Tree → Focus"): the
- * ancestor path with a few siblings per level, then the focus's descendants breadth-first while
- * whole child lists fit the budget, with manual overrides applied on top. Manual expansions win:
- * automatic ones are undone, latest first, until the view fits again.
+ * ancestor path with a few siblings per level, every child of the focus, then best-first chains into
+ * the descendants of highest subtree value while they fit the budget, with manual overrides applied on
+ * top. Manual expansions win: automatic openings are undone, latest first, until the view fits again.
  */
-export function focusView({ tree, focus, order, overrides, attention, budget = 150, context = 3 }: FocusInput): Map<NodeId, NodeId[]> {
+export function focusView({ tree, focus, order, overrides, attention, values, budget = 70, context = 3 }: FocusInput): Map<NodeId, NodeId[]> {
   const shown = new Map<NodeId, NodeId[]>();
   const warm = withAncestors(tree, attention);
+  const valueOf = (id: NodeId) => values.get(id) ?? 0;
+  const byValue: SiblingOrder = (a, b) => valueOf(b.id) - valueOf(a.id) || order(a, b);
+  let visible = 1;
+  const revealed = (id: NodeId, kids: readonly NodeId[]) => kids.length + (kids.length < tree.nodes[id].children.length ? 1 : 0);
+  const open = (id: NodeId, kids: NodeId[]) => {
+    shown.set(id, kids);
+    visible += revealed(id, kids);
+  };
+  const toManual = withAncestors(tree, new Set([...overrides].filter(([, expanded]) => expanded).map(([id]) => id)));
+  const forced = (node: TreeNode) => toManual.has(node.id);
+  const openable = (node: TreeNode) => node.children.length > 0 && overrides.get(node.id) !== false;
+  /**
+   * The `count` most valuable children, in sort order; all of them when only one would be left out.
+   * Children leading to a manual expansion are always kept, so value changes never hide it.
+   */
+  const best = (node: TreeNode, count: number) => {
+    const ranked = sortedChildren(tree, node, byValue);
+    const picked = new Set(ranked.slice(0, ranked.length === count + 1 ? count + 1 : count));
+    for (const child of ranked) if (forced(child)) picked.add(child);
+    return sortedChildren(tree, node, order).filter((n) => picked.has(n)).map((n) => n.id);
+  };
+
   const path: NodeId[] = [];
   for (let id: NodeId | null = focus; id !== null; id = tree.nodes[id].parent) path.unshift(id);
-  let visible = 1;
-  const queue: { id: NodeId; auto: boolean }[] = [];
+  const contextNodes: NodeId[] = [];
   for (let i = 0; i < path.length - 1; i++) {
     const children = sortedChildren(tree, tree.nodes[path[i]], order).map((n) => n.id);
     const kids = overrides.get(path[i]) ? children : nearSiblings(children, path[i + 1], context, warm);
-    shown.set(path[i], kids);
-    visible += kids.length + (kids.length < children.length ? 1 : 0);
-    for (const id of kids) if (id !== path[i + 1]) queue.push({ id, auto: false });
+    open(path[i], kids);
+    contextNodes.push(...kids.filter((id) => id !== path[i + 1]));
   }
-  queue.unshift({ id: focus, auto: true });
-  const automatic: NodeId[] = [];
+  for (const id of contextNodes) {
+    if (!overrides.get(id) || tree.nodes[id].children.length === 0) continue;
+    const kids = sortedChildren(tree, tree.nodes[id], order).map((n) => n.id);
+    open(id, kids);
+    contextNodes.push(...kids);
+  }
+
+  let frontier: TreeNode[] = [];
   let full = false;
-  for (let head = 0; head < queue.length; head++) {
-    const { id, auto } = queue[head];
-    const node = tree.nodes[id];
-    const override = overrides.get(id);
-    if (node.children.length === 0 || override === false) continue;
-    if (!override) {
-      if (!auto || full) continue;
-      if (visible + node.children.length > budget) {
-        full = true;
-        continue;
-      }
-    }
-    const kids = sortedChildren(tree, node, order).map((n) => n.id);
-    shown.set(id, kids);
-    visible += kids.length;
-    if (!override) automatic.push(id);
-    for (const kid of kids) queue.push({ id: kid, auto });
+  const reach = (kids: NodeId[]) => {
+    for (const id of kids) if (openable(tree.nodes[id]) && (!full || forced(tree.nodes[id]))) frontier.push(tree.nodes[id]);
+  };
+  const focusNode = tree.nodes[focus];
+  const focusOverride = overrides.get(focus);
+  if (openable(focusNode)) {
+    open(focus, focusOverride ? sortedChildren(tree, focusNode, order).map((n) => n.id) : best(focusNode, MAX_FOCUS_CHILDREN));
+    reach(shown.get(focus)!);
   }
-  const leadsToManual = withAncestors(tree, new Set([...overrides].filter(([id, open]) => open && shown.has(id)).map(([id]) => id)));
+  const automatic: NodeId[] = [];
+  while (frontier.length > 0) {
+    let top = 0;
+    for (let i = 1; i < frontier.length; i++) if (byValue(frontier[i], frontier[top]) < 0) top = i;
+    const [node] = frontier.splice(top, 1);
+    const override = overrides.get(node.id);
+    const kids = override ? sortedChildren(tree, node, order).map((n) => n.id) : best(node, CHAIN_CHILDREN);
+    if (!forced(node) && visible + revealed(node.id, kids) > budget) {
+      full = true;
+      frontier = frontier.filter(forced);
+      continue;
+    }
+    open(node.id, kids);
+    if (!override) automatic.push(node.id);
+    reach(kids);
+  }
+  const leadsToManual = withAncestors(tree, new Set([...overrides].filter(([id, expanded]) => expanded && shown.has(id)).map(([id]) => id)));
   for (let i = automatic.length - 1; i >= 0 && visible > budget; i--) {
     if (leadsToManual.has(automatic[i])) continue;
-    visible -= shown.get(automatic[i])!.length;
+    visible -= revealed(automatic[i], shown.get(automatic[i])!);
     shown.delete(automatic[i]);
   }
   return shown;

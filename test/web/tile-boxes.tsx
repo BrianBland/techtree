@@ -8,14 +8,14 @@ import { FakeDocument, type FakeNode } from "./fake-dom.ts";
 export interface Box {
   node: string;
   cls: string;
-  top: number;
-  bottom: number;
+  left: number;
+  right: number;
 }
 
 /**
  * Render `count` equal-weight sibling leaves with every decoration (attention glow on `attention`, all
  * by default; selection ring, crate marks, question, failing PR and finding badges) and return each
- * tile's painted rect boxes in world units.
+ * tile's painted rect boxes' horizontal extents in world units.
  */
 export function decoratedSiblingBoxes(count: number, attention?: ReadonlySet<NodeId>): Box[] {
   const doc = new FakeDocument();
@@ -50,25 +50,26 @@ export function decoratedSiblingBoxes(count: number, attention?: ReadonlySet<Nod
       fitRequest={0}
       onSelect={() => {}}
       onToggle={() => {}}
+      onStub={() => {}}
     />,
     root as unknown as Element,
   );
 
   const boxes: Box[] = [];
-  const walk = (el: FakeNode, node: string, ty: number, k: number) => {
+  const walk = (el: FakeNode, node: string, tx: number, k: number) => {
     const scale = /scale\(([\d.]+)\)/.exec(el.getAttribute("transform") ?? "");
     const k2 = scale ? k * Number(scale[1]) : k;
     if (el.localName === "rect") {
-      const y = Number(el.getAttribute("y") ?? 0);
-      const h = Number(el.getAttribute("height"));
-      boxes.push({ node, cls: el.getAttribute("class") ?? "", top: ty + y * k2, bottom: ty + (y + h) * k2 });
+      const x = Number(el.getAttribute("x") ?? 0);
+      const w = Number(el.getAttribute("width"));
+      boxes.push({ node, cls: el.getAttribute("class") ?? "", left: tx + x * k2, right: tx + (x + w) * k2 });
     }
-    for (const child of el.childNodes) if (child.nodeType === 1) walk(child, node, ty, k2);
+    for (const child of el.childNodes) if (child.nodeType === 1) walk(child, node, tx, k2);
   };
   for (const g of (root as unknown as FakeNode).querySelectorAll((n) => /^node( |$)/.test(n.getAttribute("class") ?? ""))) {
     const translate = /translate\(([-\d.]+)px,([-\d.]+)px\)/.exec(String((g.style as Record<string, unknown>).transform))!;
     const id = g.querySelectorAll((n) => n.getAttribute("class") === "label")[0].textContent;
-    walk(g, id, Number(translate[2]), 1);
+    walk(g, id, Number(translate[1]), 1);
   }
   return boxes;
 }

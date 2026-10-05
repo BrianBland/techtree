@@ -1,6 +1,6 @@
 import { useEffect, useMemo, useRef } from "preact/hooks";
 import type { NodeId, PrState, Task, Tree } from "../types.ts";
-import { stubId, type Layout, type PlacedNode } from "./layout.ts";
+import { HANDLE_WIDTH, LABEL_HEIGHT, labelName, labelWidth, ROW_HEIGHT, stubId, type Layout, type PlacedNode } from "./layout.ts";
 import { researchBar, type TileLook } from "./visual.ts";
 import { fitView, zoomAt, type View } from "./view.ts";
 
@@ -22,26 +22,30 @@ export interface TreeViewProps {
   fitRequest: number;
   onSelect(id: NodeId): void;
   onToggle(id: NodeId): void;
+  /** A "+N more" stub under `parent` was clicked. */
+  onStub(parent: NodeId): void;
 }
 
 /** Tiles are drawn as SPRITE×SPRITE pixel sprites scaled to their side. */
 const SPRITE = 16;
 const BAR = { x: 2, y: 12, width: 12, height: 2 };
 /**
- * Decorations stay inside the tile's layout band (side + NODE_GAP): badges sit beside the tile
- * rather than above or below it, and the attention/selection rings hug the tile in world units.
+ * Decorations stay inside the tile's layout slot (DECORATED_HALF_WIDTH radii each side): badges sit
+ * beside the tile, and the attention/selection rings hug the tile in world units.
  */
 const BADGE = 7;
 const BADGE_OUTSET = 5;
 const RING_GAP = 3;
-const ELBOW = 20;
+/** Edges of one parent meet on a bus this far above the children's row; clears the largest tile. */
+const BUS_ABOVE_CHILD = 44;
+const LABEL_BASELINE = 15;
 const STUB_EDGE_WIDTH = 2;
 const DRAG_THRESHOLD = 3;
 const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
 let flashGeneration = 0;
 
 export function TreeView(props: TreeViewProps) {
-  const { tree, layout, look, edgeWidth, compositeColor, tasks, prs, attention, deltas, selected, fitRequest, onSelect, onToggle } = props;
+  const { tree, layout, look, edgeWidth, compositeColor, tasks, prs, attention, deltas, selected, fitRequest, onSelect, onToggle, onStub } = props;
   const svg = useRef<SVGSVGElement>(null);
   const world = useRef<SVGGElement>(null);
   const view = useRef<View>({ x: 0, y: 0, k: 1 });
@@ -112,8 +116,8 @@ export function TreeView(props: TreeViewProps) {
   const edges = useMemo(
     () =>
       layout.edges.map(([p, c]) => {
-        const end = Math.round(c.x - c.r);
-        const d = `M${Math.round(p.x + p.r)} ${Math.round(p.y)}H${end - ELBOW}V${Math.round(c.y)}H${end}`;
+        const bus = Math.round(p.y + ROW_HEIGHT - BUS_ABOVE_CHILD);
+        const d = `M${Math.round(p.x)} ${Math.round(p.y + p.r + LABEL_HEIGHT)}V${bus}H${Math.round(c.x)}V${Math.round(c.y - c.r)}`;
         return <path key={c.id} d={d} style={{ d: `path("${d}")` }} stroke-width={c.stubOf === undefined ? edgeWidth(c.id) : STUB_EDGE_WIDTH} />;
       }),
     [layout, edgeWidth],
@@ -137,7 +141,7 @@ export function TreeView(props: TreeViewProps) {
       <g ref={world}>
         <g class="edges">{edges}</g>
         {layout.nodes.map((n) => {
-          if (n.stubOf !== undefined) return <Stub key={n.id} node={n} onSelect={click(() => onSelect(n.stubOf!))} />;
+          if (n.stubOf !== undefined) return <Stub key={n.id} node={n} onSelect={click(() => onStub(n.stubOf!))} />;
           const node = tree.nodes[n.id];
           return (
             <Tile
@@ -189,10 +193,11 @@ interface TileProps {
 function Tile(props: TileProps) {
   const { node, name, crate, expandable, hiding, look, selected, prs, running, asking, attention, delta, flashKey, compositeColor, onSelect, onToggle } = props;
   const side = node.r * 2;
-  const gutter = (side * (SPRITE - 2 + BADGE)) / SPRITE;
+  const labelLeft = node.r - labelWidth(name, expandable, node.hiddenChildren) / 2;
   const classes = ["node", selected && "selected", attention && "attention", crate && "crate"].filter(Boolean).join(" ");
   return (
     <g class={classes} style={{ transform: `translate(${Math.round(node.x - node.r)}px,${Math.round(node.y - node.r)}px)` }} onClick={onSelect}>
+      <title>{node.id || name}</title>
       {attention && <rect class="glow" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       {selected && <rect class="ring" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       <g transform={`scale(${side / SPRITE})`}>
@@ -217,12 +222,12 @@ function Tile(props: TileProps) {
       </g>
       {expandable && (
         <g class="handle" onClick={onToggle}>
-          <rect x={gutter + 4} y={node.r - 5} width={10} height={10} />
-          <text x={gutter + 9} y={node.r + 3.5}>{hiding ? "+" : "−"}</text>
+          <rect x={labelLeft} y={side + LABEL_BASELINE - 9} width={10} height={10} />
+          <text x={labelLeft + 5} y={side + LABEL_BASELINE - 0.5}>{hiding ? "+" : "−"}</text>
         </g>
       )}
-      <text class="label" x={gutter + (expandable ? 18 : 6)} y={node.r + 4}>
-        {name}
+      <text class="label" x={labelLeft + (expandable ? HANDLE_WIDTH : 0)} y={side + LABEL_BASELINE}>
+        {labelName(name)}
         {node.hiddenChildren > 0 && <tspan class="hidden-count"> {node.hiddenChildren}</tspan>}
       </text>
       {delta !== undefined && (
@@ -234,14 +239,15 @@ function Tile(props: TileProps) {
   );
 }
 
-/** A "+N more" stand-in for folded siblings; clicking it focuses their parent. */
+/** A "+N more" stand-in for folded children. */
 function Stub({ node, onSelect }: { node: PlacedNode; onSelect(e: MouseEvent): void }) {
   const side = node.r * 2;
+  const text = `+${node.hiddenChildren} more`;
   return (
     <g class="stub" style={{ transform: `translate(${Math.round(node.x - node.r)}px,${Math.round(node.y - node.r)}px)` }} onClick={onSelect}>
       <rect width={side} height={side} />
-      <text class="label" x={side + 6} y={node.r + 4}>
-        +{node.hiddenChildren} more
+      <text class="label" x={node.r - labelWidth(text, false, 0) / 2} y={side + LABEL_BASELINE}>
+        {text}
       </text>
     </g>
   );

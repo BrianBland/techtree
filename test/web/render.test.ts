@@ -61,13 +61,13 @@ test("decorated sibling tiles never paint over each other", { timeout: 30_000 },
   const boxes = decoratedSiblingBoxes(3).filter((b) => b.node !== "repo");
   const extent = (node: string) => {
     const own = boxes.filter((b) => b.node === node);
-    return { top: Math.min(...own.map((b) => b.top)), bottom: Math.max(...own.map((b) => b.bottom)) };
+    return { left: Math.min(...own.map((b) => b.left)), right: Math.max(...own.map((b) => b.right)) };
   };
   assert.ok(boxes.some((b) => b.cls === "glow") && boxes.some((b) => b.cls === "ring"), "decorations rendered");
   const [a, b, c] = ["n0", "n1", "n2"].map(extent);
   // Rings and glows are stroked 2 units wide, half of it outside their box.
-  assert.ok(a.bottom + 1 < b.top - 1, `n0 ${JSON.stringify(a)} overlaps n1 ${JSON.stringify(b)}`);
-  assert.ok(b.bottom + 1 < c.top - 1, `n1 ${JSON.stringify(b)} overlaps n2 ${JSON.stringify(c)}`);
+  assert.ok(a.right + 1 < b.left - 1, `n0 ${JSON.stringify(a)} overlaps n1 ${JSON.stringify(b)}`);
+  assert.ok(b.right + 1 < c.left - 1, `n1 ${JSON.stringify(b)} overlaps n2 ${JSON.stringify(c)}`);
 });
 
 test("only nodes that need you glow; worst scores stand out by colour alone", { timeout: 30_000 }, async () => {
@@ -156,10 +156,10 @@ interface Ui {
 /**
  * Boot the real UI against the real server and `RepoBackend` over a scored fixture repo, with
  * fake pi workers: one task asking a question, one running, and one open PR on `RUNNING_NODE`.
- * `serve` can wrap the backend the server talks to.
+ * `serve` can wrap the backend the server talks to; `files` adds files to the fixture repo.
  */
-async function bootUi(t: TestContext, serve: (real: RepoBackend) => Backend = (real) => real): Promise<Ui> {
-  const { tmp, repo, cache } = fixture(t, { "src/net/lib.rs": TODOS });
+async function bootUi(t: TestContext, serve: (real: RepoBackend) => Backend = (real) => real, files: Record<string, string> = {}): Promise<Ui> {
+  const { tmp, repo, cache } = fixture(t, { "src/net/lib.rs": TODOS, ...files });
   mkdirSync(cache, { recursive: true });
   const prs = fakePrs([pr(7, RUNNING_NODE, "Tidy the util helpers")]);
   const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand: [process.execPath, FAKE_PI] });
@@ -229,6 +229,30 @@ test("the UI boots against the server and repo backend, opens nodes and answers 
   const tasks = await tasksAfter(backend, before);
   assert.equal(tasks.length, before + 1);
   assert.equal(tasks.at(-1)!.model, "fake/beta");
+});
+
+test("a stub under the focus expands in place; an ancestor's stub selects its parent", UI_TIMEOUT, async (t) => {
+  const wide = Object.fromEntries(Array.from({ length: 6 }, (_, i) => [`wide/a${i}/x.rs`, "fn x() {}\n"]));
+  const { app, byClass } = await bootUi(t, undefined, wide);
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const label = (g: ReturnType<SmokeDriver["find"]>[number]) => g.querySelectorAll((n) => n.getAttribute("class") === "label")[0]?.textContent;
+  const tiles = () => app.find((n) => /^node( |$)/.test(n.getAttribute("class") ?? ""));
+  const tile = (name: string) => tiles().find((g) => label(g) === name);
+  const stubs = () => byClass("stub");
+  const shownUnderWide = () => tiles().filter((g) => /^a\d$/.test(label(g) ?? "")).length;
+
+  await app.waitFor(() => stubs().some((g) => label(g) === "+4 more"), "wide's +4 more stub under the root focus");
+  assert.equal(shownUnderWide(), 2);
+  stubs().find((g) => label(g) === "+4 more")!.dispatch("click");
+  await app.waitFor(() => shownUnderWide() === 6, "the stub to expand wide in place");
+  assert.ok(app.text().includes("Scan coverage"), "nothing got selected");
+  assert.ok(tile("src"), "the root focus is kept");
+
+  tile("a0")!.dispatch("click");
+  await app.waitFor(() => stubs().some((g) => label(g) === "+2 more"), "a0 focused, with wide's siblings folded");
+  stubs().find((g) => label(g) === "+2 more")!.dispatch("click");
+  await app.waitFor(() => byClass("node selected").map(label).includes("wide"), "the ancestor stub to select wide");
+  assert.equal(shownUnderWide(), 6, "wide is the focus, so all its children show");
 });
 
 /** Open the start dialog of the first suggestion and return its parts. */
