@@ -65,6 +65,11 @@ const GH_TIMEOUT_MS = 60_000;
 /** Cache kind marking PR numbers known to be merged or closed. */
 const RETIRED = "pr-retired";
 
+/** Whether PR `number` has been seen merged or closed. */
+export function prRetired(cache: Cache, number: number): boolean {
+  return cache.get(RETIRED, String(number)) === true;
+}
+
 /** Polls `gh` for the repo's open PRs and keeps the `prs` table current. See docs/DESIGN.md "PRs". */
 export class PrPoller {
   /** `ok` after a successful poll, else what went wrong. */

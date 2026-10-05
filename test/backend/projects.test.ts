@@ -3,7 +3,8 @@ import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
-import { openDb, suppressSqliteWarning } from "../../src/db.ts";
+import { createProject } from "../../src/core/projects.ts";
+import { dbCache, openDb, suppressSqliteWarning } from "../../src/db.ts";
 import type { HttpError } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
 import { FAKE_PI, TODO_FILE, fixture, until } from "./helpers.ts";
@@ -96,4 +97,26 @@ test("projects: the cross-project overview lists every project's attention items
   assert.deepEqual(all.attentionTasks.map((x) => [x.id, x.project]), [[ids[0], "quality"], [ids[1], perf.id]]);
   assert.ok(all.suggestions.length > 0);
   assert.ok(all.suggestions.every((s) => s.project === "quality"), "only Quality has a scorer, so only it suggests");
+});
+
+test("projects: a task whose PR was merged or closed no longer blocks deleting its project", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  mkdirSync(cache, { recursive: true });
+  const db = openDb(cache);
+  const perf = createProject(db, "Perf");
+  const now = new Date().toISOString();
+  const task = { id: "t1", project: perf.id, node: "", title: "t", prompt: "", findingIds: [], state: "pr_open", manualReview: false, pr: 7,
+    plannedFrom: 0, plannedTo: 0, checklist: [], phase: "pr", createdAt: now, updatedAt: now };
+  db.prepare("INSERT INTO tasks (id, node, state, data, updated_at, project) VALUES ('t1', '', 'pr_open', ?, ?, ?)").run(JSON.stringify(task), now, perf.id);
+  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand: [process.execPath, FAKE_PI] });
+  const backend = new RepoBackend({ db, repoRoot: repo, cacheDir: cache, config, log: () => {} });
+  backend.attach({ url: "http://127.0.0.1:9", token: "tok" });
+  t.after(() => backend.close());
+  await backend.idle();
+
+  assert.equal(await status(backend.deleteProject(perf.id)), 409, "its PR may still be open");
+  dbCache(db).set("pr-retired", "7", true);
+  await backend.deleteProject(perf.id);
+  assert.deepEqual((await backend.listProjects()).map((p) => p.id), ["quality"]);
+  assert.deepEqual((await backend.getState()).tasks, []);
 });

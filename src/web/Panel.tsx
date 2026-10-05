@@ -21,16 +21,17 @@ export interface NodePanelProps {
 }
 
 export function NodePanel({ id, state, version, onStart, onSelect, onError, onClose }: NodePanelProps) {
-  const [fetched, setFetched] = useState<{ id: NodeId; detail: ApiNode } | null>(null);
-  const detail = fetched?.id === id ? fetched.detail : null;
+  const [fetched, setFetched] = useState<{ id: NodeId; project: string; detail: ApiNode } | null>(null);
+  const project = state.project.id;
+  const detail = fetched?.id === id && fetched.project === project ? fetched.detail : null;
   const node = state.tree.nodes[id];
   const tasks = state.tasks.filter((t) => t.node === id);
   const prs = state.prs.filter((p) => p.node === id);
-  const projectQuery = `project=${encodeURIComponent(state.project.id)}`;
+  const projectQuery = `project=${encodeURIComponent(project)}`;
 
   useEffect(() => {
     let live = true;
-    get<ApiNode>(`/api/node?id=${encodeURIComponent(id)}&${projectQuery}`).then((d) => live && setFetched({ id, detail: d }), (e: Error) => onError(e.message));
+    get<ApiNode>(`/api/node?id=${encodeURIComponent(id)}&${projectQuery}`).then((d) => live && setFetched({ id, project, detail: d }), (e: Error) => onError(e.message));
     return () => {
       live = false;
     };

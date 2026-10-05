@@ -16,7 +16,7 @@ import { llmScanPlugin, scanCoverage, scanNode } from "../plugins/llm-scan.ts";
 import { listModels } from "./models.ts";
 import { launchDetached, shellQuote, terminalArgv } from "./terminal.ts";
 import { Babysitter } from "../prs/babysit.ts";
-import { PrPoller } from "../prs/poller.ts";
+import { PrPoller, prRetired } from "../prs/poller.ts";
 import { TaskRunner } from "../runner/runner.ts";
 import { HttpError, type Backend, type ProjectInput, type WorkerReport } from "../server/backend.ts";
 import type {
@@ -127,9 +127,10 @@ export class RepoBackend implements Backend {
     const project = this.project(id);
     if (project.builtin) throw new HttpError(409, `${project.name} is built in`);
     const tasks = this.runner().list().filter((t) => t.project === id);
-    const blocking = tasks.find((t) => LIVE_STATES.includes(t.state) || t.state === "pr_open");
+    const prClosed = (t: Task) => t.pr !== undefined && prRetired(this.cache, t.pr);
+    const blocking = tasks.find((t) => LIVE_STATES.includes(t.state) || (t.state === "pr_open" && !prClosed(t)));
     if (blocking) throw new HttpError(409, `task ${blocking.id} is ${blocking.state}; cancel it or close its PR first`);
-    for (const task of tasks) await this.discard(task.id);
+    for (const task of tasks) this.runnerCall(() => this.runner().discard(task.id, { prClosed: prClosed(task) }));
     deleteProjectRows(this.opts.db, id);
   }
 

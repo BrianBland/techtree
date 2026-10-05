@@ -43,7 +43,10 @@ function App() {
 
   useEffect(() => {
     void loadProjects();
-    const stopReconnect = onReconnect(resync);
+    const stopReconnect = onReconnect(() => {
+      void loadProjects();
+      resync();
+    });
     const stopEvents = onServerEvent((event) => {
       if (event.type === "task") {
         setEventTick((n) => n + 1);
@@ -71,7 +74,11 @@ function App() {
   }, []);
 
   if (!state) return <div class="loading">{error ?? "Loading…"}</div>;
-  const onProjectsChanged = (next: string) => void loadProjects().then(() => switchView(next));
+  const onProjectsChanged = (next: string) =>
+    void loadProjects().then(() => {
+      switchView(next);
+      if (next === shownProject.current) void load();
+    });
   return (
     <Main
       state={state}
@@ -167,6 +174,10 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
     setOverrides(new Map());
     setFitRequest((n) => n + 1);
   };
+  const switchTo = (next: string) => {
+    if (next === ALL_PROJECTS) setSelected(null);
+    onSwitch(next);
+  };
   const onToggle = (id: NodeId) => {
     const hiding = (layout.byId.get(id)?.hiddenChildren ?? 0) > 0 || layout.byId.has(stubId(id));
     setOverrides((o) => toggleOverride(o, id, hiding, isAncestor(tree, id, liveFocus)));
@@ -183,7 +194,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
       <header class="toolbar">
         <strong>techtree</strong>
         <span class="muted">{state.repo.name}</span>
-        <ProjectSwitcher projects={projects} view={view} onSwitch={onSwitch} onChanged={onProjectsChanged} onError={setError} />
+        <ProjectSwitcher projects={projects} view={view} onSwitch={switchTo} onChanged={onProjectsChanged} onError={setError} />
         <label>
           Score
           <select value={scoreKey} onChange={(e) => setScoreKey((e.currentTarget as HTMLSelectElement).value)}>

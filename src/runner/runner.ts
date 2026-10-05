@@ -247,9 +247,9 @@ export class TaskRunner {
   }
 
   /** Throw away a task that should never become a PR: stop it, remove its worktree, local branch, log, session and row. */
-  discard(taskId: string): void {
+  discard(taskId: string, { prClosed = false } = {}): void {
     const task = this.require(taskId);
-    if (task.state === "pr_open") throw new Error(`task ${taskId} has an open PR; close it on GitHub first`);
+    if (task.state === "pr_open" && !prClosed) throw new Error(`task ${taskId} has an open PR; close it on GitHub first`);
     this.stopWorker(task);
     this.checkingOut.delete(task.id);
     if (task.worktree) tryGit(this.opts.repoRoot, "worktree", "remove", "--force", task.worktree);

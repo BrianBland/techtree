@@ -602,3 +602,47 @@ test("dragging the panel's left edge resizes it within bounds, remembers the wid
   assert.equal(width(), "440");
   assert.equal(stored.has("techtree.panelWidth"), false);
 });
+
+test("switching projects with a node open drops the old project's actions; All projects shows the overview", UI_TIMEOUT, async (t) => {
+  let release!: () => void;
+  const gate = new Promise<void>((resolve) => (release = resolve));
+  const ui = await bootUi(t, (real) => ({ ...delegate(real), getNode: (id, project) => (project === "perf" ? gate : Promise.resolve()).then(() => real.getNode(id, project)) }));
+  const { app, backend } = ui;
+  await backend.createProject({ name: "Perf" });
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  const switcher = () => app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as SmokeDriver["root"] & { value: string };
+  const choose = (value: string) => {
+    switcher().value = value;
+    switcher().dispatch("change");
+  };
+  const node = TODO_FILE.slice(0, TODO_FILE.lastIndexOf("/"));
+  const name = (await backend.getState()).tree.nodes[node].name;
+  app.find((n) => n.getAttribute("class") === "label" && n.textContent === name)[0].dispatch("click");
+  const starts = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
+  await app.waitFor(() => starts().length > 0, "Quality's suggestion in the node panel");
+
+  app.reconnect(); // refetch the project list, which now includes Perf
+  await app.waitFor(() => switcher().querySelectorAll((n) => n.localName === "option").some((o) => o.textContent === "Perf"), "Perf in the switcher");
+  choose("perf");
+  await app.waitFor(() => app.text().includes("New task here") && !app.text().includes("Scan subtree"), "Perf's node panel");
+  assert.equal(starts().length, 0, "no Start for Quality's suggestion while Perf's details load");
+  release();
+
+  choose("all");
+  await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === "All projects", "the cross-project overview");
+});
+
+test("saving a project's goal shows the new goal", UI_TIMEOUT, async (t) => {
+  const { app, backend } = await bootUi(t);
+  await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
+  app.find((n) => n.localName === "button" && n.getAttribute("title") === "Project settings")[0].dispatch("click");
+  await app.waitFor(() => app.text().includes("Project settings"), "settings dialog");
+  const dialog = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0];
+  const goal = dialog.querySelectorAll((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  goal.value = "fewer unwraps";
+  goal.dispatch("input");
+  await new Promise((r) => setTimeout(r, 0));
+  dialog.dispatch("submit");
+  await app.waitFor(() => app.text().includes("fewer unwraps") && !app.text().includes("Project settings"), "the new goal in the overview");
+  assert.equal((await backend.listProjects())[0].goal, "fewer unwraps");
+});
