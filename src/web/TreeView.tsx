@@ -25,6 +25,13 @@ export interface TreeViewProps {
 /** Tiles are drawn as SPRITE×SPRITE pixel sprites scaled to their side. */
 const SPRITE = 16;
 const BAR = { x: 2, y: 12, width: 12, height: 2 };
+/**
+ * Decorations stay inside the tile's layout band (side + NODE_GAP): badges sit beside the tile
+ * rather than above or below it, and the alarm/selection rings hug the tile in world units.
+ */
+const BADGE = 7;
+const BADGE_OUTSET = 5;
+const RING_GAP = 3;
 const ELBOW = 20;
 const DRAG_THRESHOLD = 3;
 const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)").matches ?? false;
@@ -158,12 +165,13 @@ interface TileProps {
 function Tile(props: TileProps) {
   const { node, name, crate, expandable, look, selected, prs, running, asking, delta, flashKey, compositeColor, onSelect, onToggle } = props;
   const side = node.r * 2;
+  const gutter = (side * (SPRITE - 2 + BADGE)) / SPRITE;
   const classes = ["node", selected && "selected", look.worst && "worst", look.hot && "hot", crate && "crate"].filter(Boolean).join(" ");
   return (
     <g class={classes} style={{ transform: `translate(${Math.round(node.x - node.r)}px,${Math.round(node.y - node.r)}px)` }} onClick={onSelect}>
+      {look.worst && <rect class="alarm" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
+      {selected && <rect class="ring" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       <g transform={`scale(${side / SPRITE})`}>
-        {look.worst && <rect class="alarm" x={-2} y={-2} width={SPRITE + 4} height={SPRITE + 4} />}
-        {selected && <rect class="ring" x={-2} y={-2} width={SPRITE + 4} height={SPRITE + 4} />}
         <rect class="frame" width={SPRITE} height={SPRITE} />
         <rect x={1} y={1} width={SPRITE - 2} height={SPRITE - 2} fill={look.fill} />
         <path class="bevel-light" d="M1 1h14v1H2v13H1z" />
@@ -180,17 +188,17 @@ function Tile(props: TileProps) {
           look.xp !== null && <rect class="xp" x={BAR.x} y={BAR.y} width={(BAR.width * look.xp) / 100} height={BAR.height} />
         )}
         {delta !== undefined && <rect key={flashKey} class="flash" width={SPRITE} height={SPRITE} />}
-        {asking && <Badge kind="ask" x={-3} y={-3} text="!" />}
-        {prs && <Badge kind={prs.some((p) => p.ci === "fail") ? "pr failing" : "pr"} x={12} y={-3} text={prs.length} />}
-        {look.findings > 0 && <Badge kind="findings" x={13} y={13} text={look.findings > 9 ? "9+" : look.findings} />}
+        {asking && <Badge kind="ask" x={-BADGE_OUTSET} y={0} text="!" />}
+        {prs && <Badge kind={prs.some((p) => p.ci === "fail") ? "pr failing" : "pr"} x={SPRITE - 2} y={0} text={prs.length} />}
+        {look.findings > 0 && <Badge kind="findings" x={SPRITE - 2} y={SPRITE - BADGE} text={look.findings > 9 ? "9+" : look.findings} />}
       </g>
       {expandable && (
         <g class="handle" onClick={onToggle}>
-          <rect x={side + 4} y={node.r - 5} width={10} height={10} />
-          <text x={side + 9} y={node.r + 3.5}>{node.hiddenChildren ? "+" : "−"}</text>
+          <rect x={gutter + 4} y={node.r - 5} width={10} height={10} />
+          <text x={gutter + 9} y={node.r + 3.5}>{node.hiddenChildren ? "+" : "−"}</text>
         </g>
       )}
-      <text class="label" x={side + (expandable ? 18 : 6)} y={node.r + 4}>
+      <text class="label" x={gutter + (expandable ? 18 : 6)} y={node.r + 4}>
         {name}
         {node.hiddenChildren > 0 && <tspan class="hidden-count"> {node.hiddenChildren}</tspan>}
       </text>
@@ -206,8 +214,8 @@ function Tile(props: TileProps) {
 function Badge({ kind, x, y, text }: { kind: string; x: number; y: number; text: string | number }) {
   return (
     <g class={`badge ${kind}`}>
-      <rect x={x} y={y} width={7} height={7} />
-      <text x={x + 3.5} y={y + 5.4}>{text}</text>
+      <rect x={x} y={y} width={BADGE} height={BADGE} />
+      <text x={x + BADGE / 2} y={y + 5.4}>{text}</text>
     </g>
   );
 }

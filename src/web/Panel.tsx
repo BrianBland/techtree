@@ -23,7 +23,6 @@ export function NodePanel({ id, state, version, onStart, onSelect, onError, onCl
   const node = state.tree.nodes[id];
   const tasks = state.tasks.filter((t) => t.node === id);
   const prs = state.prs.filter((p) => p.node === id);
-  const taskKey = tasks.map((t) => t.id + t.state).join();
 
   useEffect(() => {
     let live = true;
@@ -31,7 +30,7 @@ export function NodePanel({ id, state, version, onStart, onSelect, onError, onCl
     return () => {
       live = false;
     };
-  }, [id, version, taskKey]);
+  }, [id, version, attentionKey(state)]);
 
   const scan = () => post("/api/scan", { node: id }).catch((e: Error) => onError(e.message));
 
@@ -215,6 +214,16 @@ function ReviewDiff({ task, onError }: { task: Task; onError(message: string): v
       </button>
     </div>
   );
+}
+
+/**
+ * Changes whenever a task changes state or a PR's attention flags change anywhere in the repo,
+ * so views showing calls to action (own or descendants') know to refetch.
+ */
+export function attentionKey(state: ApiState): string {
+  const tasks = state.tasks.map((t) => t.id + t.state).join();
+  const prs = state.prs.map((p) => [p.number, p.ci, p.babysit, p.stale, p.stuck].join(":")).join();
+  return `${tasks}|${prs}`;
 }
 
 export function SuggestionRow({ suggestion: s, onStart }: { suggestion: Suggestion; onStart(): void }) {
