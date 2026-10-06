@@ -167,7 +167,6 @@ export interface Project {
   goal?: string;
   scorer: ScorerSpec;
   createdAt: string;
-  builtin?: boolean;
 }
 
 // ---- Scoring output ----

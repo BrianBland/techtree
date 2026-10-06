@@ -136,7 +136,7 @@ export class TaskRunner {
     if (scorer !== undefined && task.kind !== "scorer") throw new Error("scorer is for scorer tasks only");
     const proposal = scorer === undefined ? undefined : scorerParts(scorer);
     if (typeof proposal === "string") throw new Error(proposal);
-    if (proposal && !Object.keys(proposal).length) throw new Error("scorer must set rubric, command or plan");
+    if (proposal && !Object.keys(proposal).length) throw new Error("scorer must set plugins, rubric, command or plan");
     if (plan !== undefined && !Array.isArray(plan)) throw new Error("plan must be a list of steps");
     const checklist = plan ? plan.map((text) => ({ text: String(text), done: false })) : task.checklist;
     if (done !== undefined && !(Number.isInteger(done) && done >= 0 && done < checklist.length))

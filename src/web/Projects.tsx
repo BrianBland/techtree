@@ -1,5 +1,5 @@
 import { useState } from "preact/hooks";
-import { ALL_PROJECTS, QUALITY } from "../core/projects.ts";
+import { ALL_PROJECTS, SCORER_PLUGINS } from "../core/projects.ts";
 import type { Project } from "../types.ts";
 import { get, send } from "./api.ts";
 
@@ -80,10 +80,11 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
   const [rubric, setRubric] = useState(project?.scorer.rubric ?? "");
   const [command, setCommand] = useState(project?.scorer.command?.join("\n") ?? "");
   const [plan, setPlan] = useState(!!project?.scorer.plan);
-  const editsScorer = project && !project.builtin;
+  const [plugins, setPlugins] = useState(project?.scorer.plugins ?? []);
+  const editsScorer = !!project;
   const submit = (e: Event) => {
     e.preventDefault();
-    const scorer = { rubric, command: command.split("\n").map((arg) => arg.trim()).filter(Boolean), plan };
+    const scorer = { plugins, rubric, command: command.split("\n").map((arg) => arg.trim()).filter(Boolean), plan };
     const saved = project
       ? send<Project>("PATCH", `/api/projects/${encodeURIComponent(project.id)}`, { name, goal, ...(editsScorer && { scorer }) })
       : send<Project>("POST", "/api/projects", { name, goal });
@@ -91,7 +92,7 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
   };
   const remove = () => {
     if (!project || !confirm(`Delete project ${project.name} with its tasks?`)) return;
-    send("DELETE", `/api/projects/${encodeURIComponent(project.id)}`).then(() => onDone(QUALITY), (err: Error) => onError(err.message));
+    send("DELETE", `/api/projects/${encodeURIComponent(project.id)}`).then(() => onDone(ALL_PROJECTS), (err: Error) => onError(err.message));
   };
   return (
     <div class="overlay" onClick={(e) => e.target === e.currentTarget && onClose()}>
@@ -113,6 +114,16 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
         <RefineButton kind="goal" text={goal} name={name} onText={setGoal} onError={onError} />
         {editsScorer && (
           <>
+            <fieldset>
+              <legend>Metric plugins</legend>
+              {SCORER_PLUGINS.map((id) => (
+                <label class="inline" key={id}>
+                  <input type="checkbox" checked={plugins.includes(id)} onChange={(e) => setPlugins((e.currentTarget as HTMLInputElement).checked ? [...plugins, id] : plugins.filter((p) => p !== id))} />
+                  {id}
+                </label>
+              ))}
+            </fieldset>
+            <p class="muted small">Slop requires Rust for test-count normalization.</p>
             <label>
               Rubric
               <textarea
@@ -139,7 +150,7 @@ function ProjectDialog({ project, onDone, onClose, onError }: ProjectDialogProps
           </>
         )}
         <div class="buttons">
-          {project && !project.builtin && (
+          {project && (
             <button type="button" class="link danger" onClick={remove}>
               Delete
             </button>

@@ -1,5 +1,5 @@
 import { useEffect, useState } from "preact/hooks";
-import { ALL_PROJECTS, hasScorer, isScannable, isScored } from "../core/projects.ts";
+import { ALL_PROJECTS, isScannable, isScored } from "../core/projects.ts";
 import type { ApiOverview, ApiState, Bundle, NodeId, Project, StartTaskRequest, Suggestion, Task, TaskKind } from "../types.ts";
 import { get, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
@@ -48,7 +48,7 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
       </span>
     );
   const scored = all || isScored(state.project);
-  const custom = !all && !state.project.builtin;
+  const custom = !all;
   const { coverage } = overview;
   return (
     <aside class="panel">
@@ -117,7 +117,7 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
           </div>
         </section>
       )}
-      <Section title="Projects without a scorer" items={all ? projects.filter((p) => !p.builtin && !isScored(p)) : []}>
+      <Section title="Projects without a scorer" items={all ? projects.filter((p) => !isScored(p)) : []}>
         {(p) => (
           <li key={p.id} class="row">
             <div>

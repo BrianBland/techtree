@@ -4,11 +4,12 @@ import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
-import { getProject } from "../../src/core/projects.ts";
+import { getProject, saveProject } from "../../src/core/projects.ts";
 import { openDb, suppressSqliteWarning, type Db } from "../../src/db.ts";
 import { startServer } from "../../src/server/server.ts";
 import type { HttpError } from "../../src/server/backend.ts";
 import { FAKE_PI, TODO_FILE, fixture, until } from "./helpers.ts";
+import type { MetricPlugin } from "../../src/types.ts";
 
 suppressSqliteWarning();
 
@@ -104,7 +105,6 @@ test("scorers: plan items become findings and suggestions; progress counts items
   const booted = await boot(t);
   const { backend, db } = booted;
   const feature = await backend.createProject({ name: "Feature", goal: "add caching" });
-  assert.equal((await backend.startTask({ node: "", findingIds: [], manualReview: true, kind: "plan", project: "quality" }).catch((e: HttpError) => e.status)), 400);
 
   const task = await backend.startTask({ node: "", findingIds: [], manualReview: true, kind: "plan", prompt: "scenario:plan", project: feature.id });
   assert.equal(task.kind, "plan");
@@ -149,4 +149,74 @@ test("scorers: a scorer task's proposal is accepted into the project's scorer", 
   assert.equal(await backend.acceptScorer(task.id).catch((e: HttpError) => e.status), 409);
   await backend.idle();
   assert.ok((await backend.getOverview(perf.id)).coverage.totalNodes > 0, "the rubric makes the project scannable");
+});
+
+test("scorers: Quality's scorer is replaceable and plugin projects have isolated findings", { timeout: 30_000 }, async (t) => {
+  const { backend, db } = await boot(t);
+  const qualityFinding = (await backend.getNode(NODE)).findings[0];
+  const other = await backend.createProject({ name: "Other quality" });
+  await backend.updateProject(other.id, { scorer: { plugins: ["generic"] } });
+  await rescored(backend);
+  const node = await backend.getNode(NODE, other.id);
+  assert.equal(node.findings[0].title, qualityFinding.title);
+  assert.notEqual(node.findings[0].id, qualityFinding.id);
+  assert.equal((await backend.getNode(NODE)).findings[0].id, qualityFinding.id);
+  assert.deepEqual(db.prepare("SELECT DISTINCT project FROM findings ORDER BY project").all().map((r) => r.project), [other.id, "quality"].sort());
+  assert.equal(await backend.scan(NODE, other.id).catch((e: HttpError) => e.status), 400, "generic alone is not scannable");
+  await backend.updateProject("quality", { scorer: { rubric: "missing error handling" } });
+  await rescored(backend);
+  assert.deepEqual((await backend.getState()).project.scorer, { rubric: "missing error handling" });
+  assert.deepEqual((await backend.getNode(NODE)).findings, [], "removed plugins no longer supply findings");
+  assert.equal((await backend.getState()).scores[NODE].metrics.loc.raw, node.score.metrics.loc.raw);
+  await backend.updateProject("quality", { scorer: {} });
+  await rescored(backend);
+  assert.equal((await backend.getState()).scores[NODE].quality, null);
+  assert.deepEqual((await backend.getOverview()).suggestions, []);
+});
+
+test("scorers: Quality can refine and accept a scorer proposal that removes its plugins", { timeout: 30_000 }, async (t) => {
+  const { backend } = await boot(t);
+  const task = await backend.startTask({ node: "", findingIds: [], manualReview: true, kind: "scorer", prompt: "scenario:scorer" });
+  assert.equal(task.title, "Refine scorer");
+  assert.match(task.prompt, /"plugins":\[/);
+  await until(async () => (await backend.getState()).tasks.find((x) => x.state === "review"), "Quality proposal");
+  await backend.acceptScorer(task.id);
+  await backend.idle();
+  assert.deepEqual((await backend.getState()).project.scorer, { rubric: "allocation-heavy hot paths" });
+});
+
+test("scorers: removed analysis never runs in the shared pass and obsolete runs cannot publish", { timeout: 30_000 }, async (t) => {
+  for (const action of ["edit", "delete"] as const) await t.test(action, async (t) => {
+    const { tmp, repo, cache } = fixture(t);
+    mkdirSync(cache, { recursive: true });
+    const db = openDb(cache);
+    saveProject(db, { ...getProject(db, "quality")!, scorer: { plugins: ["generic"] } });
+    let release!: () => void;
+    let reached!: () => void;
+    const gate = new Promise<void>((r) => { release = r; });
+    const collecting = new Promise<void>((r) => { reached = r; });
+    let calls = 0;
+    let slopCalls = 0;
+    const generic: MetricPlugin = {
+      id: "generic",
+      metrics: [{ key: "loc", label: "LOC", direction: "neutral", aggregate: "sum" }, { key: "todo_density", label: "Debt", direction: "lower_better", aggregate: "sum" }],
+      collect: async () => {
+        if (++calls === 2) { reached(); await gate; }
+        return { "": { loc: 10, todo_density: 3 } };
+      },
+    };
+    const slop: MetricPlugin = { id: "slop", metrics: [], collect: async () => { slopCalls++; return {}; } };
+    const backend = new RepoBackend({ db, repoRoot: repo, cacheDir: cache, config: mergeConfig({ minLoc: 1 }), plugins: [generic, slop], log: () => {} });
+    t.after(() => backend.close());
+    backend.attach({ url: "http://127.0.0.1:9", token: "tok" });
+    await collecting;
+    if (action === "edit") await backend.updateProject("quality", { scorer: {} });
+    else await backend.deleteProject("quality");
+    release();
+    await backend.idle();
+    assert.equal(slopCalls, 0, "unselected analysis is not infrastructure");
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM snapshots").get()!.n, 0, "obsolete scorer does not save a snapshot");
+    assert.equal(db.prepare("SELECT COUNT(*) AS n FROM cache WHERE kind = 'backend' AND key = 'result:quality'").get()!.n, 0);
+    if (action === "edit") assert.equal((await backend.getState()).scores[""].quality, null);
+  });
 });

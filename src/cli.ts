@@ -3,13 +3,16 @@ import { resolve } from "node:path";
 import { parseArgs } from "node:util";
 import { loadConfig } from "./config.ts";
 import { score } from "./core/pipeline.ts";
-import { getProject, hasScorer, QUALITY } from "./core/projects.ts";
+import { getProject, isScored, QUALITY } from "./core/projects.ts";
+import { buildModel, findingImpact } from "./core/scoring.ts";
 import { formatReport } from "./core/report.ts";
 import { recordFindings, saveSnapshot } from "./core/store.ts";
 import { dbCache, openDb, suppressSqliteWarning } from "./db.ts";
 import { cacheDir, repoId, repoRootOf } from "./paths.ts";
 import { defaultPlugins } from "./plugins/index.ts";
 import { llmScanPlugin } from "./plugins/llm-scan.ts";
+import { projectPlugins, projectWeights, sharedPlugins } from "./plugins/project.ts";
+import type { Task } from "./types.ts";
 import { serve, stopServer } from "./backend/serve.ts";
 
 suppressSqliteWarning();
@@ -32,18 +35,21 @@ async function scoreCommand(path: string, projectId: string): Promise<number> {
     console.error(`no project ${JSON.stringify(projectId)}`);
     return 1;
   }
-  if (!hasScorer(project)) {
+  if (!isScored(project)) {
     console.log(`${project.name} has no scorer yet; nothing to score`);
     return 0;
   }
   const started = performance.now();
-  const result = await score({
-    repoRoot,
-    config: loadConfig(repoRoot),
-    plugins: [...defaultPlugins, llmScanPlugin],
-    cache: dbCache(db),
-    log: (msg) => console.error(msg),
-  });
+  const config = loadConfig(repoRoot);
+  const available = [...defaultPlugins, llmScanPlugin];
+  const common = { repoRoot, config, cache: dbCache(db), log: (msg: string) => console.error(msg) };
+  const base = await score({ ...common, plugins: sharedPlugins(available) });
+  const tasks = db.prepare("SELECT data FROM tasks WHERE project = ?").all(project.id) as { data: string }[];
+  const resolved = new Set(tasks.map((r) => JSON.parse(r.data) as Task).filter((t) => (t.kind ?? "change") === "change" && (t.state === "pr_open" || t.state === "done")).flatMap((t) => t.findingIds));
+  const raw = await score({ ...common, tree: base.tree, plugins: projectPlugins(project, available, base, (id) => resolved.has(id)) });
+  const weights = projectWeights(raw, config, project, available);
+  const model = buildModel(raw.tree, raw.metricDefs, raw.own, { ...config, weights });
+  const result = { ...raw, scores: model.scores, impacts: Object.fromEntries(raw.findings.map((f) => [f.id, findingImpact(model, f)])) };
   saveSnapshot(db, result, project.id);
   recordFindings(db, result.findings, result.createdAt, true, project.id);
   console.log(formatReport(result));

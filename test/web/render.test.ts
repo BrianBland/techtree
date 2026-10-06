@@ -622,6 +622,40 @@ test("the project switcher creates a project, switches the view and keeps it in 
   assert.equal(urls.at(-1), "/");
 });
 
+test("Quality settings edit its scorer and the UI recovers when the last project is deleted", UI_TIMEOUT, async (t) => {
+  const { app, backend } = await bootUi(t);
+  await app.waitFor(() => app.text().includes("Refine scorer"), "Quality scorer action");
+  app.find((n) => n.localName === "button" && n.getAttribute("title") === "Project settings")[0].dispatch("click");
+  await app.waitFor(() => app.text().includes("Metric plugins"), "Quality scorer settings");
+  const dialog = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0];
+  assert.ok(dialog.querySelectorAll((n) => n.localName === "button" && n.textContent === "Delete").length);
+  for (const checkbox of dialog.querySelectorAll((n) => n.localName === "input" && n.getAttribute("type") === "checkbox")) {
+    (checkbox as unknown as { checked: boolean }).checked = false;
+    checkbox.dispatch("change");
+    await new Promise((r) => setTimeout(r, 0));
+  }
+  dialog.dispatch("submit");
+  await backend.idle();
+  await app.waitFor(() => app.text().includes("No scorer yet"), "Quality without plugins");
+  assert.deepEqual((await backend.getState()).project.scorer, {});
+  for (const task of (await backend.getState()).tasks) await backend.discard(task.id);
+  await backend.deleteProject("quality");
+  app.reconnect();
+  await app.waitFor(() => app.text().includes("No projects. Create one"), "empty projects UI");
+  const switcher = app.find((n) => n.getAttribute("class") === "project-switcher")[0] as unknown as { value: string; dispatch(t: string): void };
+  switcher.value = "__new";
+  switcher.dispatch("change");
+  await app.waitFor(() => app.text().includes("New project"), "creation remains available");
+  const createdDialog = app.find((n) => n.getAttribute("class") === "dialog project-dialog")[0];
+  const name = createdDialog.querySelectorAll((n) => n.localName === "input")[0] as unknown as { value: string; dispatch(t: string): void };
+  name.value = "Quality";
+  name.dispatch("input");
+  await new Promise((r) => setTimeout(r, 0));
+  createdDialog.dispatch("submit");
+  await app.waitFor(() => app.text().includes("No scorer yet"), "recreated Quality loads without another event");
+  assert.equal((await backend.getState()).project.id, "quality");
+});
+
 test("New task here starts a free-form task in the selected project", UI_TIMEOUT, async (t) => {
   const { app, backend, byClass } = await bootUi(t);
   const perf = await backend.createProject({ name: "Perf" });

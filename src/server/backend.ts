@@ -44,7 +44,7 @@ export interface BundleInput {
 export interface ProjectInput {
   name?: string;
   goal?: string;
-  /** `rubric`, `command` and `plan` replace the project's; see `scorerParts`. */
+  /** Replaces the complete scorer; see `scorerParts`. */
   scorer?: ScorerSpec;
 }
 

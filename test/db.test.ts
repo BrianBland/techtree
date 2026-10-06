@@ -5,7 +5,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { DatabaseSync } from "node:sqlite";
 import { mergeConfig } from "../src/config.ts";
-import { listProjects } from "../src/core/projects.ts";
+import { deleteProjectRows, getProject, listProjects, saveProject, scorerParts } from "../src/core/projects.ts";
 import { nodeHistory } from "../src/core/store.ts";
 import { dbCache, openDb, suppressSqliteWarning } from "../src/db.ts";
 import { TaskRunner } from "../src/runner/runner.ts";
@@ -46,4 +46,37 @@ test("opening a pre-projects database makes its snapshots, findings and tasks Qu
   assert.deepEqual(db.prepare("SELECT project FROM findings UNION SELECT project FROM tasks").all().map((r) => r.project), ["quality"]);
   const runner = new TaskRunner({ db, config: mergeConfig({}), repoRoot: dir, cacheDir: dir, url: "", token: "" });
   assert.equal(runner.get("t1")?.project, "quality");
+});
+
+test("Quality migration preserves settings and history, and deletion survives reopening", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "techtree-db-"));
+  t.after(() => rmSync(dir, { recursive: true, force: true }));
+  const db = openDb(dir);
+  const legacy = { ...getProject(db, "quality")!, name: "My quality", goal: "less debt", scorer: { plugins: ["generic"], rubric: "errors" }, builtin: true };
+  saveProject(db, legacy);
+  db.prepare("UPDATE meta SET value = '2' WHERE key = 'schema_version'").run();
+  db.prepare("INSERT INTO snapshots (sha, created_at, project) VALUES ('abc', '2025-01-01', 'quality')").run();
+  db.close();
+  const migrated = openDb(dir);
+  const { builtin, ...expected } = legacy;
+  assert.deepEqual(getProject(migrated, "quality"), expected);
+  assert.equal(migrated.prepare("SELECT COUNT(*) AS n FROM snapshots").get()!.n, 1);
+  migrated.close();
+  const reopened = openDb(dir);
+  assert.deepEqual(getProject(reopened, "quality"), expected);
+  deleteProjectRows(reopened, "quality");
+  reopened.close();
+  const deleted = openDb(dir);
+  assert.equal(getProject(deleted, "quality"), undefined);
+  deleted.close();
+});
+
+test("scorer parts validate plugin selection and permit complete replacement", () => {
+  assert.deepEqual(scorerParts({ plugins: ["generic", "llm-scan"], rubric: " errors " }), { plugins: ["generic", "llm-scan"], rubric: "errors" });
+  assert.deepEqual(scorerParts({ plugins: [], rubric: "", command: [], plan: false }), {});
+  assert.equal(typeof scorerParts({ plugins: "generic" }), "string");
+  assert.equal(typeof scorerParts({ plugins: ["unknown"] }), "string");
+  assert.equal(typeof scorerParts({ plugins: [42] }), "string");
+  assert.equal(typeof scorerParts({ plugins: ["slop"] }), "string", "slop needs Rust test counts for normalization");
+  assert.deepEqual(scorerParts({ plugins: ["rust", "slop"] }), { plugins: ["rust", "slop"] });
 });

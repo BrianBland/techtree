@@ -35,9 +35,10 @@ const status = (promise: Promise<unknown>) =>
     (err: HttpError) => err.status,
   );
 
-test("projects: Quality is built in; custom projects are created, renamed and deleted", { timeout: 30_000 }, async (t) => {
+test("projects: Quality is an ordinary project; projects are created, renamed and deleted", { timeout: 30_000 }, async (t) => {
   const backend = await boot(t);
-  assert.deepEqual((await backend.listProjects()).map((p) => [p.id, p.name, p.builtin]), [["quality", "Quality", true]]);
+  assert.deepEqual((await backend.listProjects()).map((p) => [p.id, p.name]), [["quality", "Quality"]]);
+  assert.ok(!("builtin" in (await backend.listProjects())[0]));
 
   const perf = await backend.createProject({ name: "Faster startup", goal: "cold start below 1 s" });
   assert.deepEqual([perf.id, perf.goal, perf.scorer], ["faster-startup", "cold start below 1 s", {}]);
@@ -48,7 +49,6 @@ test("projects: Quality is built in; custom projects are created, renamed and de
   const renamed = await backend.updateProject(perf.id, { name: "Startup", goal: "" });
   assert.deepEqual([renamed.name, renamed.goal], ["Startup", undefined]);
 
-  assert.equal(await status(backend.deleteProject("quality")), 409);
   assert.equal(await status(backend.deleteProject("nope")), 404);
   await backend.deleteProject(perf.id);
   assert.deepEqual((await backend.listProjects()).map((p) => p.id), ["quality", "faster-startup-2", "all-2"]);
@@ -176,4 +176,20 @@ test("projects: GET /api/prs lists every project's open PRs with their linked ta
   assert.deepEqual(listed.tasks.map((x) => x.id), ["t1"]);
   assert.equal(listed.autoBabysit, false);
   assert.equal((await backend.setAutoBabysit(true)).autoBabysit, true);
+});
+
+test("projects: deleting Quality leaves other projects and the all-project overview usable", { timeout: 30_000 }, async (t) => {
+  const backend = await boot(t);
+  const other = await backend.createProject({ name: "Other" });
+  await backend.deleteProject("quality");
+  await backend.rescore();
+  await backend.idle();
+  assert.equal(await status(backend.getState()), 404);
+  assert.equal((await backend.getState(other.id)).project.id, other.id);
+  assert.deepEqual((await backend.getOverview("all")).suggestions, []);
+  await backend.deleteProject(other.id);
+  await backend.rescore();
+  await backend.idle();
+  assert.deepEqual(await backend.listProjects(), []);
+  assert.equal((await backend.getOverview("all")).coverage.totalNodes, 0);
 });
