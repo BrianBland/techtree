@@ -496,6 +496,7 @@ function DiffPane({ task, onError }: { task: Task; onError(message: string): voi
 function ProposalDiff({ current, proposal }: { current: ScorerSpec; proposal?: ScorerSpec }) {
   if (!proposal) return <p class="muted small">No scorer proposed; reply in the chat to ask for one.</p>;
   const fields: [string, (spec: ScorerSpec) => string[]][] = [
+    ["Plugins", (spec) => spec.plugins ?? []],
     ["Rubric", (spec) => (spec.rubric ? spec.rubric.split("\n") : [])],
     ["Command", (spec) => spec.command ?? []],
     ["Plan", (spec) => (spec.plan ? ["on"] : [])],

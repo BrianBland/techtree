@@ -1,5 +1,6 @@
 import type { ToolDefinition } from "@earendil-works/pi-coding-agent";
 import { Type, type Static } from "typebox";
+import { SCORER_PLUGINS } from "../core/projects.ts";
 
 const reportParameters = Type.Object({
   plan: Type.Optional(Type.Array(Type.String(), { description: "Checklist of steps, sent once before any work" })),
@@ -25,11 +26,12 @@ const reportParameters = Type.Object({
   scorer: Type.Optional(
     Type.Object(
       {
+        plugins: Type.Optional(Type.Array(Type.Union(SCORER_PLUGINS.map((id) => Type.Literal(id))), { description: "Metric plugins to keep; omitted or empty removes existing plugins" })),
         rubric: Type.Optional(Type.String({ description: "What an LLM scan of each file should look for" })),
         command: Type.Optional(Type.Array(Type.String(), { description: "argv run in the repo root that prints scorer JSON" })),
         plan: Type.Optional(Type.Boolean({ description: "Score progress on reported plan items" })),
       },
-      { description: "Scorer tasks only: the proposed project scorer" },
+      { description: "Scorer tasks only: complete replacement of the project's scorer; omitted parts are removed" },
     ),
   ),
   outcome: Type.Optional(Type.Literal("no_change", { description: "Finish without changes: the right answer is that nothing should change" })),

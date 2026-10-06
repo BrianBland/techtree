@@ -9,11 +9,12 @@ import {
   createProject,
   deleteProjectRows,
   getProject,
-  hasScorer,
+  SCORER_PLUGINS,
   isScannable,
   isScored,
   listProjects,
   saveProject,
+  scorerParts,
 } from "../core/projects.ts";
 import { score } from "../core/pipeline.ts";
 import { dict } from "../core/tree.ts";
@@ -23,10 +24,10 @@ import { suggestTasks } from "../core/suggest.ts";
 import { dbCache, type Db } from "../db.ts";
 import { repoId } from "../paths.ts";
 import { defaultPlugins } from "../plugins/index.ts";
-import { commandPlugin } from "../plugins/command.ts";
+import { projectPlugins, projectWeights, sharedPlugins } from "../plugins/project.ts";
 import { refineText, type RefineKind } from "./refine.ts";
-import { QUALITY_SCAN, llmScanPlugin, rubricScan, scanCoverage, scanNode, scanPlugin, type ScanKind } from "../plugins/llm-scan.ts";
-import { addPlanItems, parsePlanItems, planPlugin, type PlanItem } from "../plugins/plan.ts";
+import { QUALITY_SCAN, llmScanPlugin, rubricScan, scanCoverage, scanNode, type ScanKind } from "../plugins/llm-scan.ts";
+import { addPlanItems, parsePlanItems, type PlanItem } from "../plugins/plan.ts";
 import { listModels } from "./models.ts";
 import { launchDetached, shellQuote, terminalArgv } from "./terminal.ts";
 import { Babysitter } from "../prs/babysit.ts";
@@ -54,7 +55,6 @@ import type {
   PrState,
   Project,
   ScoreResult,
-  ScorerSpec,
   ServerEvent,
   StartTaskRequest,
   Suggestion,
@@ -102,15 +102,16 @@ const BUSY_TTL_MS = 15_000;
 /** States whose task still claims its findings (DESIGN "Claimed findings"). */
 const CLAIMING_STATES: Task["state"][] = [...LIVE_STATES, "review", "staged", "pr_open"];
 const NO_COVERAGE: ApiOverview["coverage"] = { scannedNodes: 0, totalNodes: 0, scannedLoc: 0, totalLoc: 0 };
-const RESULT_KEY = ["backend", "result"] as const;
+const RESULT_KEY = ["backend", "tree:v3"] as const;
 const MODELS_TTL_MS = 10 * 60_000;
 
-/** A custom project's latest scoring run (DESIGN "Project scorers"). */
+/** A project's latest scoring run (DESIGN "Project scorers"). */
 interface ProjectRun {
   result: ScoreResult;
-  /** `config.weights` plus weight 1 for the project's other non-neutral metrics. */
+  /** Configured plugin weights and implicit weights for rubric, command and plan metrics. */
   weights: Record<string, number>;
   errors: string[];
+  identity: string;
 }
 
 /** What a project's views are computed from. */
@@ -140,7 +141,6 @@ export class RepoBackend implements Backend {
   /** Change tasks of plan projects whose finish already triggered a rescore. */
   private readonly resolvedPlanTasks = new Set<string>();
   private busyCache?: { key: string; at: number; paths: string[] };
-  private unscoredView?: { from: ScoreResult; result: ScoreResult };
   private visibleView?: { from: ScoreResult; dismissedKey: string; result: ScoreResult };
   private scoring?: Promise<void>;
   private rescoreQueued = false;
@@ -151,7 +151,8 @@ export class RepoBackend implements Backend {
   constructor(opts: RepoBackendOptions) {
     this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, pollPrs: false, log: (msg) => console.error(msg), ...opts };
     this.cache = dbCache(opts.db);
-    this.result = this.cache.get<ScoreResult>(...RESULT_KEY);
+    const shared = this.cache.get<{ result: ScoreResult; config: string }>(...RESULT_KEY);
+    if (shared?.config === JSON.stringify(opts.config)) this.result = shared.result;
     this.unsubscribePrs = this.opts.prs.onEvent((event) => this.emit(event));
   }
 
@@ -180,13 +181,14 @@ export class RepoBackend implements Backend {
   async updateProject(id: string, { name, goal, scorer }: ProjectInput): Promise<Project> {
     const { goal: oldGoal, ...project } = this.project(id);
     if (name !== undefined && !name.trim()) throw new HttpError(400, "name must not be empty");
-    if (scorer && project.builtin) throw new HttpError(400, `${project.name}'s scorer is built in`);
+    const parts = scorer === undefined ? undefined : scorerParts(scorer);
+    if (typeof parts === "string") throw new HttpError(400, parts);
     const nextGoal = goal === undefined ? oldGoal : goal.trim();
     const updated: Project = {
       ...project,
       ...(name !== undefined && { name: name.trim() }),
       ...(nextGoal && { goal: nextGoal }),
-      ...(scorer && { scorer: withParts(project.scorer, scorer) }),
+      ...(parts && { scorer: parts }),
     };
     saveProject(this.opts.db, updated);
     if (scorer) void this.rescore();
@@ -194,15 +196,14 @@ export class RepoBackend implements Backend {
   }
 
   async deleteProject(id: string): Promise<void> {
-    const project = this.project(id);
-    if (project.builtin) throw new HttpError(409, `${project.name} is built in`);
+    this.project(id);
     const tasks = this.runner().list().filter((t) => t.project === id);
     const prClosed = (t: Task) => t.pr !== undefined && prRetired(this.cache, t.pr);
     const blocking = tasks.find((t) => LIVE_STATES.includes(t.state) || (t.state === "pr_open" && !prClosed(t)));
     if (blocking) throw new HttpError(409, `task ${blocking.id} is ${blocking.state}; cancel it or close its PR first`);
     for (const task of tasks) this.runnerCall(() => this.runner().discard(task.id, { prClosed: prClosed(task) }));
     deleteProjectRows(this.opts.db, id);
-    this.opts.db.prepare("DELETE FROM cache WHERE (kind = 'backend' AND key = ?) OR (kind = 'plan' AND key = ?)").run(`result:${id}`, id);
+    this.opts.db.prepare("DELETE FROM cache WHERE (kind = 'backend' AND key = ?) OR (kind = 'plan' AND key = ?) OR substr(kind, 1, length(?)) = ?").run(`result:${id}`, id, `rubric:${id}:`, `rubric:${id}:`);
     this.projectRuns.delete(id);
   }
 
@@ -215,7 +216,7 @@ export class RepoBackend implements Backend {
     this.taskRunner = new TaskRunner({ db, config, repoRoot, cacheDir, ...server, onEvent: (e) => this.emit(e) });
     this.taskRunner.recover();
     if (this.opts.pollPrs && this.opts.prs === noPrs) this.startPrPolling(this.taskRunner);
-    if (!this.result || this.result.sha !== git(repoRoot, "rev-parse", "HEAD").trim()) void this.rescore();
+    if (!this.result || this.result.sha !== git(repoRoot, "rev-parse", "HEAD").trim() || listProjects(db).some((p) => isScored(p) && !this.projectRun(p))) void this.rescore();
   }
 
   private startPrPolling(runner: TaskRunner): void {
@@ -319,7 +320,7 @@ export class RepoBackend implements Backend {
     const wrong = tasks.find((t) => t.state !== "staged" || t.project !== project.id);
     if (wrong) throw new HttpError(409, `task ${wrong.id} is ${wrong.state} in ${wrong.project}, not staged in ${project.id}`);
     tasks.sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? ""));
-    const findings = new Map((this.result?.findings ?? []).map((f) => [f.id, f.title]));
+    const findings = new Map((this.projectRun(project)?.result.findings ?? []).map((f) => [f.id, f.title]));
     const { repoRoot, config, db } = this.opts;
     let bundle: Bundle;
     try {
@@ -408,15 +409,15 @@ export class RepoBackend implements Backend {
 
   async getOverview(projectId?: string): Promise<ApiOverview> {
     const all = projectId === ALL_PROJECTS;
-    const view = await this.view(all ? QUALITY : projectId);
-    const scope = all ? undefined : view.project.id;
+    const view = all ? (getProject(this.opts.db, QUALITY) ? await this.view(QUALITY) : undefined) : await this.view(projectId);
+    const scope = all ? undefined : view!.project.id;
     const suggestions = all
       ? interleave(
           await Promise.all(
             listProjects(this.opts.db).map(async (p) => this.suggestions(await this.view(p.id)).map((s) => ({ ...s, project: p.id }))),
           ),
         )
-      : this.suggestions(view);
+      : this.suggestions(view!);
     return {
       attentionTasks: this.tasks(scope).filter((t) => t.state === "needs_input" || t.state === "review"),
       stagedTasks: this.tasks(scope)
@@ -425,8 +426,8 @@ export class RepoBackend implements Backend {
       activeTasks: this.tasks(scope).filter((t) => t.state === "queued" || t.state === "running"),
       flaggedPrs: this.prs(scope).filter((p) => p.ci === "fail" || p.stuck || p.stale),
       suggestions: suggestions.slice(0, OVERVIEW_SUGGESTIONS),
-      coverage: this.coverage(view),
-      ...(!all && view.errors.length && { scorerErrors: view.errors }),
+      coverage: view ? this.coverage(view) : NO_COVERAGE,
+      ...(!all && view!.errors.length && { scorerErrors: view!.errors }),
     };
   }
 
@@ -501,7 +502,6 @@ export class RepoBackend implements Backend {
 
   /** A scorer or plan task (DESIGN "Task kinds"), anchored at the root with a prompt built from the project. */
   private startProjectTask({ project, result, config }: View, req: StartTaskRequest): Task {
-    if (project.builtin) throw new HttpError(400, `${project.name}'s scorer is built in`);
     const instruction = req.prompt?.trim() ? `\n\nInstruction from the user: ${req.prompt.trim()}` : "";
     const quality = result.scores[""]?.quality ?? 0;
     let title: string;
@@ -534,7 +534,7 @@ export class RepoBackend implements Backend {
   async acceptScorer(taskId: string): Promise<Task> {
     const task = this.runnerCall(() => this.runner().acceptProposal(taskId));
     const project = this.project(task.project);
-    saveProject(this.opts.db, { ...project, scorer: withParts(project.scorer, task.proposal!) });
+    saveProject(this.opts.db, { ...project, scorer: task.proposal! });
     void this.rescore();
     return task;
   }
@@ -610,7 +610,7 @@ export class RepoBackend implements Backend {
 
   /** Start a scoring run (or queue one behind the run in progress); completion is a `scores` event. */
   async rescore(projectId?: string): Promise<void> {
-    this.project(projectId);
+    if (projectId !== undefined) this.project(projectId);
     if (this.scoring) {
       this.rescoreQueued = true;
       return;
@@ -654,13 +654,11 @@ export class RepoBackend implements Backend {
   private async runScoring(): Promise<void> {
     const { db, repoRoot, config, plugins, log } = this.opts;
     try {
-      const result = await score({ repoRoot, config, plugins, cache: this.cache, log });
-      saveSnapshot(db, result);
-      recordFindings(db, result.findings, result.createdAt, true);
-      this.cache.set(...RESULT_KEY, result);
+      const result = unscored(await score({ repoRoot, config, plugins: sharedPlugins(plugins), cache: this.cache, log }));
+      this.cache.set(...RESULT_KEY, { result, config: JSON.stringify(config) });
       this.result = result;
       this.scoreError = undefined;
-      for (const project of listProjects(db)) if (!hasScorer(project) && isScored(project)) await this.scoreProject(project, result);
+      for (const project of listProjects(db)) if (isScored(project)) await this.scoreProject(project, result);
       this.emit({ type: "scores", snapshot: { sha: result.sha, createdAt: result.createdAt } });
     } catch (err) {
       this.scoreError = errorText(err);
@@ -668,7 +666,7 @@ export class RepoBackend implements Backend {
     }
   }
 
-  /** Score a custom project over `base`'s tree with its scorer's parts; failures are kept as its `errors`. */
+  /** Score a project over the shared tree; collection failures are kept as its errors. */
   private async scoreProject(project: Project, base: ScoreResult): Promise<void> {
     const { db, repoRoot, config, log } = this.opts;
     const errors: string[] = [];
@@ -678,13 +676,16 @@ export class RepoBackend implements Backend {
     };
     try {
       const raw = await score({ repoRoot, config, plugins: this.projectPlugins(project, base), cache: this.cache, log: onLog, tree: base.tree });
-      const weights = projectWeights(raw, config);
+      const weights = projectWeights(raw, config, project, this.opts.plugins);
       const model = buildModel(raw.tree, raw.metricDefs, raw.own, { ...config, weights });
       const impacts = Object.fromEntries(raw.findings.map((f) => [f.id, findingImpact(model, f)]));
       const result: ScoreResult = { ...raw, sha: base.sha, scores: model.scores, impacts };
+      const identity = projectIdentity(project, config);
+      const current = getProject(db, project.id);
+      if (!current || projectIdentity(current, config) !== identity) return;
       saveSnapshot(db, result, project.id);
       recordFindings(db, result.findings, result.createdAt, true, project.id);
-      const run: ProjectRun = { result, weights, errors };
+      const run: ProjectRun = { result, weights, errors, identity };
       this.cache.set("backend", `result:${project.id}`, run);
       this.projectRuns.set(project.id, run);
     } catch (err) {
@@ -693,7 +694,6 @@ export class RepoBackend implements Backend {
   }
 
   private projectPlugins(project: Project, base: ScoreResult): MetricPlugin[] {
-    const { rubric, command, plan } = project.scorer;
     const resolved = () => {
       const ids = new Set(
         this.tasks(project.id)
@@ -702,20 +702,13 @@ export class RepoBackend implements Backend {
       );
       return (id: string) => ids.has(id);
     };
-    return [
-      sharedNeutralPlugin(base),
-      ...(rubric ? [scanPlugin(rubricScan(project.id, rubric))] : []),
-      ...(command?.length ? [commandPlugin(project.id, command)] : []),
-      ...(plan ? [planPlugin(project.id, resolved())] : []),
-    ];
+    return projectPlugins(project, this.opts.plugins, base, resolved());
   }
 
-  private projectRun(id: string): ProjectRun | undefined {
-    let run = this.projectRuns.get(id);
-    if (!run) {
-      run = this.cache.get<ProjectRun>("backend", `result:${id}`);
-      if (run) this.projectRuns.set(id, run);
-    }
+  private projectRun(project: Project): ProjectRun | undefined {
+    const run = this.projectRuns.get(project.id) ?? this.cache.get<ProjectRun>("backend", `result:${project.id}`);
+    if (!run || run.identity !== projectIdentity(project, this.opts.config)) return undefined;
+    this.projectRuns.set(project.id, run);
     return run;
   }
 
@@ -735,7 +728,7 @@ export class RepoBackend implements Backend {
   }
 
   /**
-   * The project and its scores: Quality's latest result or a custom project's latest run, without
+   * The project's latest matching run, without
    * dismissed findings (listed apart); with no scorer or not scored yet, the shared tree with neutral
    * metrics only.
    */
@@ -743,19 +736,18 @@ export class RepoBackend implements Backend {
     const project = this.project(projectId);
     const latest = await this.latest();
     const { config } = this.opts;
-    const run = !hasScorer(project) && isScored(project) ? this.projectRun(project.id) : undefined;
-    if (!hasScorer(project) && !run) {
-      if (this.unscoredView?.from !== latest) this.unscoredView = { from: latest, result: unscored(latest) };
-      return { project, result: this.unscoredView.result, config, errors: [], dismissed: [] };
+    const run = isScored(project) ? this.projectRun(project) : undefined;
+    if (!run) {
+      return { project, result: latest, config, errors: [], dismissed: [] };
     }
-    const result = run ? run.result : latest;
+    const result = run.result;
     const reasons = this.dismissals();
     const dismissedKey = [...reasons.keys()].join("\0");
     if (this.visibleView?.from !== result || this.visibleView.dismissedKey !== dismissedKey) {
       this.visibleView = { from: result, dismissedKey, result: { ...result, findings: result.findings.filter((f) => !reasons.has(f.id)) } };
     }
     const dismissed = result.findings.filter((f) => reasons.has(f.id)).map((f) => ({ ...f, ...(reasons.get(f.id) && { reason: reasons.get(f.id)! }) }));
-    return { project, result: this.visibleView.result, config: run ? { ...config, weights: run.weights } : config, errors: run?.errors ?? [], dismissed };
+    return { project, result: this.visibleView.result, config: { ...config, weights: run.weights }, errors: run.errors, dismissed };
   }
 
   /** Dismissed finding ids and their reasons (DESIGN "Dismissed findings"). */
@@ -863,25 +855,12 @@ export class RepoBackend implements Backend {
   }
 }
 
-/** `scorer` with `parts` (rubric, command, plan) replaced; plugins are kept. */
-function withParts(scorer: ScorerSpec, parts: ScorerSpec): ScorerSpec {
-  return { ...(scorer.plugins && { plugins: scorer.plugins }), ...parts };
+function projectIdentity(project: Project, config: Config): string {
+  return JSON.stringify([project.createdAt, project.scorer, config]);
 }
 
 function scanKind(project: Project): ScanKind {
-  return hasScorer(project) ? QUALITY_SCAN : rubricScan(project.id, project.scorer.rubric!);
-}
-
-/** `config.weights`, plus weight 1 for every other non-neutral metric of a custom project. */
-function projectWeights(result: ScoreResult, config: Config): Record<string, number> {
-  const scored = result.metricDefs.filter((d) => d.direction !== "neutral").map((d) => [d.key, 1]);
-  return { ...Object.fromEntries(scored), ...config.weights };
-}
-
-/** The shared tree's neutral metrics (sizes, churn) from Quality's result, so project tiles keep their size. */
-function sharedNeutralPlugin(base: ScoreResult): MetricPlugin {
-  const { own, metricDefs } = unscored(base);
-  return { id: "shared", metrics: metricDefs, collect: async () => own };
+  return project.scorer.rubric ? rubricScan(project.id, project.scorer.rubric) : QUALITY_SCAN;
 }
 
 function planPrompt(): string {
@@ -904,7 +883,9 @@ function scorerPrompt(project: Project, result: ScoreResult, config: Config, scr
   const quality = result.scores[""]?.quality;
   return [
     `${isScored(project) ? "Refine" : "Draft"} the scorer of this techtree project: how its progress toward the goal is measured on the repository tree.`,
-    `Current scorer: ${JSON.stringify(withParts({}, project.scorer))}`,
+    `Current scorer: ${JSON.stringify(project.scorer)}`,
+    `Available metric plugins: ${SCORER_PLUGINS.join(", ")}. plugins selects only these; omit or use [] to remove them. A rubric overrides llm-scan's default focus.`,
+    "slop requires rust to supply test counts; retain both or remove slop too.",
     `Current scores: root composite ${quality === null || quality === undefined ? "none" : quality.toFixed(1)}; metrics: ${metrics.join(", ") || "none"}.`,
     `Current findings: ${[...bySource].map(([source, n]) => `${n} ${source}`).join(", ") || "none"}.${top.length ? `\n${top.join("\n")}` : ""}`,
     `A scorer combines: rubric (text telling an LLM scan of each file what to look for), command (argv run in the repo root, printing JSON ` +
@@ -913,7 +894,7 @@ function scorerPrompt(project: Project, result: ScoreResult, config: Config, scr
       `findings?: [{node or file, line?, title, detail, severity: "low"|"medium"|"high", effort?: "trivial"|"small"|"medium"|"large", metricEffects?: {"<key>": expected change if fixed, e.g. -12}}]} (without metricEffects a finding is credited an even share of its path's lower_better values), ` +
       `timeout ${Number(config.plugins.command?.timeoutMs) || 600000} ms) and plan (score progress on work items from plan tasks).`,
     `Write any scripts for the command in ${scriptsDir} (never in the repository) and test them.`,
-    "Propose the scorer with techtree_report {scorer: {rubric?, command?, plan?}}; the user reviews it and may reply to iterate.",
+    "Propose the complete replacement scorer with techtree_report {scorer: {plugins?, rubric?, command?, plan?}}; omitted parts are removed. The user reviews it and may reply to iterate.",
   ].join("\n");
 }
 

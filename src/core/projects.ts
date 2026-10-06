@@ -1,20 +1,20 @@
 import type { Db } from "../db.ts";
 import type { Project, ScorerSpec } from "../types.ts";
 
-/** Id of the built-in Quality project, the default of every project-scoped route and column. */
+/** Default project id for project-scoped routes and legacy rows. */
 export const QUALITY = "quality";
 /** Reserved id of the cross-project overview. */
 export const ALL_PROJECTS = "all";
+export const SCORER_PLUGINS = ["generic", "git", "rust", "slop", "llm-scan"] as const;
 
 export const QUALITY_PROJECT: Project = {
   id: QUALITY,
   name: "Quality",
-  scorer: { plugins: ["generic", "git", "rust", "slop", "llm-scan"] },
+  scorer: { plugins: [...SCORER_PLUGINS] },
   createdAt: "1970-01-01T00:00:00.000Z",
-  builtin: true,
 };
 
-/** Whether the project is scored by metric plugins (Quality); the CLI scores only these. */
+/** Whether a project selects metric plugins. */
 export function hasScorer(project: Project): boolean {
   return !!project.scorer.plugins?.length;
 }
@@ -25,35 +25,38 @@ export function isScored(project: Project): boolean {
   return hasScorer(project) || !!rubric?.trim() || !!command?.length || !!plan;
 }
 
-/** Whether subtrees of the project can be scanned: Quality's LLM scan or a rubric. */
+/** Whether the project has a rubric or explicitly selects the default LLM scan. */
 export function isScannable(project: Project): boolean {
-  return hasScorer(project) || !!project.scorer.rubric?.trim();
+  return !!project.scorer.rubric?.trim() || !!project.scorer.plugins?.includes("llm-scan");
 }
 
 /**
- * The `rubric`, `command` and `plan` parts of an untrusted scorer, or an error message.
- * Blank rubric, empty command and false plan are dropped.
+ * The validated parts of an untrusted scorer, or an error message.
+ * Blank rubric, empty plugin/command lists and false plan are dropped.
  */
 export function scorerParts(value: unknown): ScorerSpec | string {
   if (typeof value !== "object" || value === null || Array.isArray(value)) return "scorer must be an object";
-  const { rubric, command, plan, ...rest } = value as Record<string, unknown>;
+  const { plugins, rubric, command, plan, ...rest } = value as Record<string, unknown>;
   if (Object.keys(rest).length) return `unknown scorer fields: ${Object.keys(rest).join(", ")}`;
+  if (plugins !== undefined && !(Array.isArray(plugins) && plugins.every((id) => typeof id === "string" && SCORER_PLUGINS.includes(id as typeof SCORER_PLUGINS[number])))) return "scorer.plugins must list known plugin ids";
+  if (Array.isArray(plugins) && plugins.includes("slop") && !plugins.includes("rust")) return "scorer.plugins: slop requires rust for test counts";
   if (rubric !== undefined && typeof rubric !== "string") return "scorer.rubric must be a string";
   if (command !== undefined && !(Array.isArray(command) && command.every((a) => typeof a === "string"))) return "scorer.command must be a list of strings";
   if (plan !== undefined && typeof plan !== "boolean") return "scorer.plan must be a boolean";
   return {
+    ...(Array.isArray(plugins) && plugins.length && { plugins: [...new Set(plugins as string[])] }),
     ...(rubric?.trim() && { rubric: rubric.trim() }),
     ...(command?.length && { command }),
     ...(plan && { plan }),
   };
 }
 
-/** Every project, Quality first, then by creation. */
+/** Every project, ordered by creation. */
 export function listProjects(db: Db): Project[] {
   const rows = db.prepare("SELECT data FROM projects").all() as { data: string }[];
   return rows
     .map((r) => JSON.parse(r.data) as Project)
-    .sort((a, b) => Number(!!b.builtin) - Number(!!a.builtin) || a.createdAt.localeCompare(b.createdAt));
+    .sort((a, b) => a.createdAt.localeCompare(b.createdAt));
 }
 
 export function getProject(db: Db, id: string): Project | undefined {
@@ -80,7 +83,7 @@ export function createProject(db: Db, name: string, goal?: string): Project {
 
 /** Delete a project with its findings, snapshots and task rows (the caller discards the tasks first). */
 export function deleteProjectRows(db: Db, id: string): void {
-  for (const table of ["findings", "snapshots", "tasks", "projects"]) {
+  for (const table of ["findings", "snapshots", "tasks", "dismissals", "projects"]) {
     db.prepare(`DELETE FROM ${table} WHERE ${table === "projects" ? "id" : "project"} = ?`).run(id);
   }
 }

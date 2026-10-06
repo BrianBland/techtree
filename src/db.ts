@@ -1,12 +1,12 @@
 import { join } from "node:path";
 import type { DatabaseSync as DatabaseSyncType } from "node:sqlite";
 import { createRequire } from "node:module";
-import { QUALITY, QUALITY_PROJECT } from "./core/projects.ts";
+import { getProject, QUALITY, QUALITY_PROJECT, saveProject } from "./core/projects.ts";
 import type { Cache } from "./types.ts";
 
 export type Db = DatabaseSyncType;
 
-const SCHEMA_VERSION = 2;
+const SCHEMA_VERSION = 3;
 
 const SCHEMA = `
 CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -77,10 +77,22 @@ export function openDb(dirOrMemory: string): Db {
   db.exec("PRAGMA journal_mode = WAL; PRAGMA foreign_keys = ON; PRAGMA busy_timeout = 5000;");
   db.exec(SCHEMA);
   for (const table of PROJECT_SCOPED) addProjectColumn(db, table);
-  db.prepare("INSERT OR IGNORE INTO projects (id, data) VALUES (?, ?)").run(QUALITY, JSON.stringify(QUALITY_PROJECT));
-  db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(
-    String(SCHEMA_VERSION),
-  );
+  const version = Number(db.prepare("SELECT value FROM meta WHERE key = 'schema_version'").get()?.value ?? 0);
+  if (version < SCHEMA_VERSION) {
+    db.exec("BEGIN IMMEDIATE");
+    try {
+      const existing = getProject(db, QUALITY);
+      const { builtin: _builtin, ...project } = (existing ?? QUALITY_PROJECT) as typeof QUALITY_PROJECT & { builtin?: boolean };
+      saveProject(db, project);
+      db.prepare("DELETE FROM cache WHERE kind = 'backend'").run();
+      db.prepare("INSERT INTO meta (key, value) VALUES ('schema_version', ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value").run(String(SCHEMA_VERSION));
+      db.exec("COMMIT");
+    } catch (err) {
+      db.exec("ROLLBACK");
+      db.close();
+      throw err;
+    }
+  }
   return db;
 }
 

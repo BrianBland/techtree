@@ -17,6 +17,7 @@ function App() {
   const [view, setView] = useState(initialView);
   const [treeProject, setTreeProject] = useState(view === ALL_PROJECTS ? QUALITY : view);
   const [projects, setProjects] = useState<Project[]>([]);
+  const [projectsLoaded, setProjectsLoaded] = useState(false);
   const [state, setState] = useState<ApiState | null>(null);
   const [error, setError] = useState<string | null>(null);
   const [notice, setNotice] = useState<string | null>(null);
@@ -34,7 +35,20 @@ function App() {
       (e: Error) => setError(e.message),
     );
   };
-  const loadProjects = () => get<Project[]>("/api/projects").then(setProjects, (e: Error) => setError(e.message));
+  const loadProjects = () => get<Project[]>("/api/projects").then((list) => {
+    setProjects(list);
+    setProjectsLoaded(true);
+    if (!list.some((p) => p.id === shownProject.current)) {
+      ++loadGeneration.current;
+      setState(null);
+      setError(null);
+      const next = list[0]?.id ?? QUALITY;
+      shownProject.current = next;
+      setTreeProject(next);
+      setView((v) => v === ALL_PROJECTS ? v : next);
+    }
+    return list;
+  }, (e: Error) => setError(e.message));
 
   const resync = () => void load().then(() => setVersion((v) => v + 1));
 
@@ -43,7 +57,7 @@ function App() {
     if (next !== ALL_PROJECTS) setTreeProject(next);
   };
 
-  useEffect(() => void load(), [treeProject]);
+  useEffect(() => { if (projectsLoaded && projects.length) void load(); }, [treeProject, projectsLoaded]);
 
   useEffect(() => {
     void loadProjects();
@@ -80,12 +94,19 @@ function App() {
     };
   }, []);
 
-  if (!state) return <div class="loading">{error ?? "Loading…"}</div>;
   const onProjectsChanged = (next: string) =>
     void loadProjects().then(() => {
       switchView(next);
       if (next === shownProject.current) void load();
     });
+  if (projectsLoaded && !projects.length) return (
+    <div class="loading">
+      <p>No projects. Create one to get started.</p>
+      <ProjectSwitcher projects={projects} view={ALL_PROJECTS} onSwitch={switchView} onChanged={onProjectsChanged} onError={setError} />
+      {error && <p>{error}</p>}
+    </div>
+  );
+  if (!state) return <div class="loading">{error ?? "Loading…"}</div>;
   return (
     <Main
       state={state}
