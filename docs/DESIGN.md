@@ -391,6 +391,7 @@ A node's `ownCtas` are those anchored at the node; `childCtas` are the top 10 an
   - "Open PR" (`review` → `queued` → `running`, phase `pr`) resumes the same pi session with an instruction to push to the upstream remote and open the PR with `gh`, following the repo's PR template.
   - Otherwise the worker opens the PR itself in one go. Once the PR number is found the task records it, moves to `pr_open` and the child is ended. Nothing ever merges.
 - **Stopping a worker** (cancel, discard, failure, finish): the child gets SIGTERM (on finish, its stdin is closed instead) and SIGKILL if it is still alive 1 s later (5 s on finish). Until it has exited, its session counts as busy: a queued resume of the task waits, and agent mode in "Open in terminal" is refused with 409.
+- **Pruning:** when a worker run ends in `review`, `pr_open`, `done` or `failed` (not `needs_input`), the runner deletes `config.pruneOnIdle` paths inside the task's worktree in the background (absolute paths and paths with `..` are ignored), e.g. `target` so idle Rust worktrees don't keep tens of GB of build output.
 - **Cancel:** stops the child (if any) and marks the task `failed` with error `cancelled`. The worktree is kept. A task that already has a PR (a babysit or fix run, `pr` set) returns to `pr_open` instead, so the PR stays tracked and babysit can resume it later; nothing happens to the PR itself.
 - **Message** (`POST /api/tasks/:id/message`, the chat pane) routes by state:
   - `running` with a live worker: sent as a `prompt` with `streamingBehavior: "steer"`, delivered to pi after the current tool calls (or starting a run when pi is idle); it re-arms the nudge.
@@ -507,6 +508,7 @@ terminal: []          # user config only. argv template for "Open in terminal", 
 openBrowser: true     # /techtree opens the UI in the default browser
 defaultModel: ""      # provider/model prefilled in the start dialog; empty = last used, else pi's default
 titleModel: ""        # provider/model writing combined PR titles; empty = defaultModel, else pi's default. A cheap fast model is enough
+pruneOnIdle: []       # paths inside a task worktree (e.g. [target]) deleted when its worker run ends (review, pr_open, done, failed), to bound disk use; relative, no "..". Resumes rebuild them
 refineModel: ""       # provider/model for "Refine with agent" (goals, rubrics); empty = defaultModel, else pi's default. Use a strong model: refined text steers every later task
 ignore: [target, node_modules, .git]
 plugins:              # per-plugin options, e.g.

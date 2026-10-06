@@ -2,7 +2,8 @@ import { execFile, execFileSync, spawn, type ChildProcess } from "node:child_pro
 import { randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, mkdirSync, readdirSync, readFileSync, rmSync } from "node:fs";
 import { homedir } from "node:os";
-import { basename, dirname, join } from "node:path";
+import { basename, dirname, isAbsolute, join } from "node:path";
+import { rm } from "node:fs/promises";
 import { fileURLToPath } from "node:url";
 import { promisify } from "node:util";
 import { QUALITY, scorerParts } from "../core/projects.ts";
@@ -600,7 +601,17 @@ export class TaskRunner {
     this.save(task);
     worker.child.stdin?.end();
     this.awaitExit(task.id, worker.child, FINISH_GRACE_MS);
+    this.prune(task);
     this.pump();
+  }
+
+  /** Delete `pruneOnIdle` paths inside the task's worktree (DESIGN "Agents", pruning), in the background. */
+  private prune(task: Task): void {
+    if (!task.worktree) return;
+    for (const path of this.opts.config.pruneOnIdle ?? []) {
+      if (!path || isAbsolute(path) || path.split(/[\\/]/).includes("..")) continue;
+      void rm(join(task.worktree, path), { recursive: true, force: true }).catch((err: Error) => this.log(task, `prune ${path} failed: ${err.message}`));
+    }
   }
 
   private fail(task: Task, error: string): void {
@@ -610,6 +621,7 @@ export class TaskRunner {
     this.log(task, `failed: ${error}`);
     this.stopWorker(task);
     this.save(task);
+    this.prune(task);
     this.pump();
   }
 

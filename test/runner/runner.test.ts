@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createServer } from "node:http";
 import type { AddressInfo } from "node:net";
 import { tmpdir } from "node:os";
@@ -9,7 +9,7 @@ import { join } from "node:path";
 import { mergeConfig } from "../../src/config.ts";
 import { openDb, suppressSqliteWarning, type Db } from "../../src/db.ts";
 import { TaskRunner, type StartTask } from "../../src/runner/runner.ts";
-import type { ServerEvent, Task } from "../../src/types.ts";
+import type { Config, ServerEvent, Task } from "../../src/types.ts";
 
 suppressSqliteWarning();
 
@@ -34,7 +34,7 @@ interface Harness {
   waitFor(id: string, pred: (task: Task) => boolean): Promise<Task>;
 }
 
-async function setup(t: TestContext, workers = 3): Promise<Harness> {
+async function setup(t: TestContext, workers = 3, extra: Partial<Config> = {}): Promise<Harness> {
   const tmp = mkdtempSync(join(tmpdir(), "techtree-runner-"));
   const repo = join(tmp, "repo");
   const cache = join(tmp, "cache");
@@ -69,7 +69,7 @@ async function setup(t: TestContext, workers = 3): Promise<Harness> {
   });
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const url = `http://127.0.0.1:${(server.address() as AddressInfo).port}`;
-  const config = mergeConfig({ workers, worktreeTemplate: `${tmp}/wt/{repo}-{task}`, piCommand: [process.execPath, FAKE_PI] });
+  const config = mergeConfig({ workers, worktreeTemplate: `${tmp}/wt/{repo}-{task}`, piCommand: [process.execPath, FAKE_PI], ...extra });
   const db = openDb(cache);
   const newRunner = () => {
     const runner = new TaskRunner({ db: openDb(cache), config, repoRoot: repo, cacheDir: cache, url, token: "secret", onEvent });
@@ -192,6 +192,19 @@ test("a task's model is persisted and passed to pi on every spawn, including the
 
   const plain = h.runner.start(req("happy"));
   assert.doesNotMatch(log(await h.waitFor(plain.id, (x) => x.state === "review")), /model:/);
+});
+
+test("pruneOnIdle paths are deleted from the worktree when the run ends; escaping paths are ignored", async (t) => {
+  const h = await setup(t, 1, { pruneOnIdle: ["target", "../outside", "/abs"] });
+  const { id } = h.runner.start(req("hang"));
+  const running = await h.waitFor(id, (x) => x.checklist.length === 1);
+  mkdirSync(join(running.worktree!, "target", "debug"), { recursive: true });
+  writeFileSync(join(h.tmp, "wt", "outside"), "keep");
+  h.runner.cancel(id);
+  for (let i = 0; existsSync(join(running.worktree!, "target")) && i < 100; i++) await new Promise((r) => setTimeout(r, 20));
+  assert.equal(existsSync(join(running.worktree!, "target")), false);
+  assert.equal(existsSync(join(running.worktree!, ".git")), true);
+  assert.equal(existsSync(join(h.tmp, "wt", "outside")), true);
 });
 
 test("without manual review the worker opens the PR in one go", async (t) => {
