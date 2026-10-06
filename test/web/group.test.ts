@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { combineSuggestions, commonAncestor } from "../../src/web/group.ts";
+import { combineSuggestions, commonAncestor, toggleSuggestion } from "../../src/web/group.ts";
 import type { Suggestion } from "../../src/types.ts";
 
 const s = (node: string, ids: string[], extra: Partial<Suggestion> = {}): Suggestion => ({
@@ -20,4 +20,11 @@ test("combined suggestions carry every finding at the common ancestor", () => {
     node: "crates", title: "fix crates/a/src (+1 more)", findingIds: ["1", "2", "3"], impact: { node: 2, root: 0.2 },
     effort: "large", conflict: 0.5, priority: 2, manualReview: true,
   });
+});
+
+test("toggling the same suggestion twice unchecks it, whether or not it names its project", () => {
+  const once = toggleSuggestion([], s("a", ["1"]), "quality");
+  assert.deepEqual(once.map((x) => x.project), ["quality"]);
+  assert.deepEqual(toggleSuggestion(once, s("a", ["1"]), "quality"), []);
+  assert.deepEqual(toggleSuggestion(once, s("a", ["1"], { project: "quality" }), "quality"), []);
 });

@@ -3,7 +3,13 @@ import type { Effort, NodeId, Suggestion } from "../types.ts";
 const EFFORT_ORDER: Effort[] = ["trivial", "small", "medium", "large"];
 
 /** Stable identity of a suggestion across refetches. */
-export const suggestionKey = (s: Suggestion) => `${s.project ?? ""}:${s.findingIds.join(",")}`;
+export const suggestionKey = (s: Suggestion) => s.findingIds.join(",");
+
+/** Check or uncheck `s` in `group`, recording its project (`current` when unset). */
+export function toggleSuggestion(group: Suggestion[], s: Suggestion, current: string): Suggestion[] {
+  const key = suggestionKey(s);
+  return group.some((x) => suggestionKey(x) === key) ? group.filter((x) => suggestionKey(x) !== key) : [...group, { ...s, project: s.project ?? current }];
+}
 
 /** The deepest node containing every node in `ids` ("" = repo root). */
 export function commonAncestor(ids: NodeId[]): NodeId {

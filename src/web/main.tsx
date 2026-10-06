@@ -7,7 +7,7 @@ import { focusView, layoutTree, siblingOrder, stubId, toggleOverride, type Overr
 import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
 import { GroupContext, NodePanel, StartDialog } from "./Panel.tsx";
-import { combineSuggestions, suggestionKey } from "./group.ts";
+import { combineSuggestions, toggleSuggestion } from "./group.ts";
 import { Overview } from "./Overview.tsx";
 import { PanelResizer, usePanelWidth } from "./PanelResizer.tsx";
 import { ProjectSwitcher } from "./Projects.tsx";
@@ -312,8 +312,7 @@ function groupValue(grouped: Suggestion[], setGrouped: (fn: (g: Suggestion[]) =>
   return {
     selected: grouped,
     canSelect: (s: Suggestion) => !grouped.length || projectOf(grouped[0]) === projectOf(s),
-    toggle: (s: Suggestion) =>
-      setGrouped((g) => (g.some((x) => suggestionKey(x) === suggestionKey(s)) ? g.filter((x) => suggestionKey(x) !== suggestionKey(s)) : [...g, { ...s, project: projectOf(s) }])),
+    toggle: (s: Suggestion) => setGrouped((g) => toggleSuggestion(g, s, current)),
   };
 }
 
