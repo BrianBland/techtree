@@ -264,7 +264,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
       <main style={{ "--panel-width": `${panelWidth}px`, "--outbox-width": `${outboxWidth}px` }}>
         <GroupContext.Provider value={groupValue(grouped, setGrouped, state.project.id)}>
         <div class="panel-column">
-        {selected === null ? (
+        {selected === null || selected === "" ? (
           <Overview
             state={state}
             view={view}
@@ -320,7 +320,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
           attention={attention}
           selected={selected}
           fitRequest={fitRequest}
-          onSelect={(id) => select(id === "" ? null : id)}
+          onSelect={select}
           onToggle={onToggle}
           onStub={onStub}
         />
