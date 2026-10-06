@@ -45,6 +45,8 @@ test("the factory registers /techtree and the tools without starting a server", 
   withCacheHome(t, cache);
   const { tools, commands, events } = fakePi();
   assert.deepEqual([...commands.keys()], ["techtree"]);
+  const command = commands.get("techtree") as unknown as { getArgumentCompletions(prefix: string): { value: string }[] };
+  assert.deepEqual(command.getArgumentCompletions("up").map((c) => c.value), ["update"]);
   assert.deepEqual([...tools.keys()].sort(), ["techtree_findings", "techtree_status"]);
   assert.ok(events.has("session_shutdown"));
   assert.equal(existsSync(lockPath(join(cache, "techtree", repoId(repo)))), false);

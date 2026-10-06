@@ -1,5 +1,5 @@
 import { execFileSync, spawn } from "node:child_process";
-import { chmodSync, closeSync, existsSync, openSync, readFileSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
+import { chmodSync, closeSync, existsSync, openSync, readFileSync, realpathSync, renameSync, rmSync, statSync, watch, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
 import { setTimeout as sleep } from "node:timers/promises";
@@ -138,6 +138,8 @@ export interface LaunchOptions {
   /** CLI entry point to run `serve` with; defaults to the built `dist/cli.js`. */
   cli?: string;
   timeoutMs?: number;
+  /** Rebuild after stopping the old server; used only by an explicit package update. */
+  rebuild?: boolean;
 }
 
 /** Reuse the repo's live server (restarting it when built from another build) or start a detached `techtree serve` and wait for it. */
@@ -155,7 +157,23 @@ export async function restartServer(repoRoot: string, cacheDir: string, opts: La
     writeHandover(cacheDir, live);
     await terminate(live.pid);
   }
+  if (opts.rebuild) {
+    ensureBuilt(true);
+    if (live) writeHandover(cacheDir, live);
+  }
   return launch(repoRoot, cacheDir, opts);
+}
+
+/** Fast-forward the installed package's upstream, rebuild it, and refresh this repo's server. */
+export async function updateServer(repoRoot: string, cacheDir: string, opts: LaunchOptions = {}): Promise<ServerInfo> {
+  const git = (...args: string[]) => execFileSync("git", args, { cwd: PACKAGE_ROOT, encoding: "utf8", stdio: "pipe", timeout: 60_000 }).trim();
+  if (realpathSync(git("rev-parse", "--show-toplevel")) !== realpathSync(PACKAGE_ROOT)) {
+    throw new Error(`techtree update requires a Git checkout at ${PACKAGE_ROOT}`);
+  }
+  if (git("status", "--porcelain")) throw new Error(`techtree has local changes; commit or stash them in ${PACKAGE_ROOT} before updating`);
+  requireBuildTools();
+  git("pull", "--ff-only");
+  return restartServer(repoRoot, cacheDir, { ...opts, rebuild: true });
 }
 
 /** `techtree stop`: stop the live server and wait for it to exit, or clear a stale lockfile. Returns a message. */
@@ -208,12 +226,16 @@ async function launch(repoRoot: string, cacheDir: string, opts: LaunchOptions): 
 }
 
 /** Path of `dist/cli.js`, building the package first when it or the web UI is missing. */
-function ensureBuilt(): string {
+function ensureBuilt(rebuild = false): string {
   const cli = join(distDir(), "cli.js");
-  if (existsSync(cli) && existsSync(join(distDir(), "web", "app.js"))) return cli;
-  if (!existsSync(join(PACKAGE_ROOT, "node_modules", "esbuild"))) {
-    throw new Error(`techtree is not built and esbuild is missing; run \`npm install && npm run build\` in ${PACKAGE_ROOT}`);
-  }
-  execFileSync(process.execPath, ["build.mjs"], { cwd: PACKAGE_ROOT, stdio: "ignore" });
+  if (!rebuild && existsSync(cli) && existsSync(join(distDir(), "web", "app.js"))) return cli;
+  requireBuildTools();
+  execFileSync(process.execPath, ["build.mjs"], { cwd: PACKAGE_ROOT, stdio: "pipe", timeout: 120_000 });
   return cli;
+}
+
+function requireBuildTools(): void {
+  if (!existsSync(join(PACKAGE_ROOT, "node_modules", "esbuild"))) {
+    throw new Error(`esbuild is missing; run \`npm install\` in ${PACKAGE_ROOT} before building techtree`);
+  }
 }

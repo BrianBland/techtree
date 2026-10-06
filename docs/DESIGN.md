@@ -43,9 +43,23 @@ There is one server per repo, shared by every pi session in that repo through a 
 - **Build id:** `npm run build` writes `dist/build-id` (a fresh random id) after `dist/cli.js` and `dist/web/`. The server records the id it started with in `server.json` (`build`). A build is *complete* when `dist/build-id`, `dist/cli.js` and `dist/web/app.js` all exist.
 - **Auto-update:** the server watches `dist/` (`fs.watch` plus a 5 s poll). When `dist/build-id` differs from its own and the build is complete, it waits until no scoring run or LLM scan is in progress (at most 10 minutes, then proceeds), logs the handover to `server.log`, writes the handover file (below), shuts down as on SIGTERM, and spawns its replacement detached, so open pages and URLs keep working. Tasks resume as on any restart.
 - **Restart** (same port and token): write the handover file, stop the live server as `techtree stop` does, then spawn `serve`. Used by `/techtree restart` and by Launch on a build mismatch.
+- **`/techtree update`** updates the installed techtree package, not the repository being scored. Require `PACKAGE_ROOT` to be the root of a Git checkout/worktree with a clean working tree and installed build dependencies; reject non-checkout installs and local edits without pulling or stopping the server. Run `git pull --ff-only` on the checkout's current branch and configured upstream, never switch branches, reset, stash, force-push or install dependencies. A failed pull leaves the existing server running. After a successful pull (including already up to date), stop the current repo's server, rebuild the package with `node build.mjs` even when bundles already exist, then launch the new bundle on the original port/token and behave like `/techtree`. Stop before rebuilding so that this server's build watcher cannot race an explicit restart; refresh the handover after the build so a build longer than its TTL keeps the URL. Git operations and build have bounded timeouts and surface errors. A failed build does not launch stale/partial bundles: the server remains stopped, and the user can repair the build and restart. Other repo servers retain their existing build-watch behavior. `/techtree restart`, `/techtree`, and build-mismatch restarts do not pull or force a rebuild.
 - **Handover file** `<cacheDir>/handover.json` (`{ port, token }`, mode 0600): written before a restart or auto-update stops the old server. Whichever `serve` process then wins the ownership claim (the replacement, or a concurrent launch that saw no live server meanwhile) listens on that port with that token (an explicit `--port` still wins for the port), then deletes the file. A file older than 60 s is ignored, so an aborted restart never pins a later start.
 - **Live server:** `server.json` exists, its pid is alive, and `GET /api/health` on its port answers 200 within 2 s. Anything else is stale.
 - **Launch** (`/techtree` and the extension tools): reuse a live server, restarting it (see Restart) when its `build` differs from the current complete `dist/build-id` (covers servers that missed the watch; no restart when there is no `dist/build-id`); otherwise spawn `node <package>/dist/cli.js serve <repo>` detached, with stdout and stderr appended to `<cacheDir>/server.log` (mode 0600, also enforced on an existing log, because it holds the token-bearing URL), and wait up to 30 s for a live server. If `dist/cli.js` or `dist/web` is missing, the launcher builds the package first (`node build.mjs`) and fails with an error naming the missing `esbuild` dev dependency when it is not installed.
+
+```mermaid
+flowchart LR
+  Update[Update command] --> Validate[Check package checkout, clean tree and build dependencies]
+  Validate --> Pull[Pull current upstream, fast-forward only]
+  Pull --> Stop[Record URL and stop current server]
+  Stop --> Build[Rebuild installed package]
+  Build --> Launch[Refresh handover and launch fresh bundle]
+  Launch --> Open[Open same URL and reconnect widget]
+  Validate -->|error| Running[Leave old server running]
+  Pull -->|error| Running
+  Build -->|error| Stopped[Surface error, do not launch stale bundle]
+```
 
 ### Backend (`src/backend/`)
 
@@ -70,6 +84,7 @@ It is `index.ts` so that both `-e <package>/extensions` (a directory loads its `
   - `/techtree url`: show the URL without opening the browser.
   - `/techtree stop`: stop this repo's server (as `techtree stop`) and notify the result.
   - `/techtree restart`: restart the server on the same port and token (see "Server lifecycle"), then behave like `/techtree`.
+  - `/techtree update`: fast-forward pull and rebuild the installed package, restart this repo's server on the same URL, then behave like `/techtree` (see "Server lifecycle").
   - anything else is an error naming the subcommands.
 - **Status widget** (`setWidget` key `techtree`): one line, `techtree: <n> running · <m> need attention · <url>`, fed by one `GET /api/state` and then the `/api/events` stream (refetching state on reconnect). It stops on `session_shutdown`.
 - **Tools:** `techtree_status` (`{ project? }`: root quality, running tasks, attention tasks and flagged PRs, URL) and `techtree_findings` (`{ path?, limit?, project? }`: top findings by impact for the deepest node containing `path`, a repo-relative or absolute file or directory defaulting to the working directory; limit 10). `project` defaults to `quality`. Both launch the server when needed.
