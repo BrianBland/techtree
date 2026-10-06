@@ -287,3 +287,6 @@ input[type="checkbox"] {
 input[type="checkbox"]:checked { background: var(--accent); border-color: var(--accent); box-shadow: inset 0 0 0 2px var(--hud-deep); }
 input[type="checkbox"]:disabled { opacity: 0.35; cursor: not-allowed; }
 .row:has(> .group-box:checked) { background: color-mix(in srgb, var(--accent) 12%, transparent); box-shadow: inset 3px 0 0 var(--accent); }
+.proposal h4 { margin: 10px 0 4px; }
+.proposal .add { color: var(--good); }
+.diff.proposal-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; }

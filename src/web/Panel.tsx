@@ -492,17 +492,35 @@ function DiffPane({ task, onError }: { task: Task; onError(message: string): voi
   );
 }
 
-/** A scorer proposal as a line diff against the current scorer's rubric, command and plan; reply in the chat to iterate. */
+/** A scorer proposal, field by field (rubric text, command arguments, plan) with line diffs against the current scorer; reply in the chat to iterate. */
 function ProposalDiff({ current, proposal }: { current: ScorerSpec; proposal?: ScorerSpec }) {
   if (!proposal) return <p class="muted small">No scorer proposed; reply in the chat to ask for one.</p>;
-  const lines = (spec: ScorerSpec) => JSON.stringify({ rubric: spec.rubric, command: spec.command, plan: spec.plan }, null, 2).split("\n");
-  const before = lines(current);
-  const after = lines(proposal);
+  const fields: [string, (spec: ScorerSpec) => string[]][] = [
+    ["Rubric", (spec) => (spec.rubric ? spec.rubric.split("\n") : [])],
+    ["Command", (spec) => spec.command ?? []],
+    ["Plan", (spec) => (spec.plan ? ["on"] : [])],
+  ];
   return (
-    <pre class="diff">
-      {before.filter((l) => !after.includes(l)).map((l, i) => <div key={`-${i}`} class="del">- {l}</div>)}
-      {after.map((l, i) => <div key={i} class={before.includes(l) ? undefined : "add"}>{before.includes(l) ? "  " : "+ "}{l}</div>)}
-    </pre>
+    <div class="proposal">
+      {fields.map(([label, lines]) => {
+        const before = lines(current);
+        const after = lines(proposal);
+        if (!before.length && !after.length) return null;
+        const same = before.join("\n") === after.join("\n");
+        return (
+          <section key={label}>
+            <h4>
+              {label} {same ? <span class="muted small">unchanged</span> : !before.length ? <span class="small add">new</span> : null}
+            </h4>
+            <pre class="diff proposal-text">
+              {before.filter((l) => !after.includes(l)).map((l, i) => <div key={`-${i}`} class="del">- {l}</div>)}
+              {after.map((l, i) => <div key={i} class={before.includes(l) || !before.length ? undefined : "add"}>{same || !before.length ? "" : before.includes(l) ? "  " : "+ "}{l}</div>)}
+              {before.length > 0 && !after.length && <div class="muted">(removed)</div>}
+            </pre>
+          </section>
+        );
+      })}
+    </div>
   );
 }
 
