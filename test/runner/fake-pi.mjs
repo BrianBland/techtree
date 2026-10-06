@@ -7,6 +7,10 @@ import { join } from "node:path";
 import { techtreeReportTool } from "../../src/runner/report-tool.ts";
 
 const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
+if (process.argv.includes("-p")) {
+  console.log("feat: fake combined title");
+  process.exit(0);
+}
 if (process.argv.includes("--list-models")) {
   process.stdout.write("provider  model  context  max-out  thinking  images\nfake      alpha  200K     64K      yes       yes\nfake      beta   1M       128K     no        no\n");
   process.exit(0);

@@ -231,6 +231,7 @@ export interface Config {
   piCommand: string[]; // argv prefix used to spawn pi children, e.g. ["pi"]
   piLoadsExtension?: boolean; // pi already loads techtree's extension (installed in its extensions dir): don't pass `-e`
   defaultModel?: string; // start-dialog prefill, "provider/id"
+  titleModel?: string; // combined PR titles, "provider/id"; unset = defaultModel
   refineModel?: string; // "Refine with agent" model, "provider/id"; unset = defaultModel
   openBrowser?: boolean; // /techtree opens the UI in the default browser (default true)
   terminal?: string[]; // "Open in terminal" argv template with {cwd} and {command}; unset = platform default
