@@ -627,6 +627,29 @@ test("the inbox is on the left, the tree in the middle and the outbox on the rig
   assert.ok(!main.childNodes[at("panel-column")].textContent.includes("Tidy the util helpers"), "PRs left the inbox overview");
 });
 
+test("an outbox row moving to another section keeps its open task and unsent chat draft", UI_TIMEOUT, async (t) => {
+  const { app, backend, prs, running } = await bootUi(t);
+  prs.list()[0].taskId = running.id;
+  await app.waitFor(() => app.text().includes("Outbox"), "outbox");
+  app.reconnect();
+  const outbox = () => app.find((n) => (n.getAttribute("class") ?? "").includes("panel outbox"))[0];
+  const inOutbox = (pred: (n: SmokeDriver["root"]) => boolean) => outbox().querySelectorAll(pred);
+  const button = (label: string) => inOutbox((n) => n.localName === "button" && n.textContent === label)[0];
+  await app.waitFor(() => button("▸ task") !== undefined, "expand control for the linked task");
+  button("▸ task").dispatch("click");
+  await app.waitFor(() => button("Chat") !== undefined, "task action bar");
+  button("Chat").dispatch("click");
+  await app.waitFor(() => inOutbox((n) => n.localName === "textarea").length === 1, "chat pane");
+  const draft = inOutbox((n) => n.localName === "textarea")[0] as unknown as { value: string; dispatch(t: string): void };
+  draft.value = "half-typed";
+  draft.dispatch("input");
+
+  await backend.report(running.id, { needs_input: "Which fix?" });
+  await app.waitFor(() => outbox().textContent.includes("agent asks: Which fix?"), "row moved to Needs you");
+  const after = inOutbox((n) => n.localName === "textarea")[0] as unknown as { value: string } | undefined;
+  assert.equal(after?.value, "half-typed");
+});
+
 test("switching projects with a node open drops the old project's actions; All projects shows the overview", UI_TIMEOUT, async (t) => {
   let release!: () => void;
   const gate = new Promise<void>((resolve) => (release = resolve));

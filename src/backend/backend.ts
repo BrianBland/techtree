@@ -595,7 +595,11 @@ export class RepoBackend implements Backend {
   }
 
   async setAutoBabysit(on: boolean): Promise<ApiPrs> {
-    await this.opts.prs.setAutoBabysit(on);
+    try {
+      await this.opts.prs.setAutoBabysit(on);
+    } catch (err) {
+      throw err instanceof HttpError ? err : new HttpError(502, errorText(err));
+    }
     return this.listPrs();
   }
 

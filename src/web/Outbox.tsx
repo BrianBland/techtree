@@ -70,20 +70,20 @@ export function Outbox({ projects, version, onSelect, onError }: OutboxProps) {
         </label>
       </header>
       {!rows.length && <p class="muted">No open PRs.</p>}
-      {SECTIONS.map(([section, title]) => {
-        const items = rows.filter((r) => r.section === section);
-        if (!items.length) return null;
-        return (
-          <section key={section}>
-            <h3>{title}</h3>
-            <ul class="list">
-              {items.map((r) => (
-                <OutboxRow key={r.pr.number} {...r} prs={data.prs} projects={projects} version={version} onSelect={onSelect} onError={onError} />
-              ))}
-            </ul>
-          </section>
-        );
-      })}
+      <ul class="list">
+        {SECTIONS.flatMap(([section, title]) => {
+          const items = rows.filter((r) => r.section === section);
+          if (!items.length) return [];
+          return [
+            <li key={section} class="outbox-heading">
+              <h3>{title}</h3>
+            </li>,
+            ...items.map((r) => (
+              <OutboxRow key={r.pr.number} {...r} prs={data.prs} projects={projects} version={version} onSelect={onSelect} onError={onError} />
+            )),
+          ];
+        })}
+      </ul>
     </aside>
   );
 }

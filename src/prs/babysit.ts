@@ -48,13 +48,17 @@ export class Babysitter {
     return this.opts.cache.get(...AUTO_BABYSIT) === true;
   }
 
-  /** Switching on babysits every open PR of the current gh user; switching off changes no PR. */
+  /**
+   * Switching on babysits every open PR of the current gh user, and rejects (leaving the setting off)
+   * when that user cannot be looked up; switching off changes no PR.
+   */
   async setAutoBabysit(on: boolean): Promise<void> {
-    this.opts.cache.set(...AUTO_BABYSIT, on);
-    if (!on) return;
+    if (!on) return this.opts.cache.set(...AUTO_BABYSIT, false);
     const { poller } = this.opts;
     const user = await poller.refreshUser();
-    for (const pr of poller.list()) if (user && pr.author === user && !pr.babysit) this.switchOn(pr.number);
+    if (!user) throw new Error("gh user lookup failed; auto-babysit stays off");
+    this.opts.cache.set(...AUTO_BABYSIT, true);
+    for (const pr of poller.list()) if (pr.author === user && !pr.babysit) this.switchOn(pr.number);
   }
 
   private switchOn(number: number): PrState {
@@ -81,9 +85,13 @@ export class Babysitter {
     const healthy = next.ci === "pass" && next.mergeable !== "CONFLICTING" && next.review !== "CHANGES_REQUESTED";
     if (healthy && poller.fixAttempts(next.number) > 0) report({}, 0);
     const triggers = triggersOf(prev, next).join(", ");
-    if (!triggers) return;
     // The hard observe-only rule: an agent could push or reply, so none runs on someone else's PR.
-    if (!poller.user || next.author !== poller.user) return void report({ babysitStatus: `observe-only: ${triggers}` });
+    if (!poller.user || next.author !== poller.user) {
+      if (triggers) report({ babysitStatus: `observe-only: ${triggers}` });
+      else if (!next.babysitStatus?.startsWith("observe-only")) report({ babysitStatus: "observe-only: not your PR" });
+      return;
+    }
+    if (!triggers) return;
     const attempts = poller.fixAttempts(next.number);
     if (attempts >= MAX_FIX_ATTEMPTS)
       return void report({ babysit: false, babysitStatus: `gave up after ${MAX_FIX_ATTEMPTS} fix attempts` });

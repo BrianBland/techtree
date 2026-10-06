@@ -202,6 +202,23 @@ test("observe-only: another author's PR is never pushed to or replied on, only r
   assert.equal(h.poller.get(1)?.babysit, true);
 });
 
+test("a babysat foreign PR is observe-only even while nothing is wrong", async (t) => {
+  const h = await setup(t, { author: { login: "alice" } });
+  await h.babysitter.setBabysit(1, true);
+  assert.equal(h.poller.get(1)?.babysitStatus, "observe-only: not your PR");
+  assert.equal(h.runner.launches(), 0);
+});
+
+test("auto-babysit fails and stays off when the gh user cannot be looked up", async (t) => {
+  const h = await setup(t);
+  h.gh.setUser(null);
+  await assert.rejects(h.babysitter.setAutoBabysit(true), /gh user/);
+  assert.equal(h.babysitter.autoBabysit, false);
+  h.gh.setUser("me");
+  await h.babysitter.setAutoBabysit(true);
+  assert.equal(h.poller.get(1)?.babysit, true, "retrying works");
+});
+
 test("observe-only while the current gh user is unknown", async (t) => {
   const h = await setup(t, failing);
   h.gh.setUser(null);

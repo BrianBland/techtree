@@ -300,3 +300,4 @@ input[type="checkbox"]:disabled { opacity: 0.35; cursor: not-allowed; }
 .outbox-row .project-tag { color: var(--ink); }
 .outbox-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
 .ci.pending { color: var(--gold); }
+.list > li.outbox-heading { padding: 0; margin: 0; background: none; border: none; }
