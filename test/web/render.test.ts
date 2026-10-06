@@ -272,14 +272,15 @@ test("a stub under the focus expands in place; an ancestor's stub selects its pa
   assert.equal(shownUnderWide(), 6, "wide is the focus, so all its children show");
 });
 
-test("root tile and Close both show the overview while preserving graph focus", UI_TIMEOUT, async (t) => {
+test("root selection restores root focus and its highlight, but shows the overview sidebar", UI_TIMEOUT, async (t) => {
+  const urls = recordUrls(t);
   const { app, backend, byClass } = await bootUi(t, (real) => ({
     ...delegate(real),
     getState: async () => {
       const state = await real.getState();
       return { ...state, scores: { ...state.scores, [RUNNING_NODE]: { ...state.scores[RUNNING_NODE], quality: null } } };
     },
-  }));
+  }), Object.fromEntries(Array.from({ length: 8 }, (_, i) => [`sibling${i}/lib.rs`, "fn sibling() {}\n"])));
   const state = await backend.getState();
   await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
   assert.ok(app.find((n) => n.getAttribute("class") === "work-effect question").length >= 2, "question edges reach root");
@@ -291,18 +292,31 @@ test("root tile and Close both show the overview while preserving graph focus", 
   assert.equal(app.find((n) => n.getAttribute("class") === "badge findings").length, 0, "findings are not presented as task counts");
   const tile = (name: string) => app.find((n) => n.getAttribute("class") === "label" && n.textContent === name)[0];
   const selected = () => app.find((n) => (n.getAttribute("class") ?? "").split(" ").includes("selected"));
+  const tiles = () => app.find((n) => /^node( |$)/.test(n.getAttribute("class") ?? ""));
+  const rootNodes = tiles().length;
   tile(state.tree.nodes[ASKING_NODE].name).dispatch("click");
   await app.waitFor(() => byClass("answer").length === 1, "net focused");
-  const nodes = app.find((n) => /^node( |$)/.test(n.getAttribute("class") ?? "")).length;
+  const focusedNodes = tiles().length;
+  assert.ok(rootNodes > focusedNodes, "a deep focus folds root siblings");
+  assert.match(urls.at(-1)!, /focus=src/);
   tile(state.repo.name).dispatch("click");
-  await app.waitFor(() => app.text().includes("Scan coverage"), "root click closes panel");
-  assert.equal(selected().length, 0);
-  assert.equal(app.find((n) => /^node( |$)/.test(n.getAttribute("class") ?? "")).length, nodes);
+  await app.waitFor(() => app.text().includes("Scan coverage") && selected().length === 1, "root selected with overview");
+  assert.equal(selected()[0].querySelectorAll((n) => n.getAttribute("class") === "label")[0].textContent, state.repo.name);
+  assert.equal(tiles().length, rootNodes, "root focus restores rendered siblings");
+  assert.equal(urls.at(-1), "/", "root focus clears the URL parameter");
   tile(state.tree.nodes[ASKING_NODE].name).dispatch("click");
   await app.waitFor(() => byClass("answer").length === 1, "net panel reopened");
   app.find((n) => n.localName === "button" && n.textContent === "close")[0].dispatch("click");
   await app.waitFor(() => app.text().includes("Scan coverage"), "Close returns to overview");
   assert.equal(selected().length, 0);
+  assert.equal(tiles().length, focusedNodes, "Close still preserves the deep focus");
+  await backend.startTask({ node: "", title: "Root worker", findingIds: [], prompt: "scenario:hang", manualReview: true });
+  const rootTask = () => byClass("row clickable").find((n) => n.textContent.includes("Root worker"));
+  await app.waitFor(() => rootTask() !== undefined, "root task in overview");
+  rootTask()!.dispatch("click");
+  await app.waitFor(() => selected().length === 1 && tiles().length === rootNodes, "inbox root selection restores root focus");
+  assert.ok(app.text().includes("Scan coverage"), "root selections from inbox also show overview");
+  assert.equal(urls.at(-1), "/");
   const priority = app.find((n) => n.localName === "select" && n.textContent === "ActiveInactive")[0];
   assert.ok(priority, "activity priority control");
   const hide = app.find((n) => n.localName === "label" && n.textContent === "Hide unscored")[0];
@@ -374,11 +388,11 @@ test("when the model list fails the start dialog says so and starts on pi's defa
   assert.equal(tasks.at(-1)!.model, undefined);
 });
 
-async function openRootTask(ui: Ui) {
+async function openParentTask(ui: Ui) {
   ui.app.find((n) => n.localName === "button" && n.textContent === "close")[0]?.dispatch("click");
-  await ui.backend.startTask({ node: "", title: "Root worker", findingIds: [], prompt: "scenario:hang", manualReview: true });
-  const row = () => ui.byClass("row clickable").find((n) => n.textContent.includes("Root worker"));
-  await ui.app.waitFor(() => row() !== undefined, "root worker in overview");
+  await ui.backend.startTask({ node: "src", title: "Parent worker", findingIds: [], prompt: "scenario:hang", manualReview: true });
+  const row = () => ui.byClass("row clickable").find((n) => n.textContent.includes("Parent worker"));
+  await ui.app.waitFor(() => row() !== undefined, "parent worker in overview");
   row()!.dispatch("click");
 }
 
@@ -387,17 +401,17 @@ test("the node panel lists its own calls to action, then its children's, which s
   const { app, backend, byClass } = ui;
   const state = await backend.getState();
   await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
-  await openRootTask(ui);
+  await openParentTask(ui);
   await app.waitFor(() => byClass("row clickable cta-child").length > 0, "children's calls to action");
 
-  const { childCtas } = await backend.getNode("");
+  const { childCtas } = await backend.getNode("src");
   const rows = byClass("row clickable cta-child");
   assert.equal(rows.length, childCtas.length);
   assert.ok(rows.length <= 10);
   const text = byClass("panel")[0].textContent;
   assert.ok(text.indexOf("This node") < text.indexOf("From children"), "own section first");
   assert.ok(text.indexOf("From children") < text.indexOf("Composite"), "calls to action before the breakdown");
-  assert.ok(rows[0].textContent.includes(childCtas[0].reason) && rows[0].textContent.includes(childCtas[0].node));
+  assert.ok(rows[0].textContent.includes(childCtas[0].reason) && rows[0].textContent.includes(childCtas[0].node.slice("src/".length)));
 
   rows[0].dispatch("click");
   const child = state.tree.nodes[childCtas[0].node];
@@ -416,8 +430,8 @@ test("children's calls to action follow descendant task changes while the panel 
     app.find((n) => n.getAttribute("class") === "row clickable cta-child" && n.textContent.includes("needs input")).length;
   const state = await backend.getState();
   await app.waitFor(() => app.text().includes("Scan coverage"), "overview");
-  await openRootTask(ui);
-  await app.waitFor(() => asking() > 0, "root panel with a question from a descendant");
+  await openParentTask(ui);
+  await app.waitFor(() => asking() > 0, "parent panel with a question from a descendant");
   const before = asking();
 
   await backend.report(running.id, { needs_input: "Which error type?" });
@@ -443,13 +457,13 @@ test("a merged or closed PR disappears from the open node panel", UI_TIMEOUT, as
 
 test("the UI resyncs after reconnects and never acts on stale or failed data", UI_TIMEOUT, async (t) => {
   const calls = { getState: 0, getOverview: 0 };
-  const fail = { answer: false, rootNode: false };
+  const fail = { answer: false, parentNode: false };
   const listeners = new Set<(e: ServerEvent) => void>();
   const ui = await bootUi(t, (real) => ({
     ...delegate(real),
     getState: () => (calls.getState++, real.getState()),
     getOverview: () => (calls.getOverview++, real.getOverview()),
-    getNode: (id) => (fail.rootNode && id === "" ? Promise.reject(new HttpError(500, "boom")) : real.getNode(id)),
+    getNode: (id) => (fail.parentNode && id === "src" ? Promise.reject(new HttpError(500, "boom")) : real.getNode(id)),
     answer: (id, text) => (fail.answer ? Promise.reject(new HttpError(409, "wrong state")) : real.answer(id, text)),
     subscribe(listener) {
       listeners.add(listener);
@@ -477,10 +491,10 @@ test("the UI resyncs after reconnects and never acts on stale or failed data", U
   await new Promise((r) => setTimeout(r, 20));
   assert.equal(textarea.value, "keep the old error type");
 
-  fail.rootNode = true;
-  await openRootTask(ui);
-  await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === state.repo.name, "root panel");
-  await app.waitFor(() => app.text().includes("internal error"), "root detail failure shown");
+  fail.parentNode = true;
+  await openParentTask(ui);
+  await app.waitFor(() => app.find((n) => n.localName === "h2")[0]?.textContent === "src", "parent panel");
+  await app.waitFor(() => app.text().includes("internal error"), "parent detail failure shown");
   assert.ok(!app.text().includes("This node"), "previous node's calls to action still shown");
   assert.equal(app.find((n) => n.localName === "button" && n.textContent === "Start").length, 0);
 });
