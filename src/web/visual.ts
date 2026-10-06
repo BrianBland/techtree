@@ -1,4 +1,5 @@
-import type { ApiState, MetricDef, NodeId, NodeScore, PrState, Task, TaskPhase } from "../types.ts";
+import type { ApiState, MetricDef, NodeId, NodeScore, PrState, Task, TaskPhase, Tree } from "../types.ts";
+import { withAncestors } from "./layout.ts";
 
 export const NO_SCORE = "hsl(228 10% 42%)";
 /** The selected-score key meaning the composite quality rather than one metric. */
@@ -62,6 +63,44 @@ export function attentionNodes(tasks: Task[], prs: PrState[]): Set<NodeId> {
   ]);
 }
 
+export const ACTIONED_STATES: Task["state"][] = ["queued", "running", "needs_input", "review", "staged", "pr_open"];
+export type NodeEffect = "queued" | "running" | "review" | "attention" | "question";
+export const EFFECT_PRIORITY: NodeEffect[] = ["queued", "running", "review", "attention", "question"];
+
+export function activeNodes(tasks: Task[], prs: PrState[]): Set<NodeId> {
+  return new Set([...tasks.filter((t) => ACTIONED_STATES.includes(t.state)).map((t) => t.node), ...prs.map((p) => p.node)]);
+}
+
+export function nodeEffects(tasks: Task[], prs: PrState[]): Map<NodeId, NodeEffect> {
+  const effects = new Map<NodeId, NodeEffect>();
+  const add = (id: NodeId, effect: NodeEffect) => {
+    if (EFFECT_PRIORITY.indexOf(effect) > EFFECT_PRIORITY.indexOf(effects.get(id)!)) effects.set(id, effect);
+  };
+  for (const task of tasks) {
+    if (task.state === "needs_input") add(task.node, "question");
+    else if (task.state === "queued" || task.state === "running" || task.state === "review") add(task.node, task.state);
+  }
+  for (const id of attentionNodes([], prs)) add(id, "attention");
+  return effects;
+}
+
+/** Incoming-edge effects, including work on descendants folded out of the visible layout. */
+export function branchEffects(tree: Tree, effects: ReadonlyMap<NodeId, NodeEffect>): Map<NodeId, NodeEffect> {
+  const branches = new Map<NodeId, NodeEffect>();
+  for (const effect of EFFECT_PRIORITY) {
+    for (const [start, status] of effects) {
+      if (status !== effect) continue;
+      for (let id: NodeId | null = start; id !== null && tree.nodes[id]; id = tree.nodes[id].parent) branches.set(id, effect);
+    }
+  }
+  return branches;
+}
+
+export function scoredTree(tree: Tree, scoreOf: (id: NodeId) => number | null, focus: NodeId): Tree {
+  const keep = withAncestors(tree, new Set([focus, ...Object.keys(tree.nodes).filter((id) => scoreOf(id) !== null)]));
+  return { ...tree, nodes: Object.fromEntries(Object.entries(tree.nodes).filter(([id]) => keep.has(id)).map(([id, node]) => [id, { ...node, children: node.children.filter((child) => keep.has(child)) }])) };
+}
+
 const ATTENTION_VALUE = 1_000_000;
 const RUNNING_VALUE = 100_000;
 const FINDING_VALUE = 10;
@@ -70,7 +109,7 @@ const FINDING_VALUE = 10;
  * Subtree value per node (see DESIGN "UI → Tree → Focus"): the largest node value in its subtree, where
  * node value = attention + running work + (100 − quality) × √own loc + 10 × own findings.
  */
-export function subtreeValues({ tree, scores, tasks, prs, findingCounts }: Pick<ApiState, "tree" | "scores" | "tasks" | "prs" | "findingCounts">): Map<NodeId, number> {
+export function subtreeValues({ tree, scores, tasks, prs, findingCounts }: Pick<ApiState, "tree" | "scores" | "tasks" | "prs" | "findingCounts">, prioritizeActive = true): Map<NodeId, number> {
   const attention = attentionNodes(tasks, prs);
   const running = new Set(tasks.filter((t) => t.state === "running").map((t) => t.node));
   const score = (id: NodeId) => (Object.hasOwn(scores, id) ? scores[id] : undefined);
@@ -81,8 +120,8 @@ export function subtreeValues({ tree, scores, tasks, prs, findingCounts }: Pick<
     const quality = score(id)?.quality;
     const ownLoc = Math.max(0, loc(id) - node.children.reduce((sum, child) => sum + loc(child), 0));
     let value =
-      (attention.has(id) ? ATTENTION_VALUE : 0) +
-      (running.has(id) ? RUNNING_VALUE : 0) +
+      (prioritizeActive && attention.has(id) ? ATTENTION_VALUE : 0) +
+      (prioritizeActive && running.has(id) ? RUNNING_VALUE : 0) +
       (quality === null || quality === undefined ? 0 : (100 - quality) * Math.sqrt(ownLoc)) +
       FINDING_VALUE * (Object.hasOwn(findingCounts, id) ? findingCounts[id] : 0);
     for (const child of node.children) value = Math.max(value, visit(child));
@@ -152,18 +191,16 @@ export interface TileLook {
   pips: (string | null)[];
   /** Composite quality for the XP bar. */
   xp: number | null;
-  findings: number;
 }
 
 export interface TileLookInput {
   scores: Record<NodeId, NodeScore>;
   scoreKey: string;
   statKeys: string[];
-  findingCounts: Record<NodeId, number>;
 }
 
 /** Tile looks for the selected score: fill over the repo's range, pips on a fixed 0..100 ramp. */
-export function tileLooks({ scores, scoreKey, statKeys, findingCounts }: TileLookInput): (id: NodeId) => TileLook {
+export function tileLooks({ scores, scoreKey, statKeys }: TileLookInput): (id: NodeId) => TileLook {
   const fill = ramp(Object.values(scores).map((s) => scoreValue(s, scoreKey)));
   const pip = ramp([0, 100]);
   return (id) => {
@@ -175,7 +212,6 @@ export function tileLooks({ scores, scoreKey, statKeys, findingCounts }: TileLoo
         return pct === undefined || pct === null ? null : pip(pct);
       }),
       xp: score?.quality ?? null,
-      findings: findingCounts[id] ?? 0,
     };
   };
 }

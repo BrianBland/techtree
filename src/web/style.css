@@ -59,6 +59,7 @@ h3::before { content: "▮ "; color: var(--accent); }
   display: flex;
   align-items: center;
   gap: 14px;
+  flex-wrap: wrap;
   padding: 8px 14px;
   background: var(--hud);
   border-bottom: 3px solid var(--ink);
@@ -97,8 +98,22 @@ main { flex: 1; display: flex; min-height: 0; }
 .node .xp { fill: var(--gold); }
 .node .ring { fill: none; stroke: #fff; stroke-width: 2; stroke-dasharray: 6 3; animation: march 0.8s linear infinite; }
 .node:hover .frame { fill: #fff; }
-.node .glow { fill: none; stroke: var(--gold); stroke-width: 2; filter: drop-shadow(0 0 4px var(--gold)); animation: glow 1.1s ease-in-out infinite; }
-.node.attention .label { fill: var(--gold); }
+.node .glow { fill: none; stroke: var(--effect-color, var(--gold)); stroke-width: 2; filter: drop-shadow(0 0 4px var(--effect-color, var(--gold))); animation: glow 1.1s ease-in-out infinite; }
+.node.attention .label { fill: var(--effect-color, var(--gold)); }
+.queued { --effect-color: #b49aff; }
+.running { --effect-color: var(--accent); }
+.review { --effect-color: var(--good); }
+.question, .attention { --effect-color: var(--gold); }
+.node.review { --effect-color: var(--good); }
+.node .status-ring { fill: none; stroke: var(--effect-color); stroke-width: 2; }
+.node.queued .status-ring { stroke-dasharray: 2 4; }
+.node.running .status-ring { stroke-dasharray: 6 3; animation: march 0.8s linear infinite; }
+.edges .work-effect { stroke: var(--effect-color); pointer-events: none; }
+.edges .work-effect.queued { stroke-dasharray: 2 4; }
+.edges .work-effect.running { stroke-dasharray: 6 3; animation: march 0.8s linear infinite; }
+.edges .work-effect:is(.question, .attention, .review) { filter: drop-shadow(0 0 4px var(--effect-color)); animation: glow 1.1s ease-in-out infinite; }
+.edges .selected-path { stroke: #fff; stroke-dasharray: 6 3; animation: march 0.8s linear infinite; pointer-events: none; }
+.edges .edge-flash { stroke: #fff; opacity: 0; animation: flash 0.9s ease-out; pointer-events: none; }
 .stub { cursor: pointer; transition: transform 0.35s ease; }
 .stub rect { fill: var(--hud-deep); stroke: var(--line); stroke-width: 2; stroke-dasharray: 4 3; }
 .stub .label { font: 12px var(--mono); fill: var(--muted); paint-order: stroke; stroke: var(--board); stroke-width: 4px; }
@@ -131,8 +146,10 @@ main { flex: 1; display: flex; min-height: 0; }
 .badge.pr.failing text { fill: var(--ink); }
 .badge.ask rect { fill: var(--gold); animation: blink 0.8s steps(2, jump-none) infinite; }
 .badge.ask text { fill: var(--ink); }
-.badge.findings rect { fill: #2a2f55; }
-.badge.findings text { fill: var(--text); }
+.badge.actioned rect { fill: var(--accent); }
+.badge.actioned text { fill: var(--ink); }
+.badge.suggested rect { fill: #2a2f55; }
+.badge.suggested text { fill: var(--text); }
 
 @keyframes glow { 0%, 100% { opacity: 1; } 50% { opacity: 0.2; } }
 @keyframes flash { 0% { opacity: 0.85; } 100% { opacity: 0; } }

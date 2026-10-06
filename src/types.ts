@@ -254,6 +254,7 @@ export interface ApiState {
   tasks: Task[];
   prs: PrState[];
   findingCounts: Record<NodeId, number>; // own findings per node
+  suggestionCounts: Record<NodeId, number>; // currently offered suggestions per node
 }
 
 export interface HistoryPoint {

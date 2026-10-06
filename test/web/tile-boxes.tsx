@@ -32,7 +32,7 @@ export function decoratedSiblingBoxes(count: number, attention?: ReadonlySet<Nod
   const ids = Object.keys(nodes);
   const side = tileSize(1);
   const layout = layoutTree({ tree, shown: new Map([["", nodes[""].children]]), radius: () => side(1) / 2 });
-  const look: TileLook = { fill: "red", pips: Array(8).fill("red"), xp: 50, findings: 12 };
+  const look: TileLook = { fill: "red", pips: Array(8).fill("red"), xp: 50 };
   const tasks = ids.map((node, i) => ({ id: `t${i}`, node, state: "needs_input" }) as Task);
   const prs = ids.map((node, i) => ({ number: i, node, ci: "fail" }) as PrState);
   render(
@@ -46,6 +46,7 @@ export function decoratedSiblingBoxes(count: number, attention?: ReadonlySet<Nod
       tasks={tasks}
       prs={prs}
       attention={attention ?? new Set(ids)}
+      suggestionCounts={Object.fromEntries(ids.map((id) => [id, 12]))}
       selected="n0"
       fitRequest={0}
       onSelect={() => {}}

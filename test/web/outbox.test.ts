@@ -23,7 +23,8 @@ test("outbox rows fall into Needs you, Babysitting or Waiting by the first match
     ["babysat with a fix running", { babysit: true, ci: "fail", babysitStatus: "fix attempt 1/3: CI failing" }, task("running"), "babysitting",
       "fix attempt 1/3: CI failing"],
     ["babysat and healthy", { babysit: true }, undefined, "babysitting", "waiting for CI or review"],
-    ["CI running", { ci: "pending" }, undefined, "waiting", "CI running"],
+    ["checks pending, review required", { ci: "pending" }, undefined, "waiting", "checks pending · waiting for review"],
+    ["checks pending, already approved", { ci: "pending", review: "APPROVED" }, undefined, "waiting", "checks pending"],
     ["waiting on review", {}, undefined, "waiting", "waiting for review"],
   ];
   for (const [name, pr, linked, section, status] of cases) assert.deepEqual(outboxEntry({ ...base, ...pr }, linked), { section, status }, name);

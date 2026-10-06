@@ -151,6 +151,8 @@ export interface FocusInput {
   overrides: Overrides;
   /** Nodes with an attention item; siblings whose subtree holds one are preferred as context. */
   attention: ReadonlySet<NodeId>;
+  active?: ReadonlySet<NodeId>;
+  prioritizeActive?: boolean;
   /** Subtree value per node (see `subtreeValues`); missing nodes are worth 0. */
   values: ReadonlyMap<NodeId, number>;
   budget?: number;
@@ -167,11 +169,12 @@ const CHAIN_CHILDREN = 2;
  * the descendants of highest subtree value while they fit the budget, with manual overrides applied on
  * top. Manual expansions win: automatic openings are undone, latest first, until the view fits again.
  */
-export function focusView({ tree, focus, order, overrides, attention, values, budget = 70, context = 3 }: FocusInput): Map<NodeId, NodeId[]> {
+export function focusView({ tree, focus, order, overrides, attention, active = attention, prioritizeActive = true, values, budget = 70, context = 3 }: FocusInput): Map<NodeId, NodeId[]> {
   const shown = new Map<NodeId, NodeId[]>();
-  const warm = withAncestors(tree, attention);
+  const warm = withAncestors(tree, active);
+  const activityOrder = (a: NodeId, b: NodeId) => (Number(warm.has(b)) - Number(warm.has(a))) * (prioritizeActive ? 1 : -1);
   const valueOf = (id: NodeId) => values.get(id) ?? 0;
-  const byValue: SiblingOrder = (a, b) => valueOf(b.id) - valueOf(a.id) || order(a, b);
+  const byValue: SiblingOrder = (a, b) => activityOrder(a.id, b.id) || valueOf(b.id) - valueOf(a.id) || order(a, b);
   let visible = 1;
   const revealed = (id: NodeId, kids: readonly NodeId[]) => kids.length + (kids.length < tree.nodes[id].children.length ? 1 : 0);
   const open = (id: NodeId, kids: NodeId[]) => {
@@ -197,7 +200,7 @@ export function focusView({ tree, focus, order, overrides, attention, values, bu
   const contextNodes: NodeId[] = [];
   for (let i = 0; i < path.length - 1; i++) {
     const children = sortedChildren(tree, tree.nodes[path[i]], order).map((n) => n.id);
-    const kids = overrides.get(path[i]) ? children : nearSiblings(children, path[i + 1], context, warm);
+    const kids = overrides.get(path[i]) ? children : nearSiblings(children, path[i + 1], context, activityOrder);
     open(path[i], kids);
     contextNodes.push(...kids.filter((id) => id !== path[i + 1]));
   }
@@ -244,21 +247,21 @@ export function focusView({ tree, focus, order, overrides, attention, values, bu
   return shown;
 }
 
-/** `pathChild` plus up to `count` of its siblings, nearest in `children` order first, attention first; in `children` order. */
-function nearSiblings(children: NodeId[], pathChild: NodeId, count: number, warm: ReadonlySet<NodeId>): NodeId[] {
+/** `pathChild` plus up to `count` siblings, activity preference then nearest; in drawing order. */
+function nearSiblings(children: NodeId[], pathChild: NodeId, count: number, activityOrder: (a: NodeId, b: NodeId) => number): NodeId[] {
   if (children.length - 1 <= count + 1) return children;
   const at = children.indexOf(pathChild);
   const distance = (i: number) => Math.abs(i - at) * 2 - (i < at ? 1 : 0);
   const picked = children
     .map((id, i) => ({ id, i }))
     .filter(({ i }) => i !== at)
-    .sort((a, b) => Number(warm.has(b.id)) - Number(warm.has(a.id)) || distance(a.i) - distance(b.i))
+    .sort((a, b) => activityOrder(a.id, b.id) || distance(a.i) - distance(b.i))
     .slice(0, count);
   const keep = new Set([pathChild, ...picked.map((p) => p.id)]);
   return children.filter((id) => keep.has(id));
 }
 
-function withAncestors(tree: Tree, ids: ReadonlySet<NodeId>): Set<NodeId> {
+export function withAncestors(tree: Tree, ids: ReadonlySet<NodeId>): Set<NodeId> {
   const out = new Set<NodeId>();
   for (const start of ids) for (let id: NodeId | null = start; id !== null && !out.has(id); id = tree.nodes[id]?.parent ?? null) out.add(id);
   return out;
