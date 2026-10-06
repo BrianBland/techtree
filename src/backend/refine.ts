@@ -34,3 +34,14 @@ export async function refineText(
   if (!text) throw new Error("the agent returned no text");
   return text;
 }
+
+/** A PR title for several changes from a cheap model (DESIGN "Staging and combined PRs"); undefined when it fails. */
+export async function combinedTitle(changes: string[], config: Config, cwd: string): Promise<string | undefined> {
+  const model = config.titleModel || config.defaultModel;
+  const prompt =
+    "Write one pull request title (conventional style, imperative, at most 72 characters) that covers all of these changes. Reply with the title only.\n\n" +
+    changes.map((c) => `- ${c}`).join("\n");
+  const out = await runPiPrint(config.piCommand, cwd, ["--no-tools", ...(model ? ["--model", model] : []), prompt], 60_000).catch(() => "");
+  const title = out.trim().replace(/^```[a-z]*\n?|```$/g, "").trim().split("\n")[0].replace(/^["'`]|["'`]$/g, "").trim();
+  return title ? title.slice(0, 72) : undefined;
+}

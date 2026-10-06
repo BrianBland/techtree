@@ -64,14 +64,14 @@ test("stage and unstage move a review task to staged and back; other states are 
   assert.equal((await backend.unstage(task.id)).state, "review");
 });
 
-test("a combined PR cherry-picks the staged tasks' commits onto one pushed branch and records the bundle", { timeout: 30_000 }, async (t) => {
+test("a combined PR, titled by the title model, cherry-picks the staged tasks' commits onto one pushed branch and records the bundle", { timeout: 30_000 }, async (t) => {
   const { backend, origin, ghLog, reviewed } = await boot(t);
   const a = await reviewed("first scenario:happy");
   const b = await reviewed("second scenario:happy");
   await backend.stage(a.id);
   await backend.stage(b.id);
 
-  const bundle = await backend.createBundle({ taskIds: [a.id, b.id], title: "Two fixes" });
+  const bundle = await backend.createBundle({ taskIds: [a.id, b.id] }); // untitled: the title model names it
   assert.equal(bundle.pr, 77);
   assert.equal(bundle.branch, `techtree/bundle-${bundle.id}`);
   assert.deepEqual(bundle.taskIds, [a.id, b.id]);
@@ -79,7 +79,7 @@ test("a combined PR cherry-picks the staged tasks' commits onto one pushed branc
 
   const args: string[] = JSON.parse(readFileSync(ghLog, "utf8"));
   assert.deepEqual(args.slice(0, 2), ["pr", "create"]);
-  assert.equal(args[args.indexOf("--title") + 1], "Two fixes");
+  assert.equal(args[args.indexOf("--title") + 1], "feat: fake combined title");
   const body = args[args.indexOf("--body") + 1];
   assert.ok(body.includes(a.title) && body.includes(b.title));
 

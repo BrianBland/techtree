@@ -4,6 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
+import { combinedTitle } from "../backend/refine.ts";
 import type { Db } from "../db.ts";
 import type { Bundle, Config, Task } from "../types.ts";
 
@@ -53,7 +54,11 @@ export async function openBundle(opts: OpenBundleOptions): Promise<Bundle> {
     await cleanUp();
     throw err;
   }
-  const title = opts.title ?? (tasks.length === 1 ? tasks[0].title : `${tasks[0].title} (+${tasks.length - 1} more)`);
+  const title =
+    opts.title ??
+    (tasks.length === 1
+      ? tasks[0].title
+      : ((await combinedTitle(tasks.map((t) => `${t.title} (${t.node || "repo root"})`), config, repoRoot)) ?? `${tasks[0].title} (+${tasks.length - 1} more)`));
   const body = await prBody(opts, worktree);
   const created = await run(worktree, "gh", "pr", "create", "--head", branch, "--title", title, "--body", body, ...(fromRemote ? ["--base", baseBranch] : []));
   const url = /https:\/\/\S+\/pull\/\d+/.exec(created)?.[0];
