@@ -4,7 +4,7 @@ import { dirname, relative, resolve, sep } from "node:path";
 import { setTimeout as sleep } from "node:timers/promises";
 import type { ExtensionAPI, ExtensionContext } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
-import { ensureServer, restartServer, stopServer, type ServerInfo } from "../src/backend/launch.ts";
+import { ensureServer, restartServer, stopServer, updateServer, type ServerInfo } from "../src/backend/launch.ts";
 import { loadConfig } from "../src/config.ts";
 import { cacheDir, repoId, repoRootOf } from "../src/paths.ts";
 import { techtreeReportTool } from "../src/runner/report-tool.ts";
@@ -19,6 +19,7 @@ const SUBCOMMANDS = [
   { value: "url", label: "url", description: "show the URL without opening the browser" },
   { value: "stop", label: "stop", description: "stop this repository's server" },
   { value: "restart", label: "restart", description: "restart the server (same URL) and open it" },
+  { value: "update", label: "update", description: "pull and rebuild techtree, then restart (same URL)" },
 ];
 
 /** Open `url` in the OS default browser, detached, ignoring failures. */
@@ -42,12 +43,12 @@ export default function techtree(pi: ExtensionAPI, openUrl: (url: string) => voi
   let widget: AbortController | undefined;
 
   pi.registerCommand("techtree", {
-    description: "Open the techtree web UI for this repository (starts its server if needed); url | stop | restart",
+    description: "Open the techtree web UI for this repository (starts its server if needed); url | stop | restart | update",
     getArgumentCompletions: (prefix) => SUBCOMMANDS.filter((s) => s.value.startsWith(prefix.trim())),
     handler: async (args, ctx) => {
       const subcommand = args.trim();
       if (subcommand && !SUBCOMMANDS.some((s) => s.value === subcommand)) {
-        throw new Error(`techtree: unknown subcommand ${JSON.stringify(subcommand)}; use url, stop, restart or nothing`);
+        throw new Error(`techtree: unknown subcommand ${JSON.stringify(subcommand)}; use url, stop, restart, update or nothing`);
       }
       const repoRoot = repoRootIn(ctx.cwd);
       const dir = cacheDir(repoId(repoRoot));
@@ -56,7 +57,8 @@ export default function techtree(pi: ExtensionAPI, openUrl: (url: string) => voi
         ctx.ui.notify(`techtree: ${await stopServer(dir)}`, "warning");
         return;
       }
-      const server = subcommand === "restart" ? await restartServer(repoRoot, dir) : await ensureServer(repoRoot, dir);
+      if (subcommand === "update") ctx.ui.notify("techtree: pulling and rebuilding the installed package…", "warning");
+      const server = subcommand === "update" ? await updateServer(repoRoot, dir) : subcommand === "restart" ? await restartServer(repoRoot, dir) : await ensureServer(repoRoot, dir);
       ctx.ui.notify(`techtree: ${server.url}`, "warning");
       if (ctx.mode === "print") process.stdout.write(`${server.url}\n`);
       else if (subcommand !== "url" && loadConfig(repoRoot).openBrowser !== false) openUrl(server.url);

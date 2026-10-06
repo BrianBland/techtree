@@ -17,6 +17,7 @@ pi install /path/to/techtree
 In a pi session inside a git repository:
 
 - `/techtree` starts (or reuses) the repository's techtree server, prints its URL and opens it in your default browser (`openBrowser: false` in the user config turns that off). A status widget shows running tasks and items that need attention. `/techtree url` only prints the URL; `/techtree stop` and `/techtree restart` stop or restart the server. After `npm run build` a running server restarts itself on the new build, keeping its URL, and open pages reload.
+- `/techtree update` pulls the installed techtree checkout's current upstream branch (`git pull --ff-only`), rebuilds it, and restarts this repo's server on the same URL. It requires a clean Git checkout and installed build dependencies (`npm install`); it never updates the repo being scored, switches branches, or discards edits. Restart alone does not pull or rebuild. If the build fails, fix it before restarting.
 - The `techtree_status` and `techtree_findings` tools let the agent read scores and findings.
 
 The server is shared by every pi session in the repository and outlives them, so tasks keep running; it exits after two idle hours.
