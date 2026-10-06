@@ -88,6 +88,8 @@ function fakePrs(prs: PrState[]): PrSource & { merge(number: number): void } {
   return {
     list: () => prs,
     setBabysit: (number) => prs.find((p) => p.number === number)!,
+    autoBabysit: () => false,
+    setAutoBabysit: () => {},
     onEvent(listener) {
       listeners.add(listener);
       return () => listeners.delete(listener);
@@ -149,6 +151,8 @@ function delegate(real: Backend): Backend {
     source: (path, line) => real.source(path, line),
     report: (id, report) => real.report(id, report),
     setBabysit: (n, on) => real.setBabysit(n, on),
+    listPrs: () => real.listPrs(),
+    setAutoBabysit: (on) => real.setAutoBabysit(on),
     rescore: (project) => real.rescore(project),
     scan: (node, project) => real.scan(node, project),
     subscribe: (listener) => real.subscribe(listener),
@@ -538,8 +542,7 @@ test("the project switcher creates a project, switches the view and keeps it in 
 
   const heading = () => app.find((n) => n.localName === "h2")[0]?.textContent;
   choose("all");
-  await app.waitFor(() => heading() === "All projects" && app.text().includes("Top suggestions"), "cross-project overview");
-  assert.equal(urls.at(-1), "?project=all");
+  await app.waitFor(() => heading() === "All projects" && app.text().includes("Top suggestions") && urls.at(-1) === "?project=all", "cross-project overview in the URL");
   assert.ok(app.find((n) => n.getAttribute("class") === "project-tag").some((n) => n.textContent === "Quality"), "items are labelled with their project");
 
   choose("quality");
@@ -576,7 +579,7 @@ test("New task here starts a free-form task in the selected project", UI_TIMEOUT
   assert.match(task.prompt, /^Profile the startup path/);
 });
 
-test("dragging the panel's left edge resizes it within bounds, remembers the width and double-click resets it", UI_TIMEOUT, async (t) => {
+test("dragging the inbox's right edge resizes it within bounds, remembers the width and double-click resets it", UI_TIMEOUT, async (t) => {
   const stored = new Map([["techtree.panelWidth", "500"]]);
   const localStorage = { getItem: (k: string) => stored.get(k) ?? null, setItem: (k: string, v: string) => stored.set(k, v), removeItem: (k: string) => stored.delete(k) };
   Object.assign(globalThis, { localStorage, innerWidth: 1600 });
@@ -585,10 +588,10 @@ test("dragging the panel's left edge resizes it within bounds, remembers the wid
     delete (globalThis as { innerWidth?: unknown }).innerWidth;
   });
   const { app, byClass } = await bootUi(t);
-  const handle = () => byClass("panel-resizer")[0];
+  const handle = () => app.find((n) => n.getAttribute("aria-label") === "Resize inbox")[0];
   const width = () => handle().getAttribute("aria-valuenow");
   const tick = () => new Promise((r) => setTimeout(r, 0));
-  await app.waitFor(() => byClass("panel-resizer").length === 1, "resize handle");
+  await app.waitFor(() => byClass("panel-resizer").length === 2, "resize handles");
   assert.equal(width(), "500", "the saved width is restored");
 
   const drag = async (from: number, to: number) => {
@@ -599,17 +602,29 @@ test("dragging the panel's left edge resizes it within bounds, remembers the wid
     handle().dispatch("pointerup", { pointerId: 1 });
     await tick();
   };
-  await drag(1000, 800);
+  await drag(800, 1000);
   assert.deepEqual([width(), stored.get("techtree.panelWidth")], ["700", "700"]);
-  await drag(1000, 0);
+  await drag(0, 1000);
   assert.equal(width(), "1200", "at most 75% of the window");
-  await drag(500, 1500);
+  await drag(1500, 500);
   assert.equal(width(), "320", "at least 320 px");
 
   handle().dispatch("dblclick");
   await tick();
   assert.equal(width(), "440");
   assert.equal(stored.has("techtree.panelWidth"), false);
+});
+
+test("the inbox is on the left, the tree in the middle and the outbox on the right, listing open PRs by section", UI_TIMEOUT, async (t) => {
+  const { app } = await bootUi(t);
+  await app.waitFor(() => app.text().includes("Outbox") && app.text().includes("Tidy the util helpers"), "outbox with the PR");
+  const main = app.find((n) => n.localName === "main")[0];
+  const classes = main.childNodes.map((n) => n.getAttribute("class") ?? "");
+  const at = (cls: string) => classes.findIndex((c) => c.split(" ").includes(cls));
+  assert.ok(at("panel-column") < at("tree") && at("tree") < at("outbox"), classes.join(" | "));
+  const outbox = main.childNodes[at("outbox")];
+  assert.ok(outbox.textContent.includes("Waiting") && outbox.textContent.includes("waiting for review"), outbox.textContent);
+  assert.ok(!main.childNodes[at("panel-column")].textContent.includes("Tidy the util helpers"), "PRs left the inbox overview");
 });
 
 test("switching projects with a node open drops the old project's actions; All projects shows the overview", UI_TIMEOUT, async (t) => {

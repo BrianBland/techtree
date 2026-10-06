@@ -293,6 +293,13 @@ export interface ApiOverview {
   scorerErrors?: string[]; // failures of the project's scorer in its latest run
 }
 
+/** `GET /api/prs`: the outbox (DESIGN "Outbox"). */
+export interface ApiPrs {
+  prs: PrState[]; // every open PR of every project, each with its `project`
+  tasks: Task[]; // the PRs' linked tasks (`PrState.taskId`)
+  autoBabysit: boolean;
+}
+
 export interface StartTaskRequest {
   node: NodeId;
   findingIds: string[];

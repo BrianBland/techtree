@@ -207,6 +207,12 @@ function apiRoutes(backend: Backend): Route[] {
     post(/^\/api\/tasks\/([^/]+)\/report$/, async (req, _url, [id]) =>
       backend.report(id, workerReport(await readJson(req))),
     ),
+    get(/^\/api\/prs$/, () => backend.listPrs()),
+    post(/^\/api\/prs\/auto-babysit$/, async (req) => {
+      const { on } = await readJson(req);
+      if (typeof on !== "boolean") throw new HttpError(400, "on must be a boolean");
+      return backend.setAutoBabysit(on);
+    }),
     post(/^\/api\/prs\/(\d+)\/babysit$/, async (req, _url, [number]) => {
       const { on } = await readJson(req);
       if (typeof on !== "boolean") throw new HttpError(400, "on must be a boolean");

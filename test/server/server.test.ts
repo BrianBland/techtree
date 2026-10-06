@@ -45,6 +45,8 @@ const backend = {
   openTerminal: record("openTerminal", undefined),
   report: record("report"),
   setBabysit: record("setBabysit"),
+  listPrs: record("listPrs"),
+  setAutoBabysit: record("setAutoBabysit"),
   rescore: record("rescore", undefined),
   scan: record("scan", undefined),
   subscribe(listener: (e: ServerEvent) => void) {
@@ -196,6 +198,8 @@ test("routes delegate to the matching backend method", async () => {
     ["POST", "/api/tasks/t1/open-terminal", { mode: "agent" }, ["openTerminal", "t1", "agent"], { ok: true }],
     ["POST", "/api/tasks/t1/report", { done: 2 }, ["report", "t1", { done: 2 }], { ok: "report" }],
     ["POST", "/api/prs/42/babysit", { on: true }, ["setBabysit", 42, true], { ok: "setBabysit" }],
+    ["GET", "/api/prs", undefined, ["listPrs"], { ok: "listPrs" }],
+    ["POST", "/api/prs/auto-babysit", { on: true }, ["setAutoBabysit", true], { ok: "setAutoBabysit" }],
     ["POST", "/api/score", undefined, ["rescore", "quality"], { ok: true }],
     ["POST", "/api/scan?project=perf", { node: "crates" }, ["scan", "crates", "perf"], { ok: true }],
   ];

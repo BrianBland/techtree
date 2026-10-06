@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { openDb, suppressSqliteWarning } from "../../src/db.ts";
+import { dbCache, openDb, suppressSqliteWarning } from "../../src/db.ts";
 import { Babysitter, type BabysitRunner } from "../../src/prs/babysit.ts";
 import { PrPoller } from "../../src/prs/poller.ts";
 import type { StartTask } from "../../src/runner/runner.ts";
@@ -66,8 +66,9 @@ async function setup(t: TestContext, initial: Record<string, unknown> = {}): Pro
   const cache = mkdtempSync(join(tmpdir(), "techtree-babysit-"));
   t.after(() => rmSync(cache, { recursive: true, force: true }));
   const runner = new FakeRunner();
+  const db = openDb(cache);
   const poller: PrPoller = new PrPoller({
-    db: openDb(cache),
+    db,
     repoRoot: cache,
     gh: gh.gh,
     tree: () => makeTree("src"),
@@ -75,7 +76,7 @@ async function setup(t: TestContext, initial: Record<string, unknown> = {}): Pro
     onUpdate: (prev, next) => babysitter.onUpdate(prev, next),
     onRemove: (removed) => babysitter.onRemove(removed),
   });
-  const babysitter = new Babysitter({ poller, runner });
+  const babysitter = new Babysitter({ poller, runner, cache: dbCache(db) });
   const pr = async (over: Record<string, unknown> = {}) => {
     gh.setList([ghPr(1, { ...initial, ...over })]);
     await poller.poll();
@@ -260,4 +261,27 @@ test("a closed PR without babysit leaves its task alone", async (t) => {
   h.gh.setList([]);
   await h.poller.poll();
   assert.deepEqual(h.runner.cancelled, []);
+});
+
+test("auto-babysit switches on the user's open PRs and their newly seen ones; PRs switched off and others' PRs stay off", async (t) => {
+  const h = await setup(t);
+  const other = { author: { login: "someone" } };
+  const poll = async (...numbers: number[]) => {
+    h.gh.setList(numbers.map((n) => ghPr(n, n % 2 === 0 ? other : {})));
+    await h.poller.poll();
+  };
+  const babysat = () => h.poller.list().filter((p) => p.babysit).map((p) => p.number);
+  await poll(1, 2);
+
+  await h.babysitter.setAutoBabysit(true);
+  assert.equal(h.babysitter.autoBabysit, true);
+  assert.deepEqual(babysat(), [1]);
+
+  await h.babysitter.setBabysit(1, false);
+  await poll(1, 2, 3, 4);
+  assert.deepEqual(babysat(), [3], "only the user's newly seen PR; PR 1 stays off");
+
+  await h.babysitter.setAutoBabysit(false);
+  await poll(1, 2, 3, 4, 5);
+  assert.deepEqual(babysat(), [3], "switching off changes no PR and stops babysitting new ones");
 });

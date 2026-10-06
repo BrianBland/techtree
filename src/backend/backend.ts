@@ -38,6 +38,7 @@ import type {
   ApiModels,
   ApiNode,
   ApiOverview,
+  ApiPrs,
   ApiSource,
   ApiState,
   Bundle,
@@ -65,6 +66,8 @@ import type {
 export interface PrSource {
   list(): PrState[];
   setBabysit(number: number, on: boolean): PrState | Promise<PrState>;
+  autoBabysit(): boolean;
+  setAutoBabysit(on: boolean): void | Promise<void>;
   /** Register a listener for `pr` / `pr_removed` events; returns the unsubscribe function. */
   onEvent(listener: (event: ServerEvent) => void): () => void;
 }
@@ -73,6 +76,10 @@ export const noPrs: PrSource = {
   list: () => [],
   setBabysit: (number) => {
     throw new HttpError(404, `no PR #${number}`);
+  },
+  autoBabysit: () => false,
+  setAutoBabysit: () => {
+    throw new HttpError(404, "PRs are not polled");
   },
   onEvent: () => () => {},
 };
@@ -222,8 +229,14 @@ export class RepoBackend implements Backend {
       onRemove: (pr) => babysitter.onRemove(pr),
       onPolled: () => void this.reconcileBundles(),
     });
-    const babysitter = new Babysitter({ poller, runner });
-    this.opts.prs = { list: () => poller.list(), setBabysit: (n, on) => babysitter.setBabysit(n, on), onEvent: () => () => {} };
+    const babysitter = new Babysitter({ poller, runner, cache: this.cache });
+    this.opts.prs = {
+      list: () => poller.list(),
+      setBabysit: (n, on) => babysitter.setBabysit(n, on),
+      autoBabysit: () => babysitter.autoBabysit,
+      setAutoBabysit: (on) => babysitter.setAutoBabysit(on),
+      onEvent: () => () => {},
+    };
     this.stopPrPolling = () => poller.stop();
     poller.start();
   }
@@ -573,6 +586,17 @@ export class RepoBackend implements Backend {
 
   async setBabysit(prNumber: number, on: boolean): Promise<PrState> {
     return this.opts.prs.setBabysit(prNumber, on);
+  }
+
+  async listPrs(): Promise<ApiPrs> {
+    const prs = this.prs();
+    const linked = new Set(prs.map((pr) => pr.taskId));
+    return { prs, tasks: this.runner().list().filter((t) => linked.has(t.id)), autoBabysit: this.opts.prs.autoBabysit() };
+  }
+
+  async setAutoBabysit(on: boolean): Promise<ApiPrs> {
+    await this.opts.prs.setAutoBabysit(on);
+    return this.listPrs();
   }
 
   /** Start a scoring run (or queue one behind the run in progress); completion is a `scores` event. */

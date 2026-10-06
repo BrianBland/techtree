@@ -4,7 +4,7 @@ import type { ApiOverview, ApiState, Bundle, NodeId, Project, StartTaskRequest, 
 import { get, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { projectColor } from "./Projects.tsx";
-import { PrRow, Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
+import { Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
 
 export interface OverviewProps {
   state: ApiState;
@@ -62,7 +62,7 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
         </div>
         {!all && scored && <div class="score-big">{fmt(state.scores[""]?.quality)}</div>}
       </header>
-      {!overview.attentionTasks.length && !overview.flaggedPrs.length && <p class="muted">Nothing needs your attention.</p>}
+      {!overview.attentionTasks.length && <p class="muted">Nothing needs your attention.</p>}
       <Section title="Needs you" items={overview.attentionTasks}>
         {(task) => (
           <li key={task.id} class="row clickable" onClick={() => onSelect(task.node, task.project)}>
@@ -98,9 +98,6 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
       {stagedByProject(overview.stagedTasks).map(([project, tasks]) => (
         <StagedSection key={project} title={all ? `Staged · ${projectName(project)}` : "Staged"} project={project} tasks={tasks} nodeName={nodeName} onError={onError} />
       ))}
-      <Section title="Pull requests needing attention" items={overview.flaggedPrs}>
-        {(pr) => <PrRow key={pr.number} pr={pr} tag={tag(pr.project)} onError={onError} />}
-      </Section>
       {overview.scorerErrors?.map((e) => (
         <p key={e} class="error small">
           Scorer failed: {linkify(e)}

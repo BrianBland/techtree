@@ -290,3 +290,13 @@ input[type="checkbox"]:disabled { opacity: 0.35; cursor: not-allowed; }
 .proposal h4 { margin: 10px 0 4px; }
 .proposal .add { color: var(--good); }
 .diff.proposal-text { white-space: pre-wrap; overflow-wrap: anywhere; max-height: 420px; }
+.panel-column > .panel { border-left: none; border-right: 3px solid var(--ink); box-shadow: inset -2px 0 0 var(--line); }
+.panel.outbox { width: var(--outbox-width, 380px); }
+.outbox header label { white-space: nowrap; }
+.needs-count { margin-left: 8px; padding: 0 6px; font-size: 12px; color: var(--ink); background: var(--gold); animation: pulse-glow 1.4s ease-in-out infinite; }
+.outbox-row.needs_you { border-color: var(--gold); box-shadow: inset 3px 0 0 var(--gold); }
+.outbox-row.needs_you .status { color: var(--gold); font-weight: 700; }
+.outbox-row .status { margin-top: 2px; overflow-wrap: anywhere; }
+.outbox-row .project-tag { color: var(--ink); }
+.outbox-controls { display: flex; flex-direction: column; align-items: flex-end; gap: 4px; flex: none; }
+.ci.pending { color: var(--gold); }

@@ -1,5 +1,5 @@
 import type { StartTask } from "../runner/runner.ts";
-import type { PrState, Task, TaskState } from "../types.ts";
+import type { Cache, PrState, Task, TaskState } from "../types.ts";
 import type { PrPoller } from "./poller.ts";
 
 /** The part of the task runner babysit drives; `TaskRunner` implements it. */
@@ -13,10 +13,13 @@ export interface BabysitRunner {
 export interface BabysitterOptions {
   poller: PrPoller;
   runner: BabysitRunner;
+  /** Holds the auto-babysit setting. */
+  cache: Cache;
 }
 
 const MAX_FIX_ATTEMPTS = 3;
 const LIVE_STATES: TaskState[] = ["queued", "running", "needs_input"];
+const AUTO_BABYSIT = ["settings", "autoBabysit"] as const;
 
 /**
  * Reacts to PR events on babysat PRs by resuming or starting a `techtree-babysit` agent.
@@ -36,8 +39,26 @@ export class Babysitter {
   async setBabysit(number: number, on: boolean): Promise<PrState> {
     const { poller } = this.opts;
     if (!on) return poller.update(number, { babysit: false });
-    const pr = poller.update(number, { babysit: true }, 0);
     await poller.refreshUser();
+    return this.switchOn(number);
+  }
+
+  /** Whether the current user's PRs start babysat (DESIGN "PRs", Auto-babysit). */
+  get autoBabysit(): boolean {
+    return this.opts.cache.get(...AUTO_BABYSIT) === true;
+  }
+
+  /** Switching on babysits every open PR of the current gh user; switching off changes no PR. */
+  async setAutoBabysit(on: boolean): Promise<void> {
+    this.opts.cache.set(...AUTO_BABYSIT, on);
+    if (!on) return;
+    const { poller } = this.opts;
+    const user = await poller.refreshUser();
+    for (const pr of poller.list()) if (user && pr.author === user && !pr.babysit) this.switchOn(pr.number);
+  }
+
+  private switchOn(number: number): PrState {
+    const pr = this.opts.poller.update(number, { babysit: true }, 0);
     this.onUpdate(undefined, pr);
     return pr;
   }
@@ -48,8 +69,10 @@ export class Babysitter {
   }
 
   onUpdate(prev: PrState | undefined, next: PrState): void {
-    if (!next.babysit) return;
     const { poller, runner } = this.opts;
+    const firstSeenOwn = !prev && !next.babysit && poller.user !== undefined && next.author === poller.user;
+    if (firstSeenOwn && this.autoBabysit) next = poller.update(next.number, { babysit: true }, 0);
+    if (!next.babysit) return;
     const report = (patch: Partial<PrState>, fixAttempts?: number) => poller.update(next.number, patch, fixAttempts);
     if (next.ci === "pass" && next.review === "APPROVED" && next.mergeable === "MERGEABLE") {
       this.stopFix(next);

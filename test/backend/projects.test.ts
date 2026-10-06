@@ -1,12 +1,13 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { mkdirSync } from "node:fs";
-import { RepoBackend } from "../../src/backend/backend.ts";
+import { RepoBackend, type PrSource } from "../../src/backend/backend.ts";
 import { mergeConfig } from "../../src/config.ts";
 import { createProject } from "../../src/core/projects.ts";
 import { dbCache, openDb, suppressSqliteWarning } from "../../src/db.ts";
 import type { HttpError } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
+import type { PrState } from "../../src/types.ts";
 import { FAKE_PI, TODO_FILE, fixture, until } from "./helpers.ts";
 
 suppressSqliteWarning();
@@ -141,4 +142,38 @@ test("projects: a task whose PR was merged or closed no longer blocks deleting i
   await backend.deleteProject(perf.id);
   assert.deepEqual((await backend.listProjects()).map((p) => p.id), ["quality"]);
   assert.deepEqual((await backend.getState()).tasks, []);
+});
+
+test("projects: GET /api/prs lists every project's open PRs with their linked tasks and the auto-babysit switch", { timeout: 30_000 }, async (t) => {
+  const { tmp, repo, cache } = fixture(t);
+  mkdirSync(cache, { recursive: true });
+  const db = openDb(cache);
+  const perf = createProject(db, "Perf");
+  const now = new Date().toISOString();
+  const task = { id: "t1", project: perf.id, node: "", title: "t", prompt: "", findingIds: [], state: "pr_open", manualReview: false, pr: 7,
+    plannedFrom: 0, plannedTo: 0, checklist: [], phase: "pr", createdAt: now, updatedAt: now };
+  db.prepare("INSERT INTO tasks (id, node, state, data, updated_at, project) VALUES ('t1', '', 'pr_open', ?, ?, ?)").run(JSON.stringify(task), now, perf.id);
+  const pr = (number: number, taskId?: string): PrState => ({
+    number, url: `https://example.com/pr/${number}`, title: `PR ${number}`, author: "me", node: "", files: [], ci: "pass", review: "",
+    updatedAt: now, babysit: false, stale: false, stuck: false, ...(taskId && { taskId }),
+  });
+  let auto = false;
+  const prs: PrSource = {
+    list: () => [pr(7, "t1"), pr(8)],
+    setBabysit: () => pr(7),
+    autoBabysit: () => auto,
+    setAutoBabysit: (on) => void (auto = on),
+    onEvent: () => () => {},
+  };
+  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand: [process.execPath, FAKE_PI] });
+  const backend = new RepoBackend({ db, repoRoot: repo, cacheDir: cache, config, prs, log: () => {} });
+  backend.attach({ url: "http://127.0.0.1:9", token: "tok" });
+  t.after(() => backend.close());
+  await backend.idle();
+
+  const listed = await backend.listPrs();
+  assert.deepEqual(listed.prs.map((p) => [p.number, p.project]), [[7, perf.id], [8, "quality"]]);
+  assert.deepEqual(listed.tasks.map((x) => x.id), ["t1"]);
+  assert.equal(listed.autoBabysit, false);
+  assert.equal((await backend.setAutoBabysit(true)).autoBabysit, true);
 });

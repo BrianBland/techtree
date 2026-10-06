@@ -9,7 +9,8 @@ import { TreeView } from "./TreeView.tsx";
 import { GroupContext, NodePanel, StartDialog } from "./Panel.tsx";
 import { combineSuggestions, toggleSuggestion } from "./group.ts";
 import { Overview } from "./Overview.tsx";
-import { PanelResizer, usePanelWidth } from "./PanelResizer.tsx";
+import { INBOX_WIDTH, OUTBOX_WIDTH, PanelResizer, usePanelWidth } from "./PanelResizer.tsx";
+import { Outbox } from "./Outbox.tsx";
 import { ProjectSwitcher } from "./Projects.tsx";
 
 function App() {
@@ -120,7 +121,9 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
   const [selected, setSelected] = useState<NodeId | null>(focus || null);
   const [overrides, setOverrides] = useState<Overrides>(new Map());
   const [fitRequest, setFitRequest] = useState(0);
-  const [panelWidth, setPanelWidth] = usePanelWidth();
+  const [panelWidth, setPanelWidth] = usePanelWidth(INBOX_WIDTH);
+  const [outboxWidth, setOutboxWidth] = usePanelWidth(OUTBOX_WIDTH);
+  const refit = () => setFitRequest((n) => n + 1);
   const [starting, setStarting] = useState<{ suggestion: Suggestion; findings: Finding[]; project: string } | null>(null);
   const [grouped, setGrouped] = useState<Suggestion[]>([]);
   const { tree, scores, metricDefs } = state;
@@ -238,24 +241,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
           {error}
         </div>
       )}
-      <main style={{ "--panel-width": `${panelWidth}px` }}>
-        <TreeView
-          tree={tree}
-          layout={layout}
-          look={look}
-          deltas={deltas}
-          edgeWidth={edgeWidth}
-          compositeColor={compositeColor}
-          tasks={state.tasks}
-          prs={state.prs}
-          attention={attention}
-          selected={selected}
-          fitRequest={fitRequest}
-          onSelect={select}
-          onToggle={onToggle}
-          onStub={onStub}
-        />
-        <PanelResizer width={panelWidth} onResize={setPanelWidth} onResizeEnd={() => setFitRequest((n) => n + 1)} />
+      <main style={{ "--panel-width": `${panelWidth}px`, "--outbox-width": `${outboxWidth}px` }}>
         <GroupContext.Provider value={groupValue(grouped, setGrouped, state.project.id)}>
         <div class="panel-column">
         {selected === null ? (
@@ -300,6 +286,25 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
         )}
         </div>
         </GroupContext.Provider>
+        <PanelResizer edge="right" label="Resize inbox" width={panelWidth} onResize={setPanelWidth} onResizeEnd={refit} />
+        <TreeView
+          tree={tree}
+          layout={layout}
+          look={look}
+          deltas={deltas}
+          edgeWidth={edgeWidth}
+          compositeColor={compositeColor}
+          tasks={state.tasks}
+          prs={state.prs}
+          attention={attention}
+          selected={selected}
+          fitRequest={fitRequest}
+          onSelect={select}
+          onToggle={onToggle}
+          onStub={onStub}
+        />
+        <PanelResizer edge="left" label="Resize outbox" width={outboxWidth} onResize={setOutboxWidth} onResizeEnd={refit} />
+        <Outbox projects={projects} version={version} onSelect={select} onError={setError} />
       </main>
       {starting && <StartDialog {...starting} onClose={() => setStarting(null)} onError={setError} />}
     </div>

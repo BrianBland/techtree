@@ -2,6 +2,7 @@ import type {
   ApiModels,
   ApiNode,
   ApiOverview,
+  ApiPrs,
   ApiSource,
   ApiState,
   Bundle,
@@ -86,6 +87,9 @@ export interface Backend {
   discard(taskId: string): Promise<void>;
   report(taskId: string, report: WorkerReport): Promise<Task>;
   setBabysit(prNumber: number, on: boolean): Promise<PrState>;
+  /** The outbox: every open PR, their linked tasks and the auto-babysit switch (DESIGN "Outbox"). */
+  listPrs(): Promise<ApiPrs>;
+  setAutoBabysit(on: boolean): Promise<ApiPrs>;
   /** `review` → `staged`, and back (DESIGN "Staging and combined PRs"). */
   stage(taskId: string): Promise<Task>;
   unstage(taskId: string): Promise<Task>;
