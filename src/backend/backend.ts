@@ -361,9 +361,13 @@ export class RepoBackend implements Backend {
   }
 
   async getState(projectId?: string): Promise<ApiState> {
-    const { project, result, config } = await this.view(projectId);
+    const view = await this.view(projectId);
+    const { project, result, config } = view;
     const findingCounts = dict<number>();
     for (const f of result.findings) findingCounts[f.node] = (findingCounts[f.node] ?? 0) + 1;
+    const suggestionCounts = dict<number>();
+    // Conflict changes ordering, not counts; avoid polling worktree diffs just to count suggestions.
+    for (const s of this.suggestions(view, [])) suggestionCounts[s.node] = (suggestionCounts[s.node] ?? 0) + 1;
     const { repoRoot } = this.opts;
     return {
       repo: { root: repoRoot, id: repoId(repoRoot), name: basename(repoRoot) },
@@ -376,6 +380,7 @@ export class RepoBackend implements Backend {
       tasks: this.tasks(project.id),
       prs: this.prs(project.id),
       findingCounts,
+      suggestionCounts,
     };
   }
 
@@ -785,9 +790,9 @@ export class RepoBackend implements Backend {
   }
 
   /** Suggestions of a scored project, recomputed when its result or the busy paths change. */
-  private suggestions({ project, result, config }: View): Suggestion[] {
+  private suggestions({ project, result, config }: View, busyPaths?: string[]): Suggestion[] {
     if (!isScored(project)) return [];
-    const busy = this.busyPaths();
+    const busy = busyPaths ?? this.busyPaths();
     const claimed = new Set(this.tasks(project.id).flatMap((t) => (CLAIMING_STATES.includes(t.state) ? t.findingIds : [])));
     const busyKey = [...busy, "", ...[...claimed].sort()].join("\0");
     const cached = this.derived.get(project.id);

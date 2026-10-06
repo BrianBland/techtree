@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useRef } from "preact/hooks";
 import type { NodeId, PrState, Task, Tree } from "../types.ts";
-import { HANDLE_WIDTH, LABEL_HEIGHT, labelName, labelWidth, ROW_HEIGHT, stubId, type Layout, type PlacedNode } from "./layout.ts";
-import { researchBar, type TileLook } from "./visual.ts";
+import { HANDLE_WIDTH, LABEL_HEIGHT, labelName, labelWidth, ROW_HEIGHT, stubId, withAncestors, type Layout, type PlacedNode } from "./layout.ts";
+import { ACTIONED_STATES, branchEffects, EFFECT_PRIORITY, nodeEffects, researchBar, type NodeEffect, type TileLook } from "./visual.ts";
 import { fitView, zoomAt, type View } from "./view.ts";
 
 export interface TreeViewProps {
@@ -13,6 +13,7 @@ export interface TreeViewProps {
   compositeColor: (score: number) => string;
   tasks: Task[];
   prs: PrState[];
+  suggestionCounts?: Record<NodeId, number>;
   /** Nodes that need you: they glow and pulse. */
   attention: ReadonlySet<NodeId>;
   /** Selected-score changes from the latest rescore; a new map replays the flash. */
@@ -45,7 +46,7 @@ const reducedMotion = globalThis.matchMedia?.("(prefers-reduced-motion: reduce)"
 let flashGeneration = 0;
 
 export function TreeView(props: TreeViewProps) {
-  const { tree, layout, look, edgeWidth, compositeColor, tasks, prs, attention, deltas, selected, fitRequest, onSelect, onToggle, onStub } = props;
+  const { tree, layout, look, edgeWidth, compositeColor, tasks, prs, suggestionCounts = {}, attention, deltas, selected, fitRequest, onSelect, onToggle, onStub } = props;
   const svg = useRef<SVGSVGElement>(null);
   const world = useRef<SVGGElement>(null);
   const view = useRef<View>({ x: 0, y: 0, k: 1 });
@@ -113,20 +114,27 @@ export function TreeView(props: TreeViewProps) {
     if (!suppressClick.current) handler();
   };
 
+  const effects = useMemo(() => nodeEffects(tasks, prs), [tasks, prs]);
+  const branches = useMemo(() => branchEffects(tree, effects), [tree, effects]);
+  const selectedBranches = useMemo(() => withAncestors(tree, new Set(selected === null ? [] : [selected])), [tree, selected]);
+  const changedBranches = useMemo(() => withAncestors(tree, new Set(deltas.keys())), [tree, deltas]);
+  const flashKey = useMemo(() => ++flashGeneration, [deltas]);
   const edges = useMemo(
     () =>
       layout.edges.map(([p, c]) => {
         const bus = Math.round(p.y + ROW_HEIGHT - BUS_ABOVE_CHILD);
         const d = `M${Math.round(p.x)} ${Math.round(p.y + p.r + LABEL_HEIGHT)}V${bus}H${Math.round(c.x)}V${Math.round(c.y - c.r)}`;
-        return <path key={c.id} d={d} style={{ d: `path("${d}")` }} stroke-width={c.stubOf === undefined ? edgeWidth(c.id) : STUB_EDGE_WIDTH} />;
+        const width = c.stubOf === undefined ? edgeWidth(c.id) : STUB_EDGE_WIDTH;
+        const path = (cls: string, key: string) => <path key={key} class={cls} d={d} style={{ d: `path("${d}")` }} stroke-width={width} />;
+        return { base: path("", c.id), priority: EFFECT_PRIORITY.indexOf(branches.get(c.id)!), effect: branches.has(c.id) && path(`work-effect ${branches.get(c.id)}`, c.id), selected: selectedBranches.has(c.id) && path("selected-path", c.id), flash: changedBranches.has(c.id) && path("edge-flash", `${c.id}-${flashKey}`) };
       }),
-    [layout, edgeWidth],
+    [layout, edgeWidth, branches, selectedBranches, changedBranches, flashKey],
   );
 
   const prsByNode = useMemo(() => groupBy(prs, (p) => p.node), [prs]);
   const runningByNode = useMemo(() => groupBy(tasks.filter((t) => t.state === "running"), (t) => t.node), [tasks]);
   const askingNodes = useMemo(() => new Set(tasks.filter((t) => t.state === "needs_input").map((t) => t.node)), [tasks]);
-  const flashKey = useMemo(() => ++flashGeneration, [deltas]);
+  const actionedByNode = useMemo(() => groupBy(tasks.filter((t) => ACTIONED_STATES.includes(t.state)), (t) => t.node), [tasks]);
 
   return (
     <svg ref={svg} class="tree" onPointerDown={onPointerDown} onPointerMove={onPointerMove} onPointerUp={onPointerUp}>
@@ -139,7 +147,12 @@ export function TreeView(props: TreeViewProps) {
         </pattern>
       </defs>
       <g ref={world}>
-        <g class="edges">{edges}</g>
+        <g class="edges">
+          {edges.map((e) => e.base)}
+          {[...edges].sort((a, b) => a.priority - b.priority).map((e) => e.effect)}
+          {edges.map((e) => e.selected)}
+          {edges.map((e) => e.flash)}
+        </g>
         {layout.nodes.map((n) => {
           if (n.stubOf !== undefined) return <Stub key={n.id} node={n} onSelect={click(() => onStub(n.stubOf!))} />;
           const node = tree.nodes[n.id];
@@ -157,6 +170,9 @@ export function TreeView(props: TreeViewProps) {
               running={runningByNode.get(n.id)?.[0]}
               asking={askingNodes.has(n.id)}
               attention={attention.has(n.id)}
+              effect={effects.get(n.id)}
+              actioned={actionedByNode.get(n.id)?.length ?? 0}
+              suggested={Object.hasOwn(suggestionCounts, n.id) ? suggestionCounts[n.id] : 0}
               delta={deltas.get(n.id)}
               flashKey={flashKey}
               compositeColor={compositeColor}
@@ -183,6 +199,9 @@ interface TileProps {
   running?: Task;
   asking: boolean;
   attention: boolean;
+  effect?: NodeEffect;
+  actioned: number;
+  suggested: number;
   delta?: number;
   flashKey: number;
   compositeColor: (score: number) => string;
@@ -191,14 +210,15 @@ interface TileProps {
 }
 
 function Tile(props: TileProps) {
-  const { node, name, crate, expandable, hiding, look, selected, prs, running, asking, attention, delta, flashKey, compositeColor, onSelect, onToggle } = props;
+  const { node, name, crate, expandable, hiding, look, selected, prs, running, asking, attention, effect, actioned, suggested, delta, flashKey, compositeColor, onSelect, onToggle } = props;
   const side = node.r * 2;
   const labelLeft = node.r - labelWidth(name, expandable, node.hiddenChildren) / 2;
-  const classes = ["node", selected && "selected", attention && "attention", crate && "crate"].filter(Boolean).join(" ");
+  const classes = ["node", selected && "selected", attention && "attention", effect, crate && "crate"].filter(Boolean).join(" ");
   return (
     <g class={classes} style={{ transform: `translate(${Math.round(node.x - node.r)}px,${Math.round(node.y - node.r)}px)` }} onClick={onSelect}>
-      <title>{node.id || name}</title>
+      <title>{`${node.id || name}${effect ? ` · ${effect === "review" ? "ready for review" : effect === "running" ? "in progress" : effect}` : ""}`}</title>
       {attention && <rect class="glow" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
+      {!attention && (effect === "queued" || effect === "running") && <rect class="status-ring" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       {selected && <rect class="ring" x={-RING_GAP} y={-RING_GAP} width={side + 2 * RING_GAP} height={side + 2 * RING_GAP} />}
       <g transform={`scale(${side / SPRITE})`}>
         <rect class="frame" width={SPRITE} height={SPRITE} />
@@ -216,9 +236,10 @@ function Tile(props: TileProps) {
           look.xp !== null && <rect class="xp" x={BAR.x} y={BAR.y} width={(BAR.width * look.xp) / 100} height={BAR.height} />
         )}
         {delta !== undefined && <rect key={flashKey} class="flash" width={SPRITE} height={SPRITE} />}
-        {asking && <Badge kind="ask" x={-BADGE_OUTSET} y={0} text="!" />}
+        {asking && <Badge kind="ask" x={-BADGE_OUTSET} y={0} text="?" title="Agent has a question" />}
         {prs && <Badge kind={prs.some((p) => p.ci === "fail") ? "pr failing" : "pr"} x={SPRITE - 2} y={0} text={prs.length} />}
-        {look.findings > 0 && <Badge kind="findings" x={SPRITE - 2} y={SPRITE - BADGE} text={look.findings > 9 ? "9+" : look.findings} />}
+        {actioned > 0 && <Badge kind="actioned" x={-BADGE_OUTSET} y={SPRITE - BADGE} text={actioned > 9 ? "9+" : actioned} title={`${actioned} actioned tasks`} />}
+        {suggested > 0 && <Badge kind="suggested" x={SPRITE - 2} y={SPRITE - BADGE} text={suggested > 9 ? "9+" : suggested} title={`${suggested} suggested tasks`} />}
       </g>
       {expandable && (
         <g class="handle" onClick={onToggle}>
@@ -253,9 +274,10 @@ function Stub({ node, onSelect }: { node: PlacedNode; onSelect(e: MouseEvent): v
   );
 }
 
-function Badge({ kind, x, y, text }: { kind: string; x: number; y: number; text: string | number }) {
+function Badge({ kind, x, y, text, title }: { kind: string; x: number; y: number; text: string | number; title?: string }) {
   return (
     <g class={`badge ${kind}`}>
+      {title && <title>{title}</title>}
       <rect x={x} y={y} width={BADGE} height={BADGE} />
       <text x={x + BADGE / 2} y={y + 5.4}>{text}</text>
     </g>

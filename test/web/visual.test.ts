@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { COMPOSITE, NO_SCORE, attentionNodes, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "../../src/web/visual.ts";
+import { COMPOSITE, NO_SCORE, attentionNodes, branchEffects, nodeEffects, activeNodes, scoredTree, ramp, researchBar, scoreDeltas, sparkline, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "../../src/web/visual.ts";
 import { fitView, zoomAt } from "../../src/web/view.ts";
 import type { MetricDef, NodeScore, PrState, Task, Tree } from "../../src/types.ts";
 
@@ -130,19 +130,19 @@ test("tile looks colour pips by absolute percentile and leave missing metrics em
     metrics: Object.fromEntries(Object.entries(metrics).map(([k, pct]) => [k, { raw: 0, value: 0, pct }])),
   });
   const scores = { a: score(90, { x: 0, y: 100 }), b: score(91, { x: 100 }), c: score(92, { x: null }) };
-  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x", "y"], findingCounts: { a: 3 } });
+  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x", "y"] });
   assert.deepEqual(look("a").pips, [ramp([0, 100])(0), ramp([0, 100])(100)]);
   assert.deepEqual(look("b").pips, [ramp([0, 100])(100), null]);
   assert.deepEqual(look("c").pips, [null, null]);
   assert.equal(look("a").fill, ramp([90, 92])(90));
-  assert.deepEqual([look("a").findings, look("b").findings, look("a").xp], [3, 0, 90]);
+  assert.equal(look("a").xp, 90);
 });
 
 test("tile looks tolerate unscored nodes and nodes missing from the scores", () => {
   const scores: Record<string, NodeScore> = { a: { node: "a", quality: null, metrics: {} }, b: { node: "b", quality: 70, metrics: {} } };
-  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x"], findingCounts: {} });
+  const look = tileLooks({ scores, scoreKey: COMPOSITE, statKeys: ["x"] });
   for (const id of ["a", "missing"]) {
-    assert.deepEqual(look(id), { fill: NO_SCORE, pips: [null], xp: null, findings: 0 });
+    assert.deepEqual(look(id), { fill: NO_SCORE, pips: [null], xp: null });
   }
 });
 
@@ -173,4 +173,32 @@ test("subtree values ignore inherited properties of JSON-decoded state, e.g. a d
   const values = subtreeValues(state);
   assert.equal(values.get("constructor"), 1_000_000);
   assert.equal(values.get(""), 1_000_000);
+});
+
+test("work effects have deterministic precedence and propagate only onto ancestor branches", () => {
+  const node = (id: string, parent: string | null, children: string[]) => ({ id, name: id || "repo", kind: "dir", parent, children, files: [] });
+  const tree: Tree = { repoRoot: "/r", nodes: { "": node("", null, ["a", "b"]), a: node("a", "", ["a/deep"]), "a/deep": node("a/deep", "a", []), b: node("b", "", []) } };
+  const tasks = [task({ node: "a", state: "queued" }), task({ node: "a/deep", state: "review" }), task({ node: "a/deep", state: "running" }), task({ node: "b", state: "needs_input" })];
+  const effects = nodeEffects(tasks, []);
+  assert.deepEqual([...effects], [["a", "queued"], ["a/deep", "review"], ["b", "question"]]);
+  const branches = branchEffects(tree, effects);
+  assert.equal(branches.get("a"), "review");
+  assert.equal(branches.get("a/deep"), "review");
+  assert.equal(branches.get("b"), "question");
+  assert.equal(effects.get("a"), "queued", "ancestor tiles do not inherit effects");
+  assert.equal(effects.has(""), false);
+  assert.equal(nodeEffects([...tasks].reverse(), []).get("a/deep"), "review");
+  assert.equal(nodeEffects(tasks, [{ node: "a/deep", ci: "fail" } as PrState]).get("a/deep"), "attention");
+  assert.equal(nodeEffects([task({ node: "a/deep", state: "needs_input" })], [{ node: "a/deep", ci: "fail" } as PrState]).get("a/deep"), "question");
+  assert.deepEqual([...activeNodes([...tasks, task({ node: "old", state: "failed" }), task({ node: "staged", state: "staged" })], [{ node: "pr" } as PrState])].sort(), ["a", "a/deep", "b", "pr", "staged"]);
+});
+
+test("hide unscored keeps root, focus and scored-node connectors, not empty gray branches", () => {
+  const node = (id: string, parent: string | null, children: string[]) => ({ id, name: id || "repo", kind: "dir", parent, children, files: [] });
+  const tree: Tree = { repoRoot: "/r", nodes: { "": node("", null, ["a", "b", "c"]), a: node("a", "", ["a/deep"]), "a/deep": node("a/deep", "a", []), b: node("b", "", []), c: node("c", "", []) } };
+  const filtered = scoredTree(tree, (id) => id === "a/deep" ? 0 : null, "c");
+  assert.deepEqual(Object.keys(filtered.nodes).sort(), ["", "a", "a/deep", "c"]);
+  assert.deepEqual(filtered.nodes[""].children, ["a", "c"]);
+  assert.deepEqual(tree.nodes[""].children, ["a", "b", "c"], "does not mutate API state");
+  assert.deepEqual(Object.keys(scoredTree(tree, () => null, "").nodes), [""]);
 });

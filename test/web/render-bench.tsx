@@ -124,7 +124,7 @@ export function bench(count = 1000, runs = 7): Timings {
     const weightOf = (id: NodeId) => scores[id].metrics[weightKey].raw;
     const side = tileSize(weightOf(""));
     const width = sqrtScale(weightOf(""), 2, 8);
-    const look = tileLooks({ scores, scoreKey, statKeys: STAT_KEYS, findingCounts });
+    const look = tileLooks({ scores, scoreKey, statKeys: STAT_KEYS });
     const composite = ramp(ids.map((id) => scores[id].quality));
     const order = siblingOrder(sortKey, scoreOf, weightOf);
     const shown = new Map(ids.map((id) => [id, tree.nodes[id].children.map((c) => tree.nodes[c]).sort(order).map((n) => n.id)]));
@@ -200,7 +200,7 @@ export function focusBench(count = 600, runs = 9): FocusTimings {
   const weightOf = (id: NodeId) => scores[id].metrics.loc.raw;
   const side = tileSize(weightOf(""));
   const width = sqrtScale(weightOf(""), 2, 8);
-  const look = tileLooks({ scores, scoreKey: "quality", statKeys: STAT_KEYS, findingCounts });
+  const look = tileLooks({ scores, scoreKey: "quality", statKeys: STAT_KEYS });
   const composite = ramp(ids.map((id) => scores[id].quality));
   const order = siblingOrder("name", () => null, weightOf);
   const values = subtreeValues({ tree, scores, tasks, prs, findingCounts });

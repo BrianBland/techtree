@@ -284,3 +284,18 @@ test("siblings sort by name, by score (best first, missing last) or by weight (l
   assert.deepEqual(order("score"), ["b", "a", "c"]);
   assert.deepEqual(order("weight"), ["c", "a", "b"]);
 });
+
+test("activity preference reverses both ancestor context and descendant openings", () => {
+  const tree = wideTree(8, 3);
+  const active = new Set(["n0/n0", "n7/n7"]);
+  const values = hotSpots(tree, { "n0/n0": 1000, "n7/n7": 1000 });
+  const preferred = focusOn(tree, "n4", { active, values, context: 1 });
+  const inactive = focusOn(tree, "n4", { active, values, context: 1, prioritizeActive: false });
+  assert.deepEqual(preferred.get(""), ["n4", "n7"], "nearest active sibling");
+  assert.deepEqual(inactive.get(""), ["n3", "n4"]);
+  const workFirst = focusOn(tree, "", { active, values, budget: 20 });
+  const idleFirst = focusOn(tree, "", { active, values, budget: 20, prioritizeActive: false });
+  assert.ok(workFirst.has("n0") && workFirst.has("n7"));
+  assert.ok(!idleFirst.has("n0") && !idleFirst.has("n7"));
+  assert.ok(visibleCount(tree, idleFirst) <= 20);
+});

@@ -20,5 +20,6 @@ export function outboxEntry(pr: PrState, task?: Task): { section: OutboxSection;
   if (pr.stuck) return needsYou("no progress in 24h");
   if (pr.stale) return needsYou("no update in 3 days");
   if (pr.babysit) return { section: "babysitting", status: status || "waiting for CI or review" };
-  return { section: "waiting", status: pr.ci === "pending" ? "CI running" : "waiting for review" };
+  const waiting = pr.ci === "pending" ? `checks pending${pr.review === "REVIEW_REQUIRED" ? " · waiting for review" : ""}` : "waiting for review";
+  return { section: "waiting", status: waiting };
 }

@@ -47,6 +47,7 @@ test("scores on start, runs a task through review with a diff, and survives a re
   assert.equal(finding.file, TODO_FILE);
   assert.ok(detail.history.length >= 1);
   assert.deepEqual(detail.suggestions[0].findingIds, [finding.id]);
+  assert.equal(state.suggestionCounts[node], detail.suggestions.length);
   assert.deepEqual(detail.ownCtas.map((c) => c.kind), ["suggestion"]);
   assert.ok((await first.backend.getNode("")).childCtas.some((c) => c.node === node));
 
@@ -69,6 +70,7 @@ test("scores on start, runs a task through review with a diff, and survives a re
   assert.match(await first.backend.taskDiff(started.id), /change-\d+\.txt/);
   assert.match(await first.backend.taskLog(started.id, 1), /state: review/);
   assert.deepEqual((await first.backend.getOverview()).attentionTasks.map((t) => t.id), [started.id]);
+  assert.equal((await first.backend.getState()).suggestionCounts[node] ?? 0, 0, "claimed findings are not counted as suggestions");
 
   await first.shutdown();
   const second = await boot(t, repo, cache, tmp);
@@ -77,6 +79,8 @@ test("scores on start, runs a task through review with a diff, and survives a re
   assert.deepEqual(restored.snapshot, state.snapshot);
   assert.equal(restored.tasks.find((t) => t.id === started.id)?.state, "review");
   assert.match(await second.backend.taskDiff(started.id), /change-\d+\.txt/);
+  await second.backend.discard(started.id);
+  assert.equal((await second.backend.getState()).suggestionCounts[node], state.suggestionCounts[node], "discard releases suggestions");
 });
 
 test("maps unknown ids and wrong task states to HTTP errors", { timeout: 30_000 }, async (t) => {

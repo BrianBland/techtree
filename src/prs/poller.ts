@@ -59,7 +59,7 @@ type GhCheck =
 
 const FIELDS =
   "number,url,title,author,files,statusCheckRollup,reviewDecision,reviews,updatedAt,mergeable,headRefName,headRefOid,state";
-const FAILED_CONCLUSIONS = ["FAILURE", "CANCELLED", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"];
+const FAILED_CONCLUSIONS = ["FAILURE", "TIMED_OUT", "ACTION_REQUIRED", "STARTUP_FAILURE"];
 const HOUR = 3600 * 1000;
 const STUCK_AFTER_MS = 24 * HOUR;
 const STALE_AFTER_MS = 72 * HOUR;
@@ -295,7 +295,7 @@ function ciState(rollup: GhCheck[]): CiState {
   const failed = (c: GhCheck) =>
     c.__typename === "CheckRun" ? FAILED_CONCLUSIONS.includes(c.conclusion) : c.state === "FAILURE" || c.state === "ERROR";
   const pending = (c: GhCheck) =>
-    c.__typename === "CheckRun" ? c.status !== "COMPLETED" : c.state === "PENDING" || c.state === "EXPECTED";
+    c.__typename === "CheckRun" ? c.status !== "COMPLETED" || c.conclusion === "CANCELLED" : c.state === "PENDING" || c.state === "EXPECTED";
   if (rollup.some(failed)) return "fail";
   if (rollup.some(pending)) return "pending";
   return "pass";

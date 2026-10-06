@@ -4,7 +4,7 @@ import { ALL_PROJECTS, QUALITY } from "../core/projects.ts";
 import type { ApiState, Finding, NodeId, Project, Suggestion } from "../types.ts";
 import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { focusView, layoutTree, siblingOrder, stubId, toggleOverride, type Overrides, type SortKey } from "./layout.ts";
-import { attentionNodes, COMPOSITE, ramp, scoreDeltas, scoreValue, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "./visual.ts";
+import { activeNodes, attentionNodes, COMPOSITE, ramp, scoreDeltas, scoredTree, scoreValue, sqrtScale, statMetrics, subtreeValues, tileLooks, tileSize } from "./visual.ts";
 import { TreeView } from "./TreeView.tsx";
 import { GroupContext, NodePanel, StartDialog } from "./Panel.tsx";
 import { combineSuggestions, toggleSuggestion } from "./group.ts";
@@ -23,12 +23,14 @@ function App() {
   const [version, setVersion] = useState(0);
   const [eventTick, setEventTick] = useState(0);
   const shownProject = useRef(treeProject);
+  const loadGeneration = useRef(0);
   shownProject.current = treeProject;
 
   const load = () => {
     const project = shownProject.current;
+    const generation = ++loadGeneration.current;
     return get<ApiState>(`/api/state?project=${encodeURIComponent(project)}`).then(
-      (s) => project === shownProject.current && setState(s),
+      (s) => generation === loadGeneration.current && project === shownProject.current && setState(s),
       (e: Error) => setError(e.message),
     );
   };
@@ -53,6 +55,7 @@ function App() {
       if (event.type === "task") {
         setEventTick((n) => n + 1);
         if (event.task.project === shownProject.current) setState((s) => s && { ...s, tasks: upsert(s.tasks, event.task, (t) => t.id) });
+        if (event.task.project === shownProject.current) void load();
       } else if (event.type === "pr") {
         setEventTick((n) => n + 1);
         const ours = (event.pr.project ?? QUALITY) === shownProject.current;
@@ -60,6 +63,7 @@ function App() {
       } else if (event.type === "task_removed") {
         setEventTick((n) => n + 1);
         setState((s) => s && { ...s, tasks: s.tasks.filter((t) => t.id !== event.taskId) });
+        void load();
       } else if (event.type === "pr_removed") {
         setEventTick((n) => n + 1);
         setState((s) => s && { ...s, prs: s.prs.filter((p) => p.number !== event.number) });
@@ -117,6 +121,8 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
   const [scoreKey, setScoreKey] = useState(COMPOSITE);
   const [weightKey, setWeightKey] = useState("loc");
   const [sortKey, setSortKey] = useState<SortKey>("name");
+  const [prioritizeActive, setPrioritizeActive] = useState(true);
+  const [hideUnscored, setHideUnscored] = useState(false);
   const [focus, setFocus] = useState<NodeId>(() => initialFocus(state));
   const [selected, setSelected] = useState<NodeId | null>(focus || null);
   const [overrides, setOverrides] = useState<Overrides>(new Map());
@@ -143,13 +149,16 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
   const sortBasis = sortKey === "score" ? scoreOf : sortKey === "weight" ? weightOf : null;
   const order = useMemo(() => siblingOrder(sortKey, scoreOf, weightOf), [sortKey, sortBasis]);
   const attention = useMemo(() => attentionNodes(state.tasks, state.prs), [state.tasks, state.prs]);
-  const values = useMemo(() => subtreeValues(state), [tree, scores, state.tasks, state.prs, state.findingCounts]);
+  const active = useMemo(() => activeNodes(state.tasks, state.prs), [state.tasks, state.prs]);
+  const values = useMemo(() => subtreeValues(state, prioritizeActive), [tree, scores, state.tasks, state.prs, state.findingCounts, prioritizeActive]);
   const liveFocus = Object.hasOwn(tree.nodes, focus) ? focus : "";
+  const graphTree = useMemo(() => hideUnscored ? scoredTree(tree, scoreOf, liveFocus) : tree, [tree, hideUnscored, scoreOf, liveFocus]);
   const shown = useMemo(
-    () => focusView({ tree, focus: liveFocus, order, overrides, attention, values }),
-    [tree, liveFocus, order, overrides, attention, values],
+    () => focusView({ tree: graphTree, focus: liveFocus, order, overrides, attention, active, prioritizeActive, values }),
+    [graphTree, liveFocus, order, overrides, attention, active, prioritizeActive, values],
   );
-  const layout = useMemo(() => layoutTree({ tree, shown, radius }), [tree, shown, radius]);
+  const layout = useMemo(() => layoutTree({ tree: graphTree, shown, radius }), [graphTree, shown, radius]);
+  useEffect(refit, [prioritizeActive, hideUnscored, scoreKey]);
 
   useEffect(() => {
     const params = new URLSearchParams({ ...(view !== QUALITY && { project: view }), ...(liveFocus && { focus: liveFocus }) });
@@ -158,8 +167,8 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
 
   const statKeys = useMemo(() => statMetrics(metricDefs, state.weights), [metricDefs, state.weights]);
   const look = useMemo(
-    () => tileLooks({ scores, scoreKey, statKeys, findingCounts: state.findingCounts }),
-    [scores, scoreKey, statKeys, state.findingCounts],
+    () => tileLooks({ scores, scoreKey, statKeys }),
+    [scores, scoreKey, statKeys],
   );
   const previousScores = useRef(scores);
   const deltas = useMemo(() => {
@@ -230,6 +239,17 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
             <option value="weight">Size</option>
           </select>
         </label>
+        <label>
+          Prioritize
+          <select value={prioritizeActive ? "active" : "inactive"} onChange={(e) => setPrioritizeActive(e.currentTarget.value === "active")}>
+            <option value="active">Active</option>
+            <option value="inactive">Inactive</option>
+          </select>
+        </label>
+        <label>
+          <input type="checkbox" checked={hideUnscored} onChange={(e) => setHideUnscored(e.currentTarget.checked)} />
+          Hide unscored
+        </label>
         <button onClick={() => setFitRequest((n) => n + 1)}>Fit</button>
         <span class="muted small">{layout.nodes.length} shown</span>
         <span class="spacer" />
@@ -288,7 +308,7 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
         </GroupContext.Provider>
         <PanelResizer edge="right" label="Resize inbox" width={panelWidth} onResize={setPanelWidth} onResizeEnd={refit} />
         <TreeView
-          tree={tree}
+          tree={graphTree}
           layout={layout}
           look={look}
           deltas={deltas}
@@ -296,10 +316,11 @@ function Main({ state, view, projects, version, eventTick, error, notice, setErr
           compositeColor={compositeColor}
           tasks={state.tasks}
           prs={state.prs}
+          suggestionCounts={state.suggestionCounts}
           attention={attention}
           selected={selected}
           fitRequest={fitRequest}
-          onSelect={select}
+          onSelect={(id) => select(id === "" ? null : id)}
           onToggle={onToggle}
           onStub={onStub}
         />

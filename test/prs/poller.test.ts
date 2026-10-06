@@ -7,6 +7,8 @@ import { openDb, suppressSqliteWarning } from "../../src/db.ts";
 import { PrPoller, type PrPollerOptions } from "../../src/prs/poller.ts";
 import type { PrState, ServerEvent, Task } from "../../src/types.ts";
 import { DAY, T0, fakeGh, ghPr, makeTree, type FakeGh } from "./helpers.ts";
+import { outboxEntry } from "../../src/web/outbox.ts";
+import { attentionNodes } from "../../src/web/visual.ts";
 
 suppressSqliteWarning();
 
@@ -104,7 +106,9 @@ test("CI rollup: any failure fails, else anything unfinished is pending, else pa
     [[ctx("PENDING")], "pending"],
     [[ctx("EXPECTED")], "pending"],
     [[run("IN_PROGRESS"), run("COMPLETED", "FAILURE")], "fail"],
-    [[run("COMPLETED", "CANCELLED")], "fail"],
+    [[run("COMPLETED", "CANCELLED")], "pending"],
+    [[run("COMPLETED", "CANCELLED"), run("COMPLETED", "SUCCESS"), ctx("PENDING")], "pending"],
+    [[run("COMPLETED", "CANCELLED"), run("COMPLETED", "FAILURE")], "fail"],
     [[run("COMPLETED", "TIMED_OUT")], "fail"],
     [[run("COMPLETED", "ACTION_REQUIRED")], "fail"],
     [[run("COMPLETED", "STARTUP_FAILURE")], "fail"],
@@ -117,6 +121,24 @@ test("CI rollup: any failure fails, else anything unfinished is pending, else pa
     cases.map((_, i) => h.poller.get(i + 1)?.ci),
     cases.map(([, ci]) => ci),
   );
+});
+
+test("a cancelled check and pending review do not report CI failure or ready-to-merge", async (t) => {
+  const h = setup(t);
+  h.gh.setList([ghPr(5530, {
+    reviewDecision: "REVIEW_REQUIRED",
+    statusCheckRollup: [
+      { __typename: "CheckRun", name: "zepter", status: "COMPLETED", conclusion: "CANCELLED" },
+      { __typename: "CheckRun", name: "CI / ci / Test", status: "COMPLETED", conclusion: "SUCCESS" },
+      { __typename: "StatusContext", context: "Heimdall Review Status", state: "PENDING" },
+    ],
+  })]);
+  await h.poller.poll();
+  const pr = h.poller.get(5530)!;
+  assert.equal(pr.ci, "pending");
+  assert.deepEqual(outboxEntry(pr), { section: "waiting", status: "checks pending · waiting for review" });
+  assert.equal(attentionNodes([], [pr]).size, 0, "cancellation is not a CI failure alert");
+  assert.equal(h.newPoller().get(5530)?.ci, "pending", "corrected status persists");
 });
 
 test("task PRs missing from the author list are fetched one by one; closed ones are dropped", async (t) => {
