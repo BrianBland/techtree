@@ -19,8 +19,17 @@ export interface OpenBundleOptions {
   findingTitles(task: Task): string[];
 }
 
-/** A cherry-pick of `task`'s commits failed; nothing was left behind. */
-export class BundleConflict extends Error {}
+/** A genuine unmerged-index conflict while replaying this task; temporary composition state is cleaned up. */
+export class BundleConflict extends Error {
+  readonly taskId: string;
+  readonly paths: string[];
+
+  constructor(task: Task, paths: string[]) {
+    super(`cherry-pick conflict in task ${task.id} (${task.title}); paths: ${paths.map((path) => JSON.stringify(path)).join(", ")}`);
+    this.taskId = task.id;
+    this.paths = paths;
+  }
+}
 
 /** Written before a smart bundle's push, so a retry can find what an ambiguous push or PR create left behind (DESIGN "Smart PR composition"). */
 export interface PublishIntent {
@@ -218,9 +227,12 @@ async function cherryPick(repoRoot: string, worktree: string, baseRef: string, t
     if (changesNothing) continue;
     try {
       await run(worktree, "git", "cherry-pick", "--empty=drop", sha);
-    } catch {
+    } catch (err) {
+      // A failed command alone may be an identity, hook, disk or process error, not a conflict.
+      const paths = await run(worktree, "git", "diff", "--name-only", "--diff-filter=U", "-z").then((out) => out.split("\0").filter(Boolean), () => []);
       await run(worktree, "git", "cherry-pick", "--abort").catch(() => {});
-      throw new BundleConflict(`cherry-pick conflict in task ${task.id} (${task.title})`);
+      if (paths.length) throw new BundleConflict(task, paths);
+      throw err;
     }
   }
 }

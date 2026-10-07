@@ -93,7 +93,7 @@ test("a combined PR, titled by the title model, cherry-picks the staged tasks' c
   assert.deepEqual((await backend.listBundles()).map((x) => x.id), [bundle.id]);
 });
 
-test("a cherry-pick conflict aborts cleanly, names the task and leaves everything staged", { timeout: 30_000 }, async (t) => {
+test("a combined PR conflict aborts cleanly and automatically unstages only the conflicting task", { timeout: 30_000 }, async (t) => {
   const { backend, repo, reviewed } = await boot(t);
   const a = await reviewed("version A scenario:readme");
   const b = await reviewed("version B scenario:readme");
@@ -101,7 +101,12 @@ test("a cherry-pick conflict aborts cleanly, names the task and leaves everythin
   await backend.stage(b.id);
 
   await assert.rejects(backend.createBundle({ taskIds: [a.id, b.id] }), (e) => status(e) === 409 && (e as Error).message.includes(b.id));
-  assert.deepEqual((await backend.getState()).tasks.map((x) => x.state), ["staged", "staged"]);
+  assert.deepEqual((await backend.getState()).tasks.map((x) => x.state), ["staged", "review"]);
+  const unstaged = (await backend.getState()).tasks.find((x) => x.id === b.id)!;
+  assert.match(unstaged.error!, /automatically unstaged/i);
+  assert.equal(unstaged.stagedAt, undefined);
+  assert.equal(unstaged.branch, b.branch);
+  assert.equal(git(repo, "rev-parse", b.branch!).trim(), git(b.worktree!, "rev-parse", "HEAD").trim());
   assert.deepEqual(await backend.listBundles(), []);
   assert.equal(git(repo, "branch", "--list", "techtree/bundle-*").trim(), "");
 });

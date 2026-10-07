@@ -324,19 +324,132 @@ test("a stale or foreign proposal is refused: changed head, unstaged task, other
   assert.deepEqual(gh().prs, []);
 });
 
-test("a conflict keeps the opened parent, leaves the rest staged and reports the partial result", { timeout: 60_000 }, async (t) => {
+test("a conflict unstages only the offending task, preserves its source and opened parent, and regroups without publishing", { timeout: 60_000 }, async (t) => {
   const ctx = await boot(t);
   const { backend, repo, replyWith, plan, publish, task, bundleOf } = ctx;
   const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
   const [c] = await staged(ctx, ["Tree colors"]);
   replyWith([{ tasks: ["Readme A", "Readme B"] }, { tasks: ["Tree colors"] }]);
-  const result = await publish(await plan());
+  const proposal = await plan();
+  const sourceHead = git(repo, "rev-parse", b.branch!);
+  replyWith([{ tasks: ["Tree colors"] }]);
+  const result = await publish(proposal);
   const bA = await bundleOf(a.id);
   assert.deepEqual(result.lastResult?.bundleIds, [bA.id]);
   assert.match(result.lastResult!.error!, new RegExp(b.id));
   assert.equal(result.proposal, undefined, "retrying needs a new confirmation");
-  assert.deepEqual([(await task(a.id)).state, (await task(b.id)).state, (await task(c.id)).state], ["pr_open", "staged", "staged"]);
+  assert.deepEqual([(await task(a.id)).state, (await task(b.id)).state, (await task(c.id)).state], ["pr_open", "review", "staged"]);
+  const unstaged = await task(b.id);
+  assert.equal(unstaged.stagedAt, undefined);
+  assert.match(unstaged.error!, /automatically unstaged/i);
+  assert.match(unstaged.error!, /README.md/);
+  assert.equal(git(repo, "rev-parse", b.branch!), sourceHead);
+  assert.ok(existsSync(b.worktree!));
+  const regrouped = await ctx.settled();
+  assert.equal(regrouped.auto, false, "one-shot recovery does not change the setting");
+  assert.deepEqual(regrouped.proposal?.groups.map((g) => g.taskIds), [[c.id]], regrouped.error);
+  assert.equal(regrouped.proposal!.stale, false);
+  assert.equal(ctx.ghCreates(), 1, "recovery does not publish the new proposal");
+  const saved = openDb(ctx.cache);
+  assert.match(JSON.parse((saved.prepare("SELECT data FROM tasks WHERE id = ?").get(b.id) as { data: string }).data).error, /automatically unstaged/i);
+  saved.close();
+  await backend.stage(b.id);
+  assert.equal((await task(b.id)).error, undefined, "restaging clears the recovery notice");
   assert.equal(git(repo, "branch", "--list", "techtree/bundle-*").replace(/^[*+ ]+/, ""), bA.branch, "the failed composition branch is removed");
+});
+
+test("a root conflict unstages its task and clears an empty pool without a model call", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a] = await staged(ctx, ["Obsolete readme"], "readme");
+  ctx.replyWith([{ tasks: ["Obsolete readme"] }]);
+  const proposal = await ctx.plan();
+  writeFileSync(join(ctx.repo, "README.md"), "upstream changed this file\n");
+  git(ctx.repo, "add", "README.md");
+  git(ctx.repo, "commit", "-qm", "Upstream change");
+  git(ctx.repo, "push", "-q", "origin", "main");
+  // The remote moved after grouping; preserve the local fingerprint so replay sees the actual conflict.
+  git(ctx.repo, "reset", "--hard", "HEAD^");
+  const result = await ctx.publish(proposal);
+  assert.deepEqual(result.lastResult?.bundleIds, []);
+  assert.match(result.lastResult!.error!, /automatically unstaged/i);
+  assert.equal((await ctx.task(a.id)).state, "review");
+  const recovered = await ctx.settled();
+  assert.equal(recovered.proposal, undefined);
+  assert.equal(ctx.groupCalls().length, 1);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("a non-conflict cherry-pick failure leaves the task staged and does not regroup", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a] = await staged(ctx, ["Retry validation"]);
+  ctx.replyWith([{ tasks: ["Retry validation"] }]);
+  const proposal = await ctx.plan();
+  const realGit = git(ctx.repo, "--exec-path");
+  writeFileSync(join(ctx.tmp, "bin", "git"), `#!/bin/sh\nif [ "$1" = "cherry-pick" ] && [ "$2" != "--abort" ]; then echo 'injected git failure' >&2; exit 1; fi\nexec ${JSON.stringify(join(realGit, "git"))} "$@"\n`);
+  chmodSync(join(ctx.tmp, "bin", "git"), 0o755);
+  const result = await ctx.publish(proposal);
+  assert.match(result.lastResult!.error!, /injected git failure/);
+  assert.doesNotMatch(result.lastResult!.error!, /conflict|automatically unstaged/i);
+  assert.equal((await ctx.task(a.id)).state, "staged");
+  assert.equal(ctx.groupCalls().length, 1);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("manual combined publication also regroups the remaining pool after automatically unstaging its conflicting task", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
+  const [c] = await staged(ctx, ["Tree colors"]);
+  ctx.replyWith([{ tasks: ["Readme A", "Readme B"] }, { tasks: ["Tree colors"] }]);
+  await ctx.plan();
+  ctx.replyWith([{ tasks: ["Readme A"] }, { tasks: ["Tree colors"] }]);
+  await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (err) => status(err) === 409 && /automatically unstaged/.test((err as Error).message));
+  const regrouped = await ctx.settled();
+  assert.equal(regrouped.auto, false);
+  assert.deepEqual(regrouped.proposal?.groups.map((group) => group.taskIds), [[a.id], [c.id]], regrouped.error);
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state, (await ctx.task(c.id)).state], ["staged", "review", "staged"]);
+  assert.equal(ctx.groupCalls().length, 2);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("failed conflict recovery persistence restores staged state and releases publication status", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
+  ctx.replyWith([{ tasks: ["Readme A", "Readme B"] }]);
+  const proposal = await ctx.plan();
+  const before = { ...(await ctx.task(b.id)) };
+  const db = openDb(ctx.cache);
+  t.after(() => db.close());
+  db.exec("CREATE TRIGGER fail_unstage BEFORE UPDATE ON tasks WHEN OLD.state = 'staged' AND NEW.state = 'review' BEGIN SELECT RAISE(ABORT, 'injected unstage persistence failure'); END");
+  const result = await ctx.publish(proposal);
+  assert.equal(result.status, "idle");
+  assert.match(result.lastResult!.error!, /automatic unstaging failed.*injected unstage persistence failure/);
+  assert.deepEqual(await ctx.task(b.id), before);
+  assert.equal((db.prepare("SELECT state FROM tasks WHERE id = ?").get(b.id) as { state: string }).state, "staged");
+  assert.equal((await ctx.task(a.id)).state, "pr_open");
+  assert.equal(ctx.groupCalls().length, 1, "no regroup claims to have excluded an unpersisted task");
+  db.exec("DROP TRIGGER fail_unstage");
+  await ctx.backend.unstage(b.id);
+  assert.equal((await ctx.task(b.id)).state, "review");
+});
+
+test("manual conflict recovery persistence failure remains a diagnostic 409 and leaves tasks staged", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
+  const before = { ...(await ctx.task(b.id)) };
+  const db = openDb(ctx.cache);
+  t.after(() => db.close());
+  db.exec("CREATE TRIGGER fail_unstage BEFORE UPDATE ON tasks WHEN OLD.state = 'staged' AND NEW.state = 'review' BEGIN SELECT RAISE(ABORT, 'injected unstage persistence failure'); END");
+  await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (err) => {
+    assert.equal(status(err), 409);
+    assert.match((err as Error).message, new RegExp(b.id));
+    assert.match((err as Error).message, /README.md/);
+    assert.match((err as Error).message, /automatic unstaging failed.*injected unstage persistence failure/);
+    return true;
+  });
+  assert.deepEqual(await ctx.task(b.id), before);
+  assert.equal((await ctx.task(a.id)).state, "staged");
+  assert.equal(ctx.ghCreates(), 0);
+  assert.equal(ctx.groupCalls().length, 0);
 });
 
 test("an ambiguous PR create is adopted from its owned branch on retry, without a duplicate PR", { timeout: 60_000 }, async (t) => {

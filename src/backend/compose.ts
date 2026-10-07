@@ -4,7 +4,7 @@ import { promisify } from "node:util";
 import type { Db } from "../db.ts";
 import { runPiPrint } from "../plugins/llm-scan.ts";
 import { prRetired } from "../prs/poller.ts";
-import { listBundles, openStackedBundle, recoverIntent, saveBundle, StaleIntent, verifyParent, type PublishIntent } from "../runner/bundle.ts";
+import { BundleConflict, listBundles, openStackedBundle, recoverIntent, saveBundle, StaleIntent, verifyParent, type PublishIntent } from "../runner/bundle.ts";
 import type { TaskRunner } from "../runner/runner.ts";
 import { HttpError } from "../server/backend.ts";
 import type { ApiComposition, Bundle, Cache, CompositionGroup, CompositionProposal, Config, ServerEvent, Task } from "../types.ts";
@@ -99,10 +99,14 @@ export class Composer {
     };
   }
 
-  /** The project's staged pool changed: restart the debounce when automatic grouping can run. */
-  poolChanged(project: string): void {
+  /** Pool changes debounce normal planning; conflict recovery requests one cheap regroup regardless of the auto setting. */
+  poolChanged(project: string, regroup = false): void {
     const s = this.state(project);
-    if (!this.closed && this.auto(project) && this.autoModel()) {
+    if (regroup) {
+      clearTimeout(s.timer);
+      s.timer = undefined;
+      if (!this.snapshot(project).tasks.length || this.autoModel()) this.start(project, true);
+    } else if (!this.closed && this.auto(project) && this.autoModel()) {
       clearTimeout(s.timer);
       s.timer = setTimeout(() => {
         s.timer = undefined;
@@ -142,6 +146,17 @@ export class Composer {
     return this.opts.cache.get<PublishIntent | null>(INTENTS, taskId) != null;
   }
 
+  /** Called only inside the publication reservation, before a conflict has any remote side effect. */
+  recoverConflict(project: string, conflict: BundleConflict): string {
+    const task = this.opts.runner().get(conflict.taskId);
+    if (!this.reserved.has(conflict.taskId) || task?.project !== project || task.state !== "staged") throw new Error(`task ${conflict.taskId} is no longer reserved and staged in this project`);
+    if (this.hasIntent(conflict.taskId)) throw new Error(`task ${conflict.taskId} has an unresolved publication intent and remains staged; recover that publication first`);
+    const message = `${conflict.message}; automatically unstaged for review (original branch and worktree preserved).`;
+    this.opts.runner().unstage(task.id, message);
+    this.opts.cache.set(PROPOSALS, project, null);
+    return `${message} ${this.autoModel() ? "Regrouping remaining staged changes; select changes before opening another PR." : "Use Smart group to refresh the remaining pool (no cheap grouping model configured)."}`;
+  }
+
   /**
    * Run `publish` with `taskIds` reserved, after every earlier publication. A task another publication holds is 409 at
    * once, before anything runs, so callers must call this before their first `await`.
@@ -175,6 +190,7 @@ export class Composer {
         this.announce(project);
         const bundleIds: string[] = [];
         let error: string | undefined;
+        let conflict = false;
         try {
           for (const group of proposal.groups) {
             let parent = group.parent ? await this.verifiedTip(project, group.parent) : undefined;
@@ -185,11 +201,19 @@ export class Composer {
           }
         } catch (err) {
           error = errorText(err);
+          if (err instanceof BundleConflict) {
+            try {
+              error = this.recoverConflict(project, err);
+              conflict = true;
+            } catch (recoveryError) {
+              error += `; automatic unstaging failed: ${errorText(recoveryError)}`;
+            }
+          }
         }
         s.publishing = false;
         s.lastResult = { bundleIds, ...(error && { error }) };
         this.opts.cache.set(PROPOSALS, project, null);
-        this.poolChanged(project);
+        this.poolChanged(project, conflict);
         return this.status(project);
       },
     );
