@@ -466,22 +466,34 @@ Each open PR becomes a `PrState`, persisted in the `prs` table (keeping `babysit
 
 ```mermaid
 flowchart TD
-  U[PR updated, babysit on] --> R{ready to merge?<br/>ci pass + APPROVED + MERGEABLE}
-  R -- yes --> OFF1[cancel live fix task, babysit off: ready to merge]
-  R -- no --> T{trigger?}
-  T -- no --> X[nothing]
-  T -- yes --> O{author is current gh user?}
-  O -- no / unknown user --> OBS[status only: observe-only, no agent]
-  O -- yes --> A{fix_attempts >= 3?}
-  A -- yes --> OFF2[babysit off: gave up after 3 fix attempts]
-  A -- no --> L{PR's task live?<br/>queued / running / needs_input}
-  L -- yes --> WAIT[status: fix in progress]
-  L -- no --> P{PR's task pr_open with worktree?}
-  P -- yes --> RES[resumeTask with babysit prompt]
-  P -- no --> NEW[start babysit task with pr: number]
-  RES --> INC[fix_attempts += 1]
+  U[Next PR poll update or switch-on] --> S{PR still open and babysit on?}
+  S -- merged or closed --> END([Cancel live fix; tracking retired])
+  S -- babysit disabled --> OFF([No further babysit launches])
+  S -- yes --> R{Ready to merge?<br/>CI pass + APPROVED + MERGEABLE}
+  R -- yes --> READY([Cancel live fix; babysit off<br/>Human merges on GitHub])
+  R -- no --> H{Healthy update?<br/>CI pass; no conflict or changes requested}
+  H -- yes --> RESET[Reset fix_attempts to 0]
+  H -- no --> O{Author is current gh user?}
+  RESET --> O
+  O -- no or unknown user --> OBS[Observe-only status; no agent]
+  O -- yes --> T{New trigger since previous state?<br/>On switch-on: current failing conditions}
+  T -- no --> WAIT[Wait for next PR update]
+  T -- yes --> A{fix_attempts >= 3?}
+  A -- yes --> GIVEUP([Babysit off: gave up<br/>Human attention required])
+  A -- no --> L{PR task live?<br/>queued / running / needs_input}
+  L -- yes --> LIVE[Status: fix in progress<br/>Do not launch another worker]
+  L -- no --> P{PR task pr_open with worktree?}
+  P -- yes --> RES[Resume task with babysit prompt]
+  P -- no --> NEW[Start babysit task for this PR]
+  RES --> INC[fix_attempts += 1<br/>Record fix-attempt status]
   NEW --> INC
+  INC --> WAIT
+  LIVE --> WAIT
+  OBS --> WAIT
+  WAIT --> U
 ```
+
+The back edges wait for an external poll update; they are not immediate retries. A completed/failed worker does not itself launch the next attempt, and unchanged failing conditions are not a new trigger. Waiting, observe-only and fix-in-progress are nonterminal. Ready-to-merge, exhausted attempts, disabled babysitting and PR retirement end this babysitting cycle; only a healthy update or explicit switch-on resets the attempt budget. Disabling babysitting prevents further launches but does not itself cancel a live worker.
 
 - **Triggers** compare with the previous state (on switch-on: CI failing, changes requested or conflict as they are now): `ci` turns `fail`; `review` turns `CHANGES_REQUESTED`; `reviewCount` grows; `mergeable` turns `CONFLICTING`.
 - **Failed attempts.** `fix_attempts` counts launches since the PR was last healthy (`ci` pass, no conflict, no changes requested); a healthy update resets it to 0, so only consecutive unsuccessful fixes use up the budget of 3.
@@ -515,6 +527,47 @@ stateDiagram-v2
   6. The bundle is recorded in the `bundles` table: `Bundle { id, project, title, branch, worktree, taskIds, pr, url, createdAt }`. Every included task moves to `pr_open` with `pr` = the bundle's PR number and `bundle` = its id. Task worktrees and branches are kept.
 - **Follow-up.** The bundle PR is polled like task PRs (its tasks are `pr_open` with its number), but it is never linked to those tasks (`PrState.taskId` skips tasks with a `bundle`), and a bundled `pr_open` task cannot be resumed by chat or `resumeTask` (409): each task's worktree holds only its own change. Babysit on a bundle PR therefore starts a new babysit task that checks the combined PR out. A bundle PR belongs to its bundle's project. After every successful poll, each bundle whose PR is retired (seen merged or closed, see "PRs") while one of its tasks is still `pr_open` is settled by `gh pr view <n> --json state`: `MERGED` → its tasks become `done` and their findings get `resolved_at`; `CLOSED` → its tasks return to `review` (`pr` and `bundle` cleared); a failed lookup (or `OPEN`) changes nothing and is retried after the next poll. Single-task "Open PR" is unchanged.
 
+### Combined-PR creation and bounded conflict resolution
+
+> **Design target, not an implementation diagram:** manual combined PRs and immediate conflict unstaging/regrouping exist today. The cheap resolver, pinned-source/net-change validation for manual bundles and durable manual-publication recovery in the expanded flow below are proposed requirements. Until the resolver exists, every genuine cherry-pick conflict takes the give-up/unstage path directly. Dashed edges highlight the new resolver path; this documentation change does not enable an agent.
+
+```mermaid
+flowchart TD
+    POOL[Staged independent changes, unchecked] --> GROUP[Cheap read-only grouping<br/>Visual suggestions only]
+    GROUP --> SELECT[Human selects or adjusts changes<br/>Open combined PR]
+    POOL -->|Manual selection without grouping| SELECT
+    SELECT --> RESERVE[Reserve selected tasks; validate membership and heads]
+    RESERVE --> BASE[Fetch latest base; create temporary bundle branch and worktree]
+    BASE --> PICK[Cherry-pick next selected commit<br/>Tasks in staging order; commits oldest first]
+    PICK --> RESULT{Replay result?}
+    RESULT -- applied or empty commit dropped --> MORE{More selected commits?}
+    MORE -- yes --> PICK
+    MORE -- no --> NET{Publishable net change?}
+    NET -- yes --> TITLE[Cheap combined-title model or fallback title<br/>PR body lists selected tasks and resolution evidence]
+    NET -- no --> STOP([Stop without a PR; leave tasks staged])
+    RESULT -- non-conflict Git failure --> STOP
+    RESULT -- genuine unmerged-index conflict --> BUDGET{Simple conflict within scope?<br/>Cheap model configured; attempt budget unused}
+    BUDGET -. yes: proposed .-> RESOLVE[One cheap no-tools resolver call<br/>Resolved patch or give_up]
+    BUDGET -- no --> FALLBACK[Abort replay; remove temporary bundle only<br/>Unstage offending task with reason<br/>Preserve original worktree and branch]
+    RESOLVE -. give_up, timeout or invalid output .-> FALLBACK
+    RESOLVE -. resolved patch .-> VERIFY{Host checks scope, intent and resolution<br/>No markers or unmerged paths; focused checks pass?}
+    VERIFY -. no or uncertain .-> FALLBACK
+    VERIFY -. yes .-> CONTINUE[Host stages allowed paths and continues cherry-pick<br/>Same confirmed selection; no new tasks]
+    CONTINUE -. proposed .-> MORE
+    FALLBACK --> REGROUP[Regroup remaining staged pool with cheap model<br/>No automatic publication retry]
+    REGROUP --> POOL
+    TITLE --> PUSH[Push fresh combined branch; open one PR against base]
+    PUSH --> REMOTE{Remote outcome known?}
+    REMOTE -- yes --> OPEN([Persist bundle and selected tasks as pr_open<br/>Human reviews and merges])
+    REMOTE -- no --> RECOVER([Keep recovery state; reconcile owned branch/PR<br/>Do not unstage or duplicate on ambiguity])
+```
+
+- **Cheap and decisive.** Use one explicitly configured cheap model (`groupModel`, else `titleModel`), never pi's default or an automatic escalation to a stronger model. Permit at most **one resolver invocation per human-confirmed publication attempt**, with a **60 s model timeout**, a **32 KiB input cap** and a **64 KiB output cap**. No repair prompts, recursive agent calls or self-directed retries. A second conflict, absent model or exhausted budget goes straight to the unstaging fallback. Giving up is a successful, valid resolver outcome, not an agent failure.
+- **Narrow evidence and authority.** The host supplies only the failing commit's intent/diff and the base/ours/theirs content needed for at most **three conflicted text files and 200 conflicting lines** in total. File paths and repository text are untrusted data. If complete relevant context exceeds the caps, decline rather than truncate important evidence or search the repository. Binary, rename/delete or modify/delete conflicts, dependency/lockfile conflicts, and fixes requiring a new design choice are outside this simple resolver's scope. The agent runs with `--no-tools`, cannot edit files or run shell commands, and returns strict JSON: `{"outcome":"resolved","patch":"<bounded patch>","reason":"<short explanation>"}` or `{"outcome":"give_up","reason":"<short explanation>"}`. No external worktree, branch, push or PR access.
+- **Host verification, not confidence alone.** The host applies a returned patch only to the allowlisted conflicted paths in the temporary bundle worktree; reject path traversal, symlink escapes, unrelated-file edits and changes to already-applied non-conflicting content. Verify it preserves both the selected task's intent and relevant base-side changes, has no conflict markers, and leaves no unmerged index entries after the host stages resolved paths. Run existing focused checks for the affected change with a **60 s validation budget**, not full CI or newly invented tests; check commands are host-selected, never supplied by the model. If suitable checks or convincing intent evidence are unavailable, give up. Invalid output, uncertain semantics, failing checks or an incomplete cherry-pick continuation take the same fallback. The host, not the agent, stages and continues the cherry-pick. A verified simple resolution may continue the original confirmed publication, but must not change the selected task set or silently discard a task's intent; the PR body records the resolution and check evidence.
+- **Fallback remains first-class.** Abort the temporary replay, unstage only the offending task (`staged` → `review`, the unstaged task pool), preserve its independent source branch/worktree, and persist the conflict paths and give-up reason. All other unpublished tasks remain staged, and previously opened PRs in a stacked publication stay open. Regrouping is advisory and preserves the existing cheap-model constraints; without a configured model it asks for Smart group instead. The user must select/confirm a new publication attempt. Never resurrect obsolete/deleted code, resolve ambiguity by dropping a side, delete a source task, or treat authentication/network/persistence failures as merge conflicts.
+- **Publication boundary.** Resolution is allowed only before pushing the current composition branch, under the existing task reservation and pinned-source/parent freshness checks. Never rewrite an existing published PR to resolve a composition conflict. Push/PR-create ambiguity remains a separate reconciliation problem, not a reason to send tasks back to review. Durable intent recovery for manual combined PRs is also a design requirement of this expanded flow; the current runtime journals only smart stacked publication intents.
+
 ### Smart PR composition
 
 Independent task branches remain unchanged. Smart grouping provides visual suggestions for semantically related changes within one project. For now, humans select or adjust suggested groups and open combined PRs manually; there is no stacked-publish action in the UI. The confirmed stacked-publication API remains available for compatibility, and existing stack links remain visible.
@@ -525,7 +578,7 @@ Independent task branches remain unchanged. Smart grouping provides visual sugge
 - **Published stacks.** Each task in a group becomes its own bundle/PR. The first targets the repository's resolved base branch (normally main); each later task targets the immediately preceding PR branch. Build each composition branch from its parent's current head and replay only that independent task's commits before pushing and opening its PR. This is the non-destructive equivalent of rebasing onto the parent; preserve original task branches/worktrees. Persist parent/base metadata in existing bundle JSON, show links and parent relationships, and reuse normal bundle polling/settlement.
 - **Append, never regroup published PRs.** Existing open same-project stack tips are grouping candidates. Before appending, verify remotely that the parent remains open with the expected branch/head/base; closed, merged, modified or foreign parents fail safely and require regrouping. Never force-push or automatically retarget an existing PR. Manual combined PRs stay independent unless explicitly supported as eligible parents.
 - **Freshness and concurrency.** Snapshot staged tasks, their commit heads, and eligible parent heads. A changed pool, edited branch, unstaged/discarded task or changed parent invalidates the proposal. Serialize composition so simultaneous manual and smart publishing cannot publish a task twice; staging during grouping queues at most one latest run. Pending/running planning must not strand state during shutdown/restart. Empty pools require no model call.
-- **Failure recovery.** Persist each successfully opened PR and transition its task immediately. If a later item conflicts, preserve already-opened parents, automatically unstage only the offending task, surface the partial result and regroup the remaining pool. Other failures leave unopened tasks staged. Fresh human confirmation is always required; recovery never publishes a revised plan. After an ambiguous push/PR-create failure, find and adopt the PR on the owned branch before retrying; never silently duplicate it. Keep recoverable pushed branches rather than deleting published state. No automatic conflict resolution, merging, squashing or restacking.
+- **Failure recovery.** Persist each successfully opened PR and transition its task immediately. If a later item conflicts, preserve already-opened parents; the current runtime automatically unstages only the offending task, surfaces the partial result and regroups the remaining pool. The proposed bounded resolver above may first resolve a simple conflict in the unpublished composition worktree; giving up follows the same unstaging fallback. Other failures leave unopened tasks staged. Fresh human confirmation is always required after fallback; recovery never publishes a revised selection. After an ambiguous push/PR-create failure, find and adopt the PR on the owned branch before retrying; never silently duplicate it. Keep recoverable pushed branches rather than deleting published state. No automatic merging, squashing or restacking.
   Recovery must match the confirmed source head and parent; changed work first reconciles the earlier owned branch without creating a PR. An existing open PR blocks changed work until the human closes or reconciles it; an unpublished or retired intent is cleared and requires another fresh confirmation. Manual combined publication refuses unresolved smart intents. Disabling automatic grouping cancels queued automatic reruns, but preserves an explicitly requested run. A replay with an unchanged resulting tree fails before pushing, even when commits cancel each other. Publication results remain visible after the staged pool empties, and settlement announces refreshed stack state.
   Grouping sends its prompt over Pi's native piped stdin (not a large argv argument) and stops the process if combined stdout/stderr exceeds 64 KiB.
   Each opened bundle, persisted task transition and intent removal commit together; task events follow the commit. If local persistence fails, the staged state and recovery intent remain intact, so the already-opened PR can be adopted rather than duplicated.
@@ -559,9 +612,9 @@ flowchart LR
     Pool -->|Debounce or Smart group| Plan[Read-only grouping proposal]
     Plan -->|Pool or parent changed| Pool
     Plan -->|Human selects or edits group| Selected[Selected independent changes]
-    Selected -->|Open combined PR| Combined[One PR against base branch]
-    Selected -->|Cherry-pick conflict| Review
-    Review -->|Remaining pool regrouped| Plan
+    Selected -->|Open combined PR| Combined[Combined-PR creation<br/>Cherry-pick and bounded-resolution flow above]
+    Combined -->|Resolver gives up: offending task only| Review
+    Combined -->|Other tasks stay staged; advisory regroup| Pool
 ```
 
 ## Dismissed findings
