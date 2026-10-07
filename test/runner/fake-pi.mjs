@@ -24,8 +24,15 @@ async function group(prompt) {
   const file = process.env.FAKE_GROUPS;
   appendFileSync(`${file}.log`, JSON.stringify([...process.argv.slice(2), prompt]) + "\n");
   while (existsSync(`${file}.hold`)) await new Promise((resolve) => setTimeout(resolve, 10));
-  const reply = existsSync(file) ? readFileSync(file, "utf8") : "";
+  let reply = existsSync(file) ? readFileSync(file, "utf8") : "";
   if (reply === "HANG") await new Promise(() => setInterval(() => {}, 1000));
+  if (reply.startsWith("{")) {
+    const replies = JSON.parse(reply).replies;
+    if (Array.isArray(replies)) {
+      const attempt = readFileSync(`${file}.log`, "utf8").trim().split("\n").length - 1;
+      reply = JSON.stringify(replies[Math.min(attempt, replies.length - 1)]);
+    }
+  }
   const section = (tag) => JSON.parse(new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`).exec(prompt)[1]);
   const tasks = section("staged-tasks");
   const tips = section("stack-tips");
