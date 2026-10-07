@@ -149,6 +149,39 @@ export interface Bundle {
   pr: number;
   url: string;
   createdAt: string;
+  base?: string; // the PR's base branch
+  head?: string; // the pushed commit
+  sourceHead?: string; // smart bundles: the pinned task head that was replayed
+  stack?: string; // smart bundles: id of the stack's root bundle (DESIGN "Smart PR composition")
+  parent?: string; // stacked smart bundles: id of the bundle whose branch this PR targets
+}
+
+/** One proposed stack: its tasks in PR order, optionally appended to an open stack tip (DESIGN "Smart PR composition"). */
+export interface CompositionGroup {
+  taskIds: string[];
+  parent?: string; // Bundle.id of an eligible stack tip
+  rationale: string;
+}
+
+export interface CompositionProposal {
+  id: string;
+  fingerprint: string;
+  model: string; // "provider/id" or "pi default"
+  createdAt: string;
+  groups: CompositionGroup[];
+  heads: Record<string, string>; // task id → branch head pinned for publishing
+}
+
+/** `GET /api/composition`: a project's smart grouping state. */
+export interface ApiComposition {
+  project: string;
+  auto: boolean;
+  model: string | null; // the automatic grouping model; null = automatic grouping cannot run
+  status: "idle" | "queued" | "planning" | "publishing" | "failed";
+  error?: string;
+  proposal?: CompositionProposal & { stale: boolean };
+  lastResult?: { bundleIds: string[]; error?: string };
+  stacks: Bundle[]; // live smart bundles, oldest first
 }
 
 // ---- Projects (DESIGN "Projects") ----
@@ -231,6 +264,7 @@ export interface Config {
   piLoadsExtension?: boolean; // pi already loads techtree's extension (installed in its extensions dir): don't pass `-e`
   defaultModel?: string; // start-dialog prefill, "provider/id"
   titleModel?: string; // combined PR titles, "provider/id"; unset = defaultModel
+  groupModel?: string; // smart PR grouping, "provider/id"; unset = titleModel
   refineModel?: string;
   pruneOnIdle?: string[]; // worktree-relative paths deleted when a worker run ends
  // "Refine with agent" model, "provider/id"; unset = defaultModel
@@ -337,4 +371,5 @@ export type ServerEvent =
   | { type: "log"; taskId: string; line: string }
   | { type: "chat"; taskId: string; entry: ChatEntry }
   | { type: "scores"; snapshot: { sha: string; createdAt: string } }
-  | { type: "scan"; node: NodeId; status: "running" | "done" | "failed"; message?: string };
+  | { type: "scan"; node: NodeId; status: "running" | "done" | "failed"; message?: string }
+  | { type: "composition"; composition: ApiComposition };

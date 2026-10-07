@@ -1,6 +1,6 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { pathToFileURL } from "node:url";
@@ -10,8 +10,8 @@ import { mergeConfig } from "../../src/config.ts";
 import { openDb, suppressSqliteWarning } from "../../src/db.ts";
 import { HttpError, type Backend } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
-import type { PrState, ServerEvent, Task } from "../../src/types.ts";
-import { FAKE_PI, TODO_FILE, fixture, until } from "../backend/helpers.ts";
+import type { ApiComposition, Bundle, PrState, ServerEvent, Task } from "../../src/types.ts";
+import { FAKE_PI, TODO_FILE, fixture, until, withEnv } from "../backend/helpers.ts";
 import type { SmokeDriver } from "./app-smoke.tsx";
 
 suppressSqliteWarning();
@@ -142,6 +142,10 @@ function delegate(real: Backend): Backend {
     unstage: (id) => real.unstage(id),
     createBundle: (input) => real.createBundle(input),
     listBundles: (project) => real.listBundles(project),
+    getComposition: (project) => real.getComposition(project),
+    planComposition: (project) => real.planComposition(project),
+    setAutoComposition: (on, project) => real.setAutoComposition(on, project),
+    publishComposition: (input) => real.publishComposition(input),
     dismiss: (ids, reason, project) => real.dismiss(ids, reason, project),
     undismiss: (ids) => real.undismiss(ids),
     message: (id, text) => real.message(id, text),
@@ -827,4 +831,96 @@ test("saving a project's goal shows the new goal", UI_TIMEOUT, async (t) => {
   dialog.dispatch("submit");
   await app.waitFor(() => app.text().includes("fewer unwraps") && !app.text().includes("Project settings"), "the new goal in the overview");
   assert.equal((await backend.listProjects())[0].goal, "fewer unwraps");
+});
+
+type Toggle = ReturnType<SmokeDriver["find"]>[number] & { checked: boolean };
+/** Preact writes `checked` as an attribute until a test assigns the property. */
+const isChecked = (box: Toggle) => box.checked ?? box.getAttribute("checked") === "true";
+
+test("the start dialog leaves Open PR automatically unchecked (manual review) unless the user opts in", UI_TIMEOUT, async (t) => {
+  const { app, backend, byClass } = await bootUi(t);
+  const startButtons = () => app.find((n) => n.localName === "button" && n.textContent === "Start");
+  for (const optIn of [false, true]) {
+    const before = (await backend.getState()).tasks.length;
+    await app.waitFor(() => startButtons().length > 0, "suggestions with Start buttons");
+    startButtons()[0].dispatch("click");
+    await app.waitFor(() => byClass("dialog").length === 1, "start dialog");
+    const label = byClass("dialog")[0].querySelectorAll((n) => n.localName === "label" && n.textContent.includes("Open PR automatically"))[0];
+    const box = label.querySelectorAll((n) => n.localName === "input")[0] as Toggle;
+    assert.equal(isChecked(box), false);
+    if (optIn) {
+      box.checked = true;
+      box.dispatch("change");
+      await new Promise((r) => setTimeout(r, 0));
+    }
+    await app.waitFor(() => byClass("dialog")[0].querySelectorAll((n) => n.localName === "button" && n.textContent === "Start")[0].getAttribute("disabled") === null, "start enabled");
+    byClass("dialog")[0].dispatch("submit");
+    await app.waitFor(() => byClass("dialog").length === 0, "dialog to close");
+    const tasks = await tasksAfter(backend, before);
+    assert.equal(tasks.at(-1)!.manualReview, !optIn);
+    await backend.cancel(tasks.at(-1)!.id);
+  }
+});
+
+test("staged tasks start unchecked; Smart group shows the proposal and Publish confirms exactly that proposal", UI_TIMEOUT, async (t) => {
+  const { tmp } = fixture(t);
+  const groups = join(tmp, "groups.json");
+  withEnv(t, "FAKE_GROUPS", groups);
+  const published: unknown[] = [];
+  const ui = await bootUi(t, (real) => ({
+    ...delegate(real),
+    publishComposition: async (input) => {
+      published.push(input);
+      return real.getComposition(input.project);
+    },
+  }));
+  const { app, backend } = ui;
+  const reviewed = async (title: string) => {
+    const task = await backend.startTask({ node: "", findingIds: [], title, prompt: "scenario:happy", manualReview: true });
+    return until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.state === "review")), `${title} in review`);
+  };
+  const a = await reviewed("Retry validation");
+  await backend.stage(a.id);
+  const section = () => app.find((n) => n.getAttribute("class") === "staged-bundle")[0];
+  const checkboxes = () => section().querySelectorAll((n) => n.localName === "input" && n.getAttribute("type") === "checkbox" && !n.parentNode?.textContent.includes("Group automatically")) as Toggle[];
+  await app.waitFor(() => section()?.textContent.includes("Retry validation") ?? false, "staged section");
+  const b = await reviewed("Retry tests");
+  await backend.stage(b.id);
+  await app.waitFor(() => checkboxes().length === 2, "the task staged while the section is open");
+  assert.deepEqual(checkboxes().map(isChecked), [false, false]);
+  assert.match(section().textContent, /Open combined PR \(0\)/);
+  assert.match(section().textContent, /groupModel|titleModel/, "automatic grouping says it needs a cheap model");
+
+  writeFileSync(groups, JSON.stringify({ groups: [{ tasks: ["title:Retry validation", "title:Retry tests"], parent: null, rationale: "both about retries" }] }));
+  const button = (text: string) => section().querySelectorAll((n) => n.localName === "button" && n.textContent === text)[0];
+  button("Smart group").dispatch("click");
+  await app.waitFor(() => section().textContent.includes("both about retries") && button("Publish 2 PRs (runs CI)") !== undefined, "the proposal");
+  assert.equal(published.length, 0, "grouping never publishes");
+  button("Publish 2 PRs (runs CI)").dispatch("click");
+  await app.waitFor(() => published.length === 1, "publish request");
+  const { proposal } = await backend.getComposition();
+  assert.deepEqual(published[0], { project: "quality", proposalId: proposal!.id, fingerprint: proposal!.fingerprint });
+
+  const auto = section().querySelectorAll((n) => n.localName === "label" && n.textContent.includes("Group automatically"))[0].querySelectorAll((n) => n.localName === "input")[0] as Toggle;
+  assert.equal(isChecked(auto), true);
+  auto.checked = false;
+  auto.dispatch("change");
+  await until(async () => (await backend.getComposition()).auto === false, "automatic grouping off");
+});
+
+test("open stacks stay visible with root and child PR links when nothing is staged", UI_TIMEOUT, async (t) => {
+  const bundle = (id: string, pr: number, title: string, parent?: string): Bundle => ({
+    id, project: "quality", title, branch: `techtree/bundle-${id}`, worktree: "", taskIds: [], pr, url: `https://example.com/pull/${pr}`, createdAt: "2024-01-01T00:00:00.000Z",
+    base: parent ? `techtree/bundle-${parent}` : "main", stack: "root", ...(parent && { parent }),
+  });
+  const stacks = [bundle("root", 100, "Retry validation"), bundle("child", 101, "Retry tests", "root")];
+  const { app } = await bootUi(t, (real) => ({
+    ...delegate(real),
+    getComposition: async (project) => ({ ...(await real.getComposition(project)), stacks, lastResult: { bundleIds: ["root", "child"] } }) satisfies ApiComposition,
+  }));
+  await app.waitFor(() => app.text().includes("Retry tests"), "stacks in the overview");
+  const links = app.find((n) => n.localName === "a" && /\/pull\/10[01]$/.test(n.getAttribute("href") ?? "")).map((n) => n.textContent);
+  assert.deepEqual(links, ["#100", "#101"]);
+  assert.match(app.text(), /#100[^#]*→[^#]*#101|#101[^#]*→ #100/);
+  assert.match(app.text(), /Opened 2 PRs\./, "publication result stays visible when the pool empties");
 });

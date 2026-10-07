@@ -194,14 +194,23 @@ function prompt(batch: SourceFile[], rubric?: string): string {
 }
 
 /** Run `<piCommand> -p --no-session <args>` in `cwd` and resolve its stdout; a nonzero exit, timeout or abort rejects. */
-export function runPiPrint(piCommand: string[], cwd: string, args: string[], timeout: number, signal?: AbortSignal): Promise<string> {
+export function runPiPrint(piCommand: string[], cwd: string, args: string[], timeout: number, signal?: AbortSignal, options: { input?: string; maxOutputBytes?: number } = {}): Promise<string> {
   const [cmd, ...prefix] = piCommand;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, [...prefix, "-p", "--no-session", ...args], { cwd, stdio: ["ignore", "pipe", "pipe"] });
+    const child = spawn(cmd, [...prefix, "-p", "--no-session", ...args], { cwd, stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
     let stdout = "";
     let stderr = "";
-    child.stdout.setEncoding("utf8").on("data", (d: string) => (stdout += d));
-    child.stderr.setEncoding("utf8").on("data", (d: string) => (stderr += d));
+    let outputBytes = 0;
+    const accept = (data: string) => {
+      outputBytes += Buffer.byteLength(data);
+      if (options.maxOutputBytes !== undefined && outputBytes > options.maxOutputBytes) {
+        stop(new Error(`pi output exceeded ${options.maxOutputBytes} bytes`));
+        return false;
+      }
+      return true;
+    };
+    child.stdout!.setEncoding("utf8").on("data", (d: string) => { if (accept(d)) stdout += d; });
+    child.stderr!.setEncoding("utf8").on("data", (d: string) => { if (accept(d)) stderr += d; });
     let stopReason: unknown;
     let killTimer: NodeJS.Timeout | undefined;
     const stop = (reason: unknown) => {
@@ -214,6 +223,8 @@ export function runPiPrint(piCommand: string[], cwd: string, args: string[], tim
     const onAbort = () => stop(signal!.reason);
     signal?.addEventListener("abort", onAbort, { once: true });
     if (signal?.aborted) onAbort();
+    child.stdin?.on("error", stop);
+    if (options.input !== undefined) child.stdin!.end(options.input);
     const cleanup = () => {
       clearTimeout(timer);
       clearTimeout(killTimer);

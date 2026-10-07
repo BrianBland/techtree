@@ -137,7 +137,7 @@ test("a retired bundle PR settles its tasks on a later poll, even after a failed
   await backend.reconcileBundles();
   assert.equal((await backend.getState()).tasks[0].state, "pr_open", "a failed gh lookup is retried later");
 
-  writeFileSync(join(tmp, "pr-state"), "MERGED\n");
+  writeFileSync(join(tmp, "pr-state"), JSON.stringify({ state: "MERGED", baseRefName: "main" }));
   await backend.reconcileBundles();
   assert.equal((await backend.getState()).tasks[0].state, "done");
 });

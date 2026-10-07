@@ -49,6 +49,10 @@ const backend = {
   setAutoBabysit: record("setAutoBabysit"),
   rescore: record("rescore", undefined),
   scan: record("scan", undefined),
+  getComposition: record("getComposition"),
+  planComposition: record("planComposition"),
+  setAutoComposition: record("setAutoComposition"),
+  publishComposition: record("publishComposition"),
   subscribe(listener: (e: ServerEvent) => void) {
     listeners.add(listener);
     return () => listeners.delete(listener);
@@ -202,6 +206,16 @@ test("routes delegate to the matching backend method", async () => {
     ["POST", "/api/prs/auto-babysit", { on: true }, ["setAutoBabysit", true], { ok: "setAutoBabysit" }],
     ["POST", "/api/score", undefined, ["rescore", "quality"], { ok: true }],
     ["POST", "/api/scan?project=perf", { node: "crates" }, ["scan", "crates", "perf"], { ok: true }],
+    ["GET", "/api/composition?project=perf", undefined, ["getComposition", "perf"], { ok: "getComposition" }],
+    ["POST", "/api/composition/plan", undefined, ["planComposition", "quality"], { ok: "planComposition" }],
+    ["POST", "/api/composition/auto?project=perf", { on: false }, ["setAutoComposition", false, "perf"], { ok: "setAutoComposition" }],
+    [
+      "POST",
+      "/api/composition/publish",
+      { project: "perf", proposalId: "p1", fingerprint: "f1", groups: [["ignored"]] },
+      ["publishComposition", { project: "perf", proposalId: "p1", fingerprint: "f1" }],
+      { ok: "publishComposition" },
+    ],
   ];
   for (const [method, path, body, call, expected] of cases) {
     calls.length = 0;
@@ -235,6 +249,8 @@ test("bad input, unknown routes and backend errors map to JSON status codes", as
     [post("/api/prs/abc/babysit", JSON.stringify({ on: true })), 404],
     [post("/api/prs/1/babysit", JSON.stringify({ on: "yes" })), 400],
     [post("/api/scan", JSON.stringify({})), 400],
+    [post("/api/composition/auto", JSON.stringify({ on: "yes" })), 400],
+    [post("/api/composition/publish", JSON.stringify({ proposalId: "p1" })), 400],
     [post("/api/tasks/t1/report", JSON.stringify([1])), 400],
     [post("/api/tasks/t1/report", JSON.stringify({})), 400],
     [post("/api/tasks/t1/report", JSON.stringify({ phase: "not-a-phase" })), 400],

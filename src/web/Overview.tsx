@@ -1,7 +1,7 @@
 import { useEffect, useState } from "preact/hooks";
 import { ALL_PROJECTS, isScannable, isScored } from "../core/projects.ts";
-import type { ApiOverview, ApiState, Bundle, NodeId, Project, StartTaskRequest, Suggestion, Task, TaskKind } from "../types.ts";
-import { get, post } from "./api.ts";
+import type { ApiComposition, ApiOverview, ApiState, Bundle, NodeId, Project, StartTaskRequest, Suggestion, Task, TaskKind } from "../types.ts";
+import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { projectColor } from "./Projects.tsx";
 import { Section, SuggestionRow, attentionKey, fmt } from "./Panel.tsx";
@@ -95,8 +95,15 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
           );
         }}
       </Section>
-      {stagedByProject(overview.stagedTasks).map(([project, tasks]) => (
-        <StagedSection key={project} title={all ? `Staged · ${projectName(project)}` : "Staged"} project={project} tasks={tasks} nodeName={nodeName} onError={onError} />
+      {(all ? projects.map((p) => p.id) : [state.project.id]).map((project) => (
+        <StagedSection
+          key={project}
+          title={all ? `Staged · ${projectName(project)}` : "Staged"}
+          project={project}
+          tasks={overview.stagedTasks.filter((t) => t.project === project)}
+          nodeName={nodeName}
+          onError={onError}
+        />
       ))}
       {overview.scorerErrors?.map((e) => (
         <p key={e} class="error small">
@@ -187,20 +194,37 @@ function ProjectTaskDialog({ kind, title, project, onClose, onError }: { kind: T
   );
 }
 
-function stagedByProject(tasks: Task[]): [string, Task[]][] {
-  const groups = new Map<string, Task[]>();
-  for (const task of tasks) groups.set(task.project, [...(groups.get(task.project) ?? []), task]);
-  return [...groups];
+/** A project's smart grouping state, kept current by `composition` events. */
+function useComposition(project: string, onError: (message: string) => void): [ApiComposition | null, (c: ApiComposition) => void] {
+  const [composition, setComposition] = useState<ApiComposition | null>(null);
+  useEffect(() => {
+    const load = () => get<ApiComposition>(`/api/composition?project=${encodeURIComponent(project)}`).then(setComposition, (e: Error) => onError(e.message));
+    void load();
+    const stopEvents = onServerEvent((e) => {
+      if (e.type === "composition" && e.composition.project === project) setComposition(e.composition);
+    });
+    const stopReconnect = onReconnect(() => void load());
+    return () => {
+      stopEvents();
+      stopReconnect();
+    };
+  }, [project]);
+  return [composition, setComposition];
 }
 
-/** A project's staged tasks with checkboxes and "Open combined PR" (DESIGN "Staging and combined PRs"). */
+/**
+ * A project's staged tasks, unchecked, with "Open combined PR"; smart grouping with its proposal and "Publish N PRs";
+ * and the open stacks (DESIGN "Staging and combined PRs", "Smart PR composition").
+ */
 function StagedSection({ title, project, tasks, nodeName, onError }: { title: string; project: string; tasks: Task[]; nodeName(id: NodeId): string; onError(message: string): void }) {
-  const [unchecked, setUnchecked] = useState<Set<string>>(new Set());
+  const [checked, setChecked] = useState<Set<string>>(new Set());
   const [prTitle, setPrTitle] = useState("");
   const [opening, setOpening] = useState(false);
-  const taskIds = tasks.filter((t) => !unchecked.has(t.id)).map((t) => t.id);
+  const [composition, setComposition] = useComposition(project, onError);
+  if (!tasks.length && !composition?.stacks.length && !composition?.lastResult) return null;
+  const taskIds = tasks.filter((t) => checked.has(t.id)).map((t) => t.id);
   const toggle = (id: string) =>
-    setUnchecked((ids) => {
+    setChecked((ids) => {
       const next = new Set(ids);
       if (!next.delete(id)) next.add(id);
       return next;
@@ -214,21 +238,99 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
   return (
     <section class="staged-bundle">
       <h3>{title}</h3>
-      <ul class="list">
-        {tasks.map((task) => (
-          <li key={task.id}>
-            <label>
-              <input type="checkbox" checked={!unchecked.has(task.id)} onChange={() => toggle(task.id)} /> {task.title}
-              <span class="muted small"> · {nodeName(task.node)}</span>
-            </label>
-          </li>
-        ))}
-      </ul>
-      <input type="text" placeholder="PR title (default: from the tasks)" value={prTitle} onInput={(e) => setPrTitle((e.currentTarget as HTMLInputElement).value)} />
-      <button class="primary" disabled={!taskIds.length || opening} onClick={open}>
-        {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
-      </button>
+      {composition && tasks.length > 0 && <SmartGroup composition={composition} tasks={tasks} onChange={setComposition} onError={onError} />}
+      {composition?.lastResult && (
+        <p class={`small${composition.lastResult.error ? " error" : ""}`}>
+          Opened {composition.lastResult.bundleIds.length} PRs{composition.lastResult.error ? `; stopped: ${composition.lastResult.error}` : "."}
+        </p>
+      )}
+      {tasks.length > 0 && (
+        <>
+          <ul class="list">
+            {tasks.map((task) => (
+              <li key={task.id}>
+                <label>
+                  <input type="checkbox" checked={checked.has(task.id)} onChange={() => toggle(task.id)} /> {task.title}
+                  <span class="muted small"> · {nodeName(task.node)}</span>
+                </label>
+              </li>
+            ))}
+          </ul>
+          <input type="text" placeholder="PR title (default: from the tasks)" value={prTitle} onInput={(e) => setPrTitle((e.currentTarget as HTMLInputElement).value)} />
+          <button disabled={!taskIds.length || opening} onClick={open}>
+            {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
+          </button>
+        </>
+      )}
+      {composition && composition.stacks.length > 0 && <Stacks stacks={composition.stacks} />}
     </section>
+  );
+}
+
+function SmartGroup({ composition, tasks, onChange, onError }: { composition: ApiComposition; tasks: Task[]; onChange(c: ApiComposition): void; onError(message: string): void }) {
+  const { project, proposal, status } = composition;
+  const query = `?project=${encodeURIComponent(project)}`;
+  const call = (path: string, body: object = {}) => post<ApiComposition>(path, body).then(onChange, (e: Error) => onError(e.message));
+  const busy = status === "planning" || status === "publishing";
+  const titleOf = (id: string) => tasks.find((t) => t.id === id)?.title ?? id;
+  const parentPr = (id: string) => composition.stacks.find((b) => b.id === id)?.pr;
+  const count = proposal?.groups.reduce((n, g) => n + g.taskIds.length, 0) ?? 0;
+  const note =
+    status === "planning" ? "Grouping…"
+    : status === "queued" ? "Grouping shortly…"
+    : status === "publishing" ? "Publishing…"
+    : composition.auto && !composition.model ? "Automatic grouping needs groupModel or titleModel in the config; Smart group uses pi's default model."
+    : proposal?.stale ? "The staged tasks changed since this proposal; group again."
+    : "";
+  return (
+    <div class="smart-group">
+      <div class="actions">
+        <button class="primary" disabled={busy} onClick={() => call(`/api/composition/plan${query}`)}>
+          Smart group
+        </button>
+        <label class="small">
+          <input type="checkbox" checked={composition.auto} onChange={(e) => call(`/api/composition/auto${query}`, { on: (e.currentTarget as HTMLInputElement).checked })} /> Group automatically
+        </label>
+      </div>
+      {note && <p class="muted small">{note}</p>}
+      {composition.error && <p class="error small">{composition.error}</p>}
+      {proposal && (
+        <>
+          <ol class="list">
+            {proposal.groups.map((group) => (
+              <li key={group.taskIds.join()}>
+                {group.taskIds.map(titleOf).join(" → ")}
+                <span class="muted small"> → {group.parent ? `#${parentPr(group.parent) ?? group.parent}` : "base branch"}</span>
+                <div class="muted small">{group.rationale}</div>
+              </li>
+            ))}
+          </ol>
+          <button
+            class="primary"
+            disabled={busy || proposal.stale}
+            onClick={() => call("/api/composition/publish", { project, proposalId: proposal.id, fingerprint: proposal.fingerprint })}
+          >
+            {`Publish ${count} PRs (runs CI)`}
+          </button>
+        </>
+      )}
+    </div>
+  );
+}
+
+/** Open smart stacks: each PR with the PR (or base branch) it targets. */
+function Stacks({ stacks }: { stacks: Bundle[] }) {
+  return (
+    <ul class="list small">
+      {stacks.map((b) => (
+        <li key={b.id}>
+          <a href={b.url} target="_blank" rel="noreferrer">
+            #{b.pr}
+          </a>{" "}
+          {b.title} → {b.parent ? `#${stacks.find((p) => p.id === b.parent)?.pr ?? b.parent}` : b.base}
+        </li>
+      ))}
+    </ul>
   );
 }
 

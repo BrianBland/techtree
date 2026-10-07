@@ -34,8 +34,10 @@ import { Babysitter } from "../prs/babysit.ts";
 import { PrPoller, prRetired } from "../prs/poller.ts";
 import { BundleConflict, listBundles, openBundle, saveBundle } from "../runner/bundle.ts";
 import { TaskRunner } from "../runner/runner.ts";
-import { HttpError, type Backend, type BundleInput, type ProjectInput, type WorkerReport } from "../server/backend.ts";
+import { HttpError, type Backend, type BundleInput, type ProjectInput, type PublishInput, type WorkerReport } from "../server/backend.ts";
+import { Composer } from "./compose.ts";
 import type {
+  ApiComposition,
   ApiModels,
   ApiNode,
   ApiOverview,
@@ -94,6 +96,8 @@ export interface RepoBackendOptions {
   /** Poll GitHub for PRs with `gh` and babysit them once attached (ignored when `prs` is given). */
   pollPrs?: boolean;
   log?: (msg: string) => void;
+  /** Quiet period after a staged-pool change before automatic smart grouping runs (DESIGN "Smart PR composition"). */
+  groupDebounceMs?: number;
 }
 
 const OVERVIEW_SUGGESTIONS = 8;
@@ -147,10 +151,21 @@ export class RepoBackend implements Backend {
   private reconciling = false;
   private scoreError?: string;
   private modelList?: { at: number; models: Promise<string[]> };
+  private readonly composer: Composer;
 
   constructor(opts: RepoBackendOptions) {
-    this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, pollPrs: false, log: (msg) => console.error(msg), ...opts };
+    this.opts = { plugins: [...defaultPlugins, llmScanPlugin], prs: noPrs, pollPrs: false, log: (msg) => console.error(msg), groupDebounceMs: 5_000, ...opts };
     this.cache = dbCache(opts.db);
+    this.composer = new Composer({
+      db: opts.db,
+      cache: this.cache,
+      repoRoot: opts.repoRoot,
+      config: opts.config,
+      runner: () => this.runner(),
+      emit: (event) => this.emit(event),
+      findingTitles: (project) => this.findingTitles(project),
+      debounceMs: this.opts.groupDebounceMs,
+    });
     const shared = this.cache.get<{ result: ScoreResult; config: string }>(...RESULT_KEY);
     if (shared?.config === JSON.stringify(opts.config)) this.result = shared.result;
     this.unsubscribePrs = this.opts.prs.onEvent((event) => this.emit(event));
@@ -201,6 +216,8 @@ export class RepoBackend implements Backend {
     const prClosed = (t: Task) => t.pr !== undefined && prRetired(this.cache, t.pr);
     const blocking = tasks.find((t) => LIVE_STATES.includes(t.state) || (t.state === "pr_open" && !prClosed(t)));
     if (blocking) throw new HttpError(409, `task ${blocking.id} is ${blocking.state}; cancel it or close its PR first`);
+    const publishing = tasks.find((t) => this.composer.isReserved(t.id));
+    if (publishing) throw new HttpError(409, `task ${publishing.id} is being published`);
     for (const task of tasks) this.runnerCall(() => this.runner().discard(task.id, { prClosed: prClosed(task) }));
     deleteProjectRows(this.opts.db, id);
     this.opts.db.prepare("DELETE FROM cache WHERE (kind = 'backend' AND key = ?) OR (kind = 'plan' AND key = ?) OR substr(kind, 1, length(?)) = ?").run(`result:${id}`, id, `rubric:${id}:`, `rubric:${id}:`);
@@ -215,6 +232,7 @@ export class RepoBackend implements Backend {
     const { db, config, repoRoot, cacheDir } = this.opts;
     this.taskRunner = new TaskRunner({ db, config, repoRoot, cacheDir, ...server, onEvent: (e) => this.emit(e) });
     this.taskRunner.recover();
+    this.composer.recover(listProjects(db).map((p) => p.id));
     if (this.opts.pollPrs && this.opts.prs === noPrs) this.startPrPolling(this.taskRunner);
     if (!this.result || this.result.sha !== git(repoRoot, "rev-parse", "HEAD").trim() || listProjects(db).some((p) => isScored(p) && !this.projectRun(p))) void this.rescore();
   }
@@ -251,30 +269,38 @@ export class RepoBackend implements Backend {
     this.reconciling = true;
     try {
       const runner = this.runner();
-      const pending = listBundles(this.opts.db).filter(
-        (b) => prRetired(this.cache, b.pr) && b.taskIds.some((id) => runner.get(id)?.state === "pr_open"),
-      );
-      for (const bundle of pending) await this.settleBundle(runner, bundle);
+      const bundles = listBundles(this.opts.db);
+      const pending = bundles.filter((b) => prRetired(this.cache, b.pr) && bundleOutcome(runner, b) === "open");
+      for (const bundle of pending) await this.settleBundle(runner, bundle, bundles.find((b) => b.id === bundle.parent));
+      for (const project of new Set(pending.map((b) => b.project))) this.composer.announce(project);
     } finally {
       this.reconciling = false;
     }
   }
 
-  private async settleBundle(runner: TaskRunner, bundle: Bundle): Promise<void> {
-    let state: string;
+  /** A stacked child merged into its parent's branch takes the parent's outcome (DESIGN "Smart PR composition", settlement). */
+  private async settleBundle(runner: TaskRunner, bundle: Bundle, parent: Bundle | undefined): Promise<void> {
+    let pr: { state: string; baseRefName: string };
     try {
-      ({ stdout: state } = await promisify(execFile)("gh", ["pr", "view", String(bundle.pr), "--json", "state", "--jq", ".state"], { cwd: this.opts.repoRoot }));
+      const { stdout } = await promisify(execFile)("gh", ["pr", "view", String(bundle.pr), "--json", "state,baseRefName"], { cwd: this.opts.repoRoot });
+      pr = JSON.parse(stdout);
     } catch (err) {
       return this.opts.log(`bundle PR #${bundle.pr}: ${errorText(err)}`);
     }
-    if (state.trim() === "OPEN") return;
-    const merged = state.trim() === "MERGED";
+    if (pr.state === "OPEN") return;
+    let merged = pr.state === "MERGED";
+    if (merged && parent && pr.baseRefName === parent.branch) {
+      const outcome = bundleOutcome(runner, parent);
+      if (outcome === "open") return;
+      merged = outcome === "merged";
+    }
+    const owned = bundle.taskIds.filter((id) => runner.get(id)?.bundle === bundle.id);
     if (merged) {
-      const findingIds = bundle.taskIds.flatMap((id) => runner.get(id)?.findingIds ?? []);
+      const findingIds = owned.flatMap((id) => runner.get(id)?.findingIds ?? []);
       const resolve = this.opts.db.prepare("UPDATE findings SET resolved_at = ? WHERE id = ? AND resolved_at IS NULL");
       for (const id of findingIds) resolve.run(new Date().toISOString(), id);
     }
-    runner.bundleClosed(bundle.taskIds, merged);
+    runner.bundleClosed(owned, merged);
   }
 
   /** Whether anything should keep the server alive: SSE clients, live or queued tasks, scoring or scans. */
@@ -284,7 +310,7 @@ export class RepoBackend implements Backend {
 
   /** Whether a scoring run or LLM scan is in progress (work a restart would lose, unlike tasks, which resume). */
   analyzing(): boolean {
-    return this.scoring !== undefined || this.scanning.size > 0;
+    return this.scoring !== undefined || this.scanning.size > 0 || this.composer.planning();
   }
 
   /** Resolves once the scoring run in progress (if any) has finished. */
@@ -298,15 +324,46 @@ export class RepoBackend implements Backend {
     this.stopPrPolling?.();
     this.taskRunner?.close();
     this.stopScans.abort(new Error("techtree server stopped"));
-    await Promise.all(this.scanning.values());
+    await Promise.all([...this.scanning.values(), this.composer.close()]);
   }
 
   async stage(taskId: string): Promise<Task> {
-    return this.runnerCall(() => this.runner().stage(taskId));
+    const task = this.runnerCall(() => this.runner().stage(taskId));
+    this.composer.poolChanged(task.project);
+    return task;
   }
 
   async unstage(taskId: string): Promise<Task> {
-    return this.runnerCall(() => this.runner().unstage(taskId));
+    this.refuseReserved(taskId);
+    const task = this.runnerCall(() => this.runner().unstage(taskId));
+    this.composer.poolChanged(task.project);
+    return task;
+  }
+
+  private refuseReserved(taskId: string): void {
+    if (this.composer.isReserved(taskId)) throw new HttpError(409, `task ${taskId} is being published`);
+  }
+
+  async getComposition(projectId?: string): Promise<ApiComposition> {
+    return this.composer.status(this.project(projectId).id);
+  }
+
+  async planComposition(projectId?: string): Promise<ApiComposition> {
+    return this.composer.plan(this.project(projectId).id);
+  }
+
+  async setAutoComposition(on: boolean, projectId?: string): Promise<ApiComposition> {
+    return this.composer.setAuto(this.project(projectId).id, on);
+  }
+
+  async publishComposition({ project, proposalId, fingerprint }: PublishInput): Promise<ApiComposition> {
+    return this.composer.publish(this.project(project).id, proposalId, fingerprint);
+  }
+
+  private findingTitles(projectId: string): (task: Task) => string[] {
+    const project = getProject(this.opts.db, projectId);
+    const titles = new Map((project ? (this.projectRun(project)?.result.findings ?? []) : []).map((f) => [f.id, f.title]));
+    return (task) => task.findingIds.map((id) => titles.get(id) ?? id);
   }
 
   async listBundles(projectId?: string): Promise<Bundle[]> {
@@ -320,24 +377,20 @@ export class RepoBackend implements Backend {
     const wrong = tasks.find((t) => t.state !== "staged" || t.project !== project.id);
     if (wrong) throw new HttpError(409, `task ${wrong.id} is ${wrong.state} in ${wrong.project}, not staged in ${project.id}`);
     tasks.sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? ""));
-    const findings = new Map((this.projectRun(project)?.result.findings ?? []).map((f) => [f.id, f.title]));
     const { repoRoot, config, db } = this.opts;
-    let bundle: Bundle;
-    try {
-      bundle = await openBundle({
-        repoRoot,
-        config,
-        project: project.id,
-        tasks,
-        ...(title && { title }),
-        findingTitles: (task) => task.findingIds.map((id) => findings.get(id) ?? id),
-      });
-    } catch (err) {
-      throw new HttpError(err instanceof BundleConflict ? 409 : 502, errorText(err));
-    }
-    saveBundle(db, bundle);
-    this.runner().bundled(bundle.taskIds, bundle.id, bundle.pr);
-    return bundle;
+    return this.composer.reserve(taskIds, async () => {
+      const pending = taskIds.find((id) => this.composer.hasIntent(id));
+      if (pending) throw new HttpError(409, `task ${pending} has an unresolved smart publication; recover it with Smart group before opening a combined PR`);
+      let bundle: Bundle;
+      try {
+        bundle = await openBundle({ repoRoot, config, project: project.id, tasks, ...(title && { title }), findingTitles: this.findingTitles(project.id) });
+      } catch (err) {
+        throw new HttpError(err instanceof BundleConflict ? 409 : 502, errorText(err));
+      }
+      this.runner().bundled(bundle.taskIds, bundle.id, bundle.pr, () => saveBundle(db, bundle));
+      this.composer.poolChanged(project.id);
+      return bundle;
+    });
   }
 
   async dismiss(findingIds: string[], reason?: string, projectId?: string): Promise<void> {
@@ -548,7 +601,10 @@ export class RepoBackend implements Backend {
   }
 
   async discard(taskId: string): Promise<void> {
-    return this.runnerCall(() => this.runner().discard(taskId));
+    this.refuseReserved(taskId);
+    const task = this.task(taskId);
+    this.runnerCall(() => this.runner().discard(taskId));
+    if (task.state === "staged") this.composer.poolChanged(task.project);
   }
 
   async cancel(taskId: string): Promise<Task> {
@@ -853,6 +909,13 @@ export class RepoBackend implements Backend {
     if (event.type === "task") this.rescoreOnPlanProgress(event.task);
     for (const listener of this.listeners) listener(event);
   }
+}
+
+/** A bundle's PR outcome as its own tasks show it: some still `pr_open` on it, all `done` on it (merged), else closed. */
+function bundleOutcome(runner: TaskRunner, bundle: Bundle): "open" | "merged" | "closed" {
+  const tasks = bundle.taskIds.map((id) => runner.get(id)).filter((t) => t?.bundle === bundle.id);
+  if (tasks.some((t) => t!.state === "pr_open")) return "open";
+  return tasks.length && tasks.every((t) => t!.state === "done") ? "merged" : "closed";
 }
 
 function projectIdentity(project: Project, config: Config): string {
