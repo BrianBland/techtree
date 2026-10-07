@@ -1,4 +1,5 @@
 import type {
+  ApiComposition,
   ApiModels,
   ApiNode,
   ApiOverview,
@@ -39,6 +40,12 @@ export interface BundleInput {
   project?: string;
   taskIds: string[];
   title?: string;
+}
+
+export interface PublishInput {
+  project?: string;
+  proposalId: string;
+  fingerprint: string;
 }
 
 export interface ProjectInput {
@@ -96,6 +103,11 @@ export interface Backend {
   /** Open one combined PR from staged tasks. */
   createBundle(input: BundleInput): Promise<Bundle>;
   listBundles(project?: string): Promise<Bundle[]>;
+  /** Smart PR composition (DESIGN "Smart PR composition"): status, run now, automatic switch, publish the stored proposal. */
+  getComposition(project?: string): Promise<ApiComposition>;
+  planComposition(project?: string): Promise<ApiComposition>;
+  setAutoComposition(on: boolean, project?: string): Promise<ApiComposition>;
+  publishComposition(input: PublishInput): Promise<ApiComposition>;
   /** Dismiss findings (false positive / won't fix) or undo it (DESIGN "Dismissed findings"). */
   dismiss(findingIds: string[], reason?: string, project?: string): Promise<void>;
   undismiss(findingIds: string[]): Promise<void>;

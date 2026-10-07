@@ -2,14 +2,38 @@
 // `scenario:<name>` in the first prompt. The scenario is kept in a fake session file so a
 // respawn with the same --session-dir/--session-id resumes it, as real pi sessions do.
 import { execFileSync } from "node:child_process";
-import { existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { techtreeReportTool } from "../../src/runner/report-tool.ts";
 
 const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
 if (process.argv.includes("-p")) {
-  console.log("feat: fake combined title");
+  let input = "";
+  for await (const chunk of process.stdin) input += chunk;
+  const prompt = input || process.argv.at(-1);
+  if (prompt.includes("<staged-tasks>")) await group(prompt);
+  else console.log("feat: fake combined title");
   process.exit(0);
+}
+
+/**
+ * Smart grouping: log the argv to `$FAKE_GROUPS.log` and reply with `$FAKE_GROUPS`, where `"title:<t>"` names the staged
+ * task titled `<t>` and `"tip:<t>"` the stack tip titled `<t>`. A reply of `HANG` never answers.
+ */
+async function group(prompt) {
+  const file = process.env.FAKE_GROUPS;
+  appendFileSync(`${file}.log`, JSON.stringify([...process.argv.slice(2), prompt]) + "\n");
+  while (existsSync(`${file}.hold`)) await new Promise((resolve) => setTimeout(resolve, 10));
+  const reply = existsSync(file) ? readFileSync(file, "utf8") : "";
+  if (reply === "HANG") await new Promise(() => setInterval(() => {}, 1000));
+  const section = (tag) => JSON.parse(new RegExp(`<${tag}>\\n([\\s\\S]*?)\\n</${tag}>`).exec(prompt)[1]);
+  const tasks = section("staged-tasks");
+  const tips = section("stack-tips");
+  console.log(
+    reply
+      .replace(/"title:([^"]*)"/g, (_, t) => JSON.stringify(tasks.find((x) => x.title === t)?.id ?? `missing ${t}`))
+      .replace(/"tip:([^"]*)"/g, (_, t) => JSON.stringify(tips.find((x) => x.title === t)?.id ?? `missing ${t}`)),
+  );
 }
 if (process.argv.includes("--list-models")) {
   process.stdout.write("provider  model  context  max-out  thinking  images\nfake      alpha  200K     64K      yes       yes\nfake      beta   1M       128K     no        no\n");

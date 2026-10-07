@@ -654,7 +654,7 @@ export function StartDialog({
       () => {},
     );
   }, []);
-  const [manualReview, setManualReview] = useState(suggestion.manualReview);
+  const [openPr, setOpenPr] = useState(false);
   const [models, setModels] = useState<string[]>([]);
   const [model, setModel] = useState("");
   const [modelsLoad, setModelsLoad] = useState<"loading" | "ready" | "failed">("loading");
@@ -677,7 +677,7 @@ export function StartDialog({
       findingIds: suggestion.findingIds,
       ...(title.trim() && { title }),
       prompt,
-      manualReview,
+      manualReview: !openPr,
       project,
       ...(model && { model }),
     };
@@ -718,8 +718,8 @@ export function StartDialog({
           {modelsLoad === "failed" && <span class="small error">Could not load models; the task will use pi's default.</span>}
         </label>
         <label class="inline">
-          <input type="checkbox" checked={manualReview} onChange={(e) => setManualReview((e.currentTarget as HTMLInputElement).checked)} />
-          Manual review before PR
+          <input type="checkbox" checked={openPr} onChange={(e) => setOpenPr((e.currentTarget as HTMLInputElement).checked)} />
+          Open PR automatically
         </label>
         <div class="buttons">
           <button type="button" class="link" onClick={onClose}>

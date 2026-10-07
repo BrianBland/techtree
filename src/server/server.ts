@@ -174,6 +174,19 @@ function apiRoutes(backend: Backend): Route[] {
         throw new HttpError(400, "project and title must be strings");
       return backend.createBundle({ taskIds, ...(project && { project }), ...(title?.trim() && { title: title.trim() }) });
     }),
+    get(/^\/api\/composition$/, (_req, url) => backend.getComposition(projectParam(url))),
+    post(/^\/api\/composition\/plan$/, (_req, url) => backend.planComposition(projectParam(url))),
+    post(/^\/api\/composition\/auto$/, async (req, url) => {
+      const { on } = await readJson(req);
+      if (typeof on !== "boolean") throw new HttpError(400, "on must be a boolean");
+      return backend.setAutoComposition(on, projectParam(url));
+    }),
+    post(/^\/api\/composition\/publish$/, async (req) => {
+      const { project, proposalId, fingerprint } = await readJson(req);
+      if (typeof proposalId !== "string" || typeof fingerprint !== "string") throw new HttpError(400, "proposalId and fingerprint must be strings");
+      if (project !== undefined && typeof project !== "string") throw new HttpError(400, "project must be a string");
+      return backend.publishComposition({ proposalId, fingerprint, ...(project && { project }) });
+    }),
     post(/^\/api\/findings\/dismiss$/, async (req) => {
       const { findingIds, reason, project } = await readJson(req);
       if (!stringList(findingIds)) throw new HttpError(400, "findingIds must be a list of strings");

@@ -224,12 +224,20 @@ export class TaskRunner {
   }
 
   /** Staged tasks now in bundle `bundleId`'s combined PR `pr`. */
-  bundled(taskIds: string[], bundleId: string, pr: number): void {
-    for (const id of taskIds) {
-      const task = this.require(id);
-      Object.assign(task, { state: "pr_open", pr, bundle: bundleId, stagedAt: undefined });
-      this.save(task);
+  bundled(taskIds: string[], bundleId: string, pr: number, persistBundle: () => void = () => {}): void {
+    const previous = taskIds.map((id) => this.require(id));
+    const tasks = previous.map((task) => ({ ...task, state: "pr_open" as const, pr, bundle: bundleId, stagedAt: undefined }));
+    this.opts.db.exec("BEGIN IMMEDIATE");
+    try {
+      persistBundle();
+      for (const task of tasks) this.save(task, false);
+      this.opts.db.exec("COMMIT");
+    } catch (err) {
+      this.opts.db.exec("ROLLBACK");
+      for (const task of previous) this.tasks.set(task.id, task);
+      throw err;
     }
+    for (const task of tasks) this.opts.onEvent?.({ type: "task", task });
   }
 
   /** A bundle's PR left the open list: merged → `done`, closed → back to `review`. */
@@ -659,7 +667,7 @@ export class TaskRunner {
     return git(this.opts.repoRoot, "rev-parse", this.opts.config.baseRef).trim();
   }
 
-  private save(task: Task): void {
+  private save(task: Task, notify = true): void {
     task.updatedAt = new Date().toISOString();
     this.tasks.set(task.id, task);
     this.opts.db
@@ -668,7 +676,7 @@ export class TaskRunner {
           "ON CONFLICT (id) DO UPDATE SET state = excluded.state, data = excluded.data, updated_at = excluded.updated_at",
       )
       .run(task.id, task.node, task.state, JSON.stringify(task), task.updatedAt, task.project);
-    this.opts.onEvent?.({ type: "task", task });
+    if (notify) this.opts.onEvent?.({ type: "task", task });
   }
 
   private chatEntry(task: Task, role: ChatEntry["role"], text: string): void {
