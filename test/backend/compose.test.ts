@@ -219,6 +219,39 @@ test("automatic grouping needs a cheap model; Smart group then runs on pi's defa
   assert.ok(!groupCalls()[0].includes("--model"));
 });
 
+test("grouping corrects a staged task mistaken for a parent once, without publishing", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Retry validation", "Retry tests"]);
+  const group = { tasks: [a.id, b.id], parent: null as string | null, rationale: "retry" };
+  writeFileSync(join(ctx.tmp, "groups.json"), JSON.stringify({ replies: [
+    { groups: [{ ...group, parent: a.id }] },
+    { groups: [group] },
+  ] }));
+  const planned = await ctx.plan();
+  assert.equal(planned.error, undefined);
+  assert.deepEqual(planned.proposal!.groups, [{ taskIds: [a.id, b.id], rationale: "retry" }]);
+  const calls = ctx.groupCalls();
+  assert.equal(calls.length, 2);
+  assert.match(calls[0].at(-1)!, /Allowed parent IDs: \[\]/);
+  assert.match(calls[0].at(-1)!, /never a staged task/i);
+  assert.ok(calls[1].at(-1)!.includes(`parent ${a.id} is not an open stack tip`), "correction includes the precise validation error");
+  assert.deepEqual(ctx.gh().prs, []);
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["staged", "staged"]);
+});
+
+test("grouping still rejects invalid parents after one correction instead of dropping them", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a] = await staged(ctx, ["Retry validation"]);
+  writeFileSync(join(ctx.tmp, "groups.json"), JSON.stringify({ groups: [{ tasks: [a.id], parent: a.id, rationale: "retry" }] }));
+  const failed = await ctx.plan();
+  assert.equal(failed.status, "failed");
+  assert.match(failed.error!, /not an open stack tip/);
+  assert.equal(failed.proposal, undefined);
+  assert.equal(ctx.groupCalls().length, 2, "invalid output never causes an unbounded retry loop");
+  assert.deepEqual(ctx.gh().prs, []);
+  assert.equal((await ctx.task(a.id)).state, "staged");
+});
+
 test("invalid grouping output fails visibly and leaves every task staged", { timeout: 60_000 }, async (t) => {
   const ctx = await boot(t);
   const { backend, replyWith, plan } = ctx;
@@ -517,9 +550,13 @@ test("turning automatic grouping off cancels queued reruns but not explicit ones
   const hold = join(ctx.tmp, "groups.json.hold");
   for (const explicit of [false, true]) {
     await ctx.backend.unstage(b.id);
-    ctx.replyWith([{ tasks: [a.title, b.title] }]);
     writeFileSync(hold, "hold");
     const before = ctx.groupCalls().length;
+    writeFileSync(join(ctx.tmp, "groups.json"), JSON.stringify({ replies: [
+      ...Array(before).fill(null),
+      { groups: [{ tasks: [a.id], parent: null, rationale: "initial snapshot" }] },
+      { groups: [{ tasks: [a.id, b.id], parent: null, rationale: "latest snapshot" }] },
+    ] }));
     await ctx.backend.setAutoComposition(true);
     await until(() => ctx.groupCalls().length === before + 1, "first run held");
     await ctx.backend.stage(b.id);
