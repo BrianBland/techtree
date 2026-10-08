@@ -462,7 +462,7 @@ Each open PR becomes a `PrState`, persisted in the `prs` table (keeping `babysit
 
 **Flags** (injectable clock). *Progress* is a new head commit, a `ci` change, a `review` change or a `reviewCount` change; it sets `last_progress_at` to now. A PR first seen starts with `last_progress_at` = its `updatedAt`. `stale` = now − `updatedAt` ≥ 3 days; `stuck` = now − `last_progress_at` ≥ 24 h.
 
-**Babysit** (`Babysitter`). `setBabysit(number, on)` toggles it per PR (async; unknown PR → error); switching on resets `fix_attempts` to 0, looks the current gh user up again, and immediately evaluates the PR's current state. Each poll update of a babysat PR walks the babysit cycle of the PR lifecycle chart under "Combined-PR creation and bounded conflict resolution": retirement, disabled babysitting, ready-to-merge, observe-only, a new trigger, the attempt budget and an existing live worker, in that order.
+**Babysit** (`Babysitter`). `setBabysit(number, on)` toggles it per PR (async; unknown PR → error); switching on resets `fix_attempts` to 0, looks the current gh user up again, and immediately evaluates the PR's current state. Each poll update of a babysat PR follows the [babysitting subchart](#babysitting-subchart): retirement, disabled babysitting, ready-to-merge, observe-only, a new trigger, the attempt budget and an existing live worker, in that order.
 
 The cycle's back edges wait for an external poll update; they are not immediate retries. A completed/failed worker does not itself launch the next attempt, and unchanged failing conditions are not a new trigger. Waiting, observe-only and fix-in-progress are nonterminal. Ready-to-merge, exhausted attempts, disabled babysitting and PR retirement end this babysitting cycle; only a healthy update (CI pass, no conflict, no changes requested) or explicit switch-on resets the attempt budget. Disabling babysitting prevents further launches but does not itself cancel a live worker.
 
@@ -478,7 +478,7 @@ The cycle's back edges wait for an external poll update; they are not immediate 
 
 To avoid many small PRs, reviewed tasks can be *staged* and several opened as one combined PR.
 
-Staging moves a task `review` → `staged` (Unstage moves it back); opening a combined PR moves its tasks to `pr_open`; a merged bundle PR makes them `done` and a closed one returns them to `review`. The PR lifecycle chart under "Combined-PR creation and bounded conflict resolution" shows all of these transitions.
+Staging moves a task `review` → `staged` (Unstage moves it back); opening a combined PR moves its tasks to `pr_open`; a merged bundle PR makes them `done` and a closed one returns them to `review`. The [core lifecycle](#core-lifecycle) shows these transitions and delegates detailed decisions to the subcharts below.
 
 - **Stage** (`review` → `staged`, new `TaskState`) records `stagedAt`; **Unstage** returns the task to `review` and clears it. Staged tasks keep their worktree and branch, are not attention items, and can still be discarded.
 - **UI.** New change tasks show an unchecked **Open PR automatically** option (`manualReview: true` by default, independent of suggestion heuristics). The overview has a **Staged** section per project, all **unchecked** by default, including tasks staged while the section is open. Smart grouping is advisory and visual: suggested groups show their rationale and individual task checkboxes, with **Select group** / **Deselect group** shortcuts. Humans can combine any selected tasks across groups into one **Open combined PR**, targeting the configured base branch. Grouping and regrouping never select tasks or publish PRs automatically. Stale suggestions fall back to the full staged list until refreshed; removed tasks lose their selection, and newly staged tasks remain unchecked.
@@ -493,74 +493,118 @@ Staging moves a task `review` → `staged` (Unstage moves it back); opening a co
 
 ### Combined-PR creation and bounded conflict resolution
 
-This is the single PR-lifecycle chart: staging, advisory grouping, replay of a confirmed selection with the bounded conflict resolver and its fallback, publication, and the babysit cycle until a terminal outcome. Manual combined PRs (`POST /api/bundles`) and confirmed stacked publications share the replay, resolver and fallback path; a stacked item replays onto its parent's head and targets the parent's branch.
+The core loop owns task states and PR settlement. Three subcharts expand its composition, conflict-resolution and babysitting steps without repeating the entire lifecycle. Manual combined PRs (`POST /api/bundles`) and confirmed stacked publications share the composition and resolver paths; a stacked item replays onto its parent's head and targets the parent's branch.
+
+#### Core lifecycle
+
+Read `[[…]]` nodes as calls to the named subchart. Subcharts return outcomes to this loop; back edges requiring a selection or poll update are not immediate automatic retries.
 
 ```mermaid
 flowchart TD
-    REVIEW[Task in review<br/>independent branch and worktree] -->|Stage| POOL[Staged, unchecked]
+    REVIEW[Task in review] -->|Stage| POOL[Staged, unchecked<br/>advisory groups available]
     POOL -->|Unstage| REVIEW
-    POOL -->|Debounce or Smart group| GROUP[Cheap read-only grouping<br/>visual suggestions only]
-    GROUP -->|Pool or parent changed| POOL
-    GROUP --> SELECT[Human selects or adjusts changes<br/>Open combined PR]
-    POOL -->|Manual selection without grouping| SELECT
-    SELECT --> RESERVE[Reserve selected tasks; pin source heads<br/>One resolver attempt for this publication]
-    RESERVE --> BASE[Fetch latest base or verified parent<br/>temporary bundle branch and worktree]
-    BASE --> PICK[Cherry-pick next selected commit<br/>tasks in staging order, commits oldest first]
-    PICK --> RESULT{Replay result?}
-    RESULT -- applied or empty commit dropped --> MORE{More selected commits?}
-    MORE -- yes --> PICK
-    RESULT -- non-conflict Git failure --> STOP([Remove temporary bundle<br/>every task stays staged])
-    RESULT -- genuine unmerged-index conflict --> SCOPE{Additive conflict in scope?<br/>checks and cheap model configured<br/>attempt unused}
-    SCOPE -- yes --> RESOLVE[One cheap no-tools call<br/>hunk replacements or give_up]
-    SCOPE -- no --> FRESHFB{Still fresh?<br/>sources, parent, reservation<br/>server not stopping}
-    RESOLVE -- give_up, timeout or invalid output --> FRESHFB
-    RESOLVE -- hunk replacements --> VERIFY{Exact line provenance<br/>checks pass candidate<br/>and reject each single side<br/>tree untouched}
-    VERIFY -- no --> FRESHFB
-    VERIFY -- yes --> FRESHOK{Still fresh?}
-    FRESHOK -- no --> STOP
-    FRESHOK -- yes --> CONTINUE[Host stages allowlisted paths<br/>continues cherry-pick without hooks]
-    CONTINUE --> MORE
-    FRESHFB -- no --> STOP
-    FRESHFB -- yes --> FALLBACK[Abort replay; remove temporary bundle<br/>unstage offending task with paths and reason<br/>earlier stack items stay pr_open]
-    FALLBACK --> REVIEW
-    FALLBACK --> REGROUP[One-shot cheap regroup of remaining pool<br/>no automatic publication retry]
-    REGROUP --> POOL
-    MORE -- no --> NET{Net change; all remaining selected<br/>sources and parent fresh; not stopping?}
-    NET -- no --> STOP
-    NET -- yes --> PUSH[Push fresh branch; open PR against base or parent<br/>body: tasks, resolution audit, then template]
-    PUSH --> REMOTE{Remote outcome known?}
-    REMOTE -- no --> AMBIG([Smart: keep intent, adopt owned branch or PR on retry<br/>Manual: report error, tasks stay staged])
-    REMOTE -- yes --> OPEN[Bundle saved; tasks pr_open]
-    OPEN --> NEXT{More confirmed stack items?}
-    NEXT -- yes: next item replays on this PR's head --> BASE
-    NEXT -- no --> POLL{Next PR poll update}
-    POLL -- merged into base --> DONE([Tasks done; findings resolved])
-    POLL -- stacked child merged into parent branch --> PARENT{Parent PR outcome?}
-    PARENT -- parent still open --> WAIT
-    PARENT -- parent merged and done --> DONE
-    PARENT -- parent closed --> REVIEW
-    POLL -- closed --> REVIEW
-    POLL -- open, babysit off --> WAIT[Wait for next poll update]
-    POLL -- open, babysit on --> READY{Ready to merge?<br/>CI pass, APPROVED, MERGEABLE}
-    READY -- yes --> READYEND([Babysit cycle ends: babysit off<br/>human merges on GitHub])
-    READY -- no --> OWN{Author is current gh user?<br/>healthy update resets attempts}
-    OWN -- no or unknown --> OBS[Observe-only status; no agent]
-    OWN -- yes --> TRIG{New trigger since previous state?}
-    TRIG -- no --> WAIT
-    TRIG -- yes --> BUDGETFIX{fix_attempts >= 3?}
-    BUDGETFIX -- yes --> GAVEUP([Babysit cycle ends: babysit off<br/>gave up, human attention])
-    BUDGETFIX -- no --> LIVE{PR task worker live?<br/>queued, running or needs_input}
-    LIVE -- yes --> INPROGRESS[Status: fix in progress<br/>no new worker, attempts unchanged]
-    LIVE -- no --> FIX[Resume or start one babysit worker<br/>fix_attempts += 1]
-    INPROGRESS --> WAIT
-    FIX --> WAIT
-    OBS --> WAIT
+    POOL -->|Human confirms selection| COMPOSE[[Composition subchart]]
+    COMPOSE -->|Published tasks pr_open| POLL{PR poll or settlement update}
+    COMPOSE -->|Unresolved conflict: offending task| REVIEW
+    COMPOSE -->|Unpublished tasks: regroup or resolve error<br/>fresh human selection required| POOL
+    POLL -->|Open| BABYSIT[[Babysitting subchart]]
+    BABYSIT --> WAIT[Wait for next poll update]
     WAIT --> POLL
-    READYEND -.->|PR still polled| POLL
-    GAVEUP -.->|PR still polled| POLL
+    POLL -->|Closed| REVIEW
+    POLL -->|Merged into base| DONE([Tasks done; findings resolved])
+    POLL -->|Stacked child merged into parent| PARENT{Parent chain outcome?}
+    PARENT -->|Still open or awaiting settlement| WAIT
+    PARENT -->|Merged and done| DONE
+    PARENT -->|Closed| REVIEW
 ```
 
-A merged stacked child waits for its parent's outcome (see "Settlement"); a closed PR returns its tasks to review rather than ending them; a babysat PR's live worker is cancelled at ready-to-merge and at retirement. Merged and closed PRs end the lifecycle; the babysit cycle's details are under "PRs".
+#### Composition subchart
+
+Entry: a human-confirmed selection. A manual combined PR replays all selected tasks into one branch; the stacked API publishes one task per branch, then starts the next item from the newly published parent. Successfully opened items remain `pr_open` if a later item fails. Ambiguous remote outcomes require reconciliation before another confirmed attempt, not conflict unstaging.
+
+```mermaid
+flowchart TD
+    SELECT[Confirmed selection] --> RESERVE[Reserve tasks; pin source heads<br/>one resolver-call budget for entire publication]
+    RESERVE --> BASE[Fetch base or verify stack parent<br/>pin validators at immutable start<br/>create temporary composition branch]
+    BASE --> PICK[Cherry-pick next pinned commit<br/>manual: tasks in staging order<br/>stacked: current task only]
+    PICK --> RESULT{Replay result?}
+    RESULT -->|Applied or empty commit dropped| MORE{More commits for this PR?}
+    MORE -->|Yes| PICK
+    RESULT -->|Non-conflict Git failure| STOP
+    RESULT -->|Unmerged-index conflict| RESOLVER[[Conflict-resolution subchart]]
+    RESOLVER -->|Resolved and continued| MORE
+    RESOLVER -->|Operational drift or shutdown| STOP
+    RESOLVER -->|Give up| CLEAN[Abort replay; remove temporary bundle]
+    CLEAN --> FRESH{Remaining sources, parent and<br/>reservation fresh; not stopping?}
+    FRESH -->|No| STOP
+    FRESH -->|Yes| FALLBACK([Unstage only offending task with reason<br/>regroup remaining pool; return to core loop])
+    MORE -->|No| NET{Net change and fresh<br/>before push; not stopping?}
+    NET -->|No| STOP
+    NET -->|Yes| PUSH[Push branch; open PR against base or parent<br/>body: tasks, resolution audit, then template]
+    PUSH --> REMOTE{Remote outcome known?}
+    REMOTE -->|No| AMBIG([Stop and report ambiguity<br/>smart: preserve intent for reconciliation<br/>manual: no durable intent recovery])
+    REMOTE -->|Yes| OPEN[Save bundle; included tasks pr_open]
+    OPEN --> NEXT{More confirmed stack items?}
+    NEXT -->|Yes: use this PR as parent| BASE
+    NEXT -->|No| RETURN([Return published PRs to core loop])
+    STOP([Remove owned temporary bundle<br/>unpublished tasks stay staged; report error])
+```
+
+#### Conflict-resolution subchart
+
+Entry: a genuine cherry-pick conflict in an unpublished composition. `Resolved` resumes the same replay; `Give up` returns to composition cleanup and its final freshness gate before unstaging. Drift or shutdown returns an ordinary error, never a give-up. The detailed scope and validation contract follows these charts.
+
+```mermaid
+flowchart TD
+    CONFLICT[Unmerged-index conflict] --> SCOPE{Additive conflict within limits?<br/>cheap model, checks and immutable validators<br/>configured; publication attempt unused?}
+    SCOPE -->|No| DECLINE([Give up with reason])
+    SCOPE -->|Yes| MODEL[One cheap no-tools call<br/>host-issued hunks only; bounded time and output]
+    MODEL --> SNAPSHOT{Composition and validators unchanged?<br/>sources fresh; not stopping?}
+    SNAPSHOT -->|No| ERROR([Operational error; keep tasks staged])
+    SNAPSHOT -->|Yes| REPLY{Valid resolved reply?}
+    REPLY -->|Give up, failed run, timeout or invalid output| DECLINE
+    REPLY -->|Yes| LINES{Exactly both sides' lines<br/>each side in order; no invented content?}
+    LINES -->|No| DECLINE
+    LINES -->|Yes| CHECK[Run focused checks on each single side<br/>and candidate within one aggregate budget]
+    CHECK --> INTACT{Composition and validators unchanged?<br/>sources and parent fresh; not stopping?}
+    INTACT -->|No| ERROR
+    INTACT -->|Yes| PASS{Candidate passes every check<br/>each single side fails at least one?}
+    PASS -->|No, or checks cannot complete| DECLINE
+    PASS -->|Yes| CONTINUE[Host confirms only allowed staged replacements<br/>cherry-pick --continue without hooks]
+    CONTINUE -->|Success| RESOLVED([Resolved; return to composition])
+    CONTINUE -->|Failure| LAST{Still fresh; not stopping?}
+    LAST -->|No| ERROR
+    LAST -->|Yes| DECLINE
+```
+
+#### Babysitting subchart
+
+Entry: a PR poll update (or explicit switch-on). Every waiting outcome returns to the core loop for the **next external poll**, not another immediate fix. Ready, disabled and exhausted-budget outcomes end babysitting but do not stop PR polling; only retirement ends this PR's polling lifecycle. Retirement and ready-to-merge cancel a live babysit worker; disabling alone does not.
+
+```mermaid
+flowchart TD
+    UPDATE[PR update] --> RETIRED{Merged or closed?}
+    RETIRED -->|Yes| END([End babysitting; return for settlement])
+    RETIRED -->|No| ENABLED{Babysit enabled?}
+    ENABLED -->|No| OFF([No launches; return to core loop])
+    ENABLED -->|Yes| READY{CI pass, APPROVED, MERGEABLE?}
+    READY -->|Yes| READYEND([Disable babysit: ready to merge<br/>human merges on GitHub])
+    READY -->|No| HEALTH[Healthy update resets fix_attempts]
+    HEALTH --> OWN{Author is current gh user?}
+    OWN -->|No or unknown| OBS[Observe-only; no agent]
+    OWN -->|Yes| TRIG{New trigger since previous state?}
+    TRIG -->|No| WAIT([Return; wait for next poll update])
+    TRIG -->|Yes| BUDGET{fix_attempts >= 3?}
+    BUDGET -->|Yes| GAVEUP([Disable babysit: gave up<br/>human attention required])
+    BUDGET -->|No| LIVE{PR task worker live?<br/>queued, running or needs_input}
+    LIVE -->|Yes| INPROGRESS[Fix in progress; attempts unchanged]
+    LIVE -->|No| FIX[Start or resume worker; fix_attempts += 1]
+    OBS --> WAIT
+    INPROGRESS --> WAIT
+    FIX --> WAIT
+```
+
+#### Resolver contract
 
 **Why this narrow resolver.** The user needs cheap resolution of the common case where two staged tasks add lines at the same spot (imports, list entries, tests, docs), not a general merge agent. The host therefore extracts the conflict hunks itself and the model only decides how the two sides' added lines interleave; replacements of host-issued hunk ids replace a free-form patch, so the model controls no paths, metadata or nonconflicting content. Anything else gives up, which is a valid outcome that costs at most one cheap call.
 
