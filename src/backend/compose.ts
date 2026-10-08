@@ -5,6 +5,7 @@ import type { Db } from "../db.ts";
 import { runPiPrint } from "../plugins/llm-scan.ts";
 import { prRetired } from "../prs/poller.ts";
 import { BundleConflict, listBundles, openStackedBundle, recoverIntent, saveBundle, StaleIntent, verifyParent, type PublishIntent } from "../runner/bundle.ts";
+import type { ConflictSession } from "../runner/resolve.ts";
 import type { TaskRunner } from "../runner/runner.ts";
 import { HttpError } from "../server/backend.ts";
 import type { ApiComposition, Bundle, Cache, CompositionGroup, CompositionProposal, Config, ServerEvent, Task } from "../types.ts";
@@ -146,6 +147,33 @@ export class Composer {
     return this.opts.cache.get<PublishIntent | null>(INTENTS, taskId) != null;
   }
 
+  /**
+   * The conflict resolver's view of a running publication: its one shared attempt, shutdown, and the freshness of the
+   * pinned `heads` (and the stack `parent`), which must hold before any resolver outcome counts and before every push.
+   * `heads` may shrink as tasks get published; the local checks repeat after the parent check's wait.
+   */
+  conflictSession(project: string, heads: Record<string, string>, budget: { spent: boolean }, parent?: Bundle): ConflictSession {
+    return {
+      budget,
+      signal: this.stopRuns.signal,
+      refresh: async () => {
+        const local = () => {
+          this.stopRuns.signal.throwIfAborted();
+          for (const [id, head] of Object.entries(heads)) {
+            const task = this.opts.runner().get(id);
+            if (!this.reserved.has(id) || task?.project !== project || task.state !== "staged") throw new Error(`task ${id} is no longer reserved and staged in this project`);
+            if (revParse(this.opts.repoRoot, task.branch) !== head) throw new Error(`task ${id} (${task.title}) changed during publication (stale); every task stays staged`);
+          }
+        };
+        local();
+        if (parent) {
+          await verifyParent(this.opts.repoRoot, parent);
+          local();
+        }
+      },
+    };
+  }
+
   /** Called only inside the publication reservation, before a conflict has any remote side effect. */
   recoverConflict(project: string, conflict: BundleConflict): string {
     const task = this.opts.runner().get(conflict.taskId);
@@ -189,13 +217,16 @@ export class Composer {
         }
         this.announce(project);
         const bundleIds: string[] = [];
+        const resolverBudget = { spent: false };
+        const unpublished = { ...proposal.heads };
         let error: string | undefined;
         let conflict = false;
         try {
           for (const group of proposal.groups) {
             let parent = group.parent ? await this.verifiedTip(project, group.parent) : undefined;
             for (const taskId of group.taskIds) {
-              parent = await this.publishTask(project, taskId, proposal.heads[taskId], parent);
+              parent = await this.publishTask(project, taskId, unpublished, parent, resolverBudget);
+              delete unpublished[taskId];
               bundleIds.push(parent.id);
             }
           }
@@ -379,9 +410,10 @@ export class Composer {
     return tip;
   }
 
-  /** Publish (or recover an earlier attempt of) one task on top of `parent`, then record it at once. */
-  private async publishTask(project: string, taskId: string, head: string, parent: Bundle | undefined): Promise<Bundle> {
+  /** Publish (or recover an earlier attempt of) one task on top of `parent`, then record it at once; `unpublished` pins every remaining task's head. */
+  private async publishTask(project: string, taskId: string, unpublished: Record<string, string>, parent: Bundle | undefined, resolverBudget: { spent: boolean }): Promise<Bundle> {
     const { repoRoot, config, cache, db } = this.opts;
+    const head = unpublished[taskId];
     const task = this.opts.runner().get(taskId);
     if (!task || task.state !== "staged") throw new Error(`task ${taskId} is no longer staged`);
     if (revParse(repoRoot, task.branch) !== head) throw new Error(`task ${taskId} (${task.title}) changed since grouping (stale); group again`);
@@ -410,6 +442,7 @@ export class Composer {
       ...(parent && { parent }),
       findingTitles: this.opts.findingTitles(project),
       journal: (next) => cache.set(INTENTS, taskId, next),
+      session: this.conflictSession(project, unpublished, resolverBudget, parent),
     });
     this.opts.runner().bundled([taskId], bundle.id, bundle.pr, () => {
       saveBundle(db, bundle!);

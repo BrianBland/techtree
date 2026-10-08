@@ -265,9 +265,10 @@ export interface Config {
   defaultModel?: string; // start-dialog prefill, "provider/id"
   titleModel?: string; // combined PR titles, "provider/id"; unset = defaultModel
   groupModel?: string; // smart PR grouping, "provider/id"; unset = titleModel
-  refineModel?: string;
+  refineModel?: string; // "Refine with agent" model, "provider/id"; unset = defaultModel
   pruneOnIdle?: string[]; // worktree-relative paths deleted when a worker run ends
- // "Refine with agent" model, "provider/id"; unset = defaultModel
+  conflictChecks?: string[][]; // user config only: argv of focused checks that let the conflict resolver accept a resolution
+  conflictValidators?: string[]; // user config only: repo-relative files or directories the checks depend on, pinned before replay
   openBrowser?: boolean; // /techtree opens the UI in the default browser (default true)
   terminal?: string[]; // "Open in terminal" argv template with {cwd} and {command}; unset = platform default
   ignore: string[]; // path prefixes or globs excluded from the tree

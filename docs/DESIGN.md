@@ -462,38 +462,9 @@ Each open PR becomes a `PrState`, persisted in the `prs` table (keeping `babysit
 
 **Flags** (injectable clock). *Progress* is a new head commit, a `ci` change, a `review` change or a `reviewCount` change; it sets `last_progress_at` to now. A PR first seen starts with `last_progress_at` = its `updatedAt`. `stale` = now − `updatedAt` ≥ 3 days; `stuck` = now − `last_progress_at` ≥ 24 h.
 
-**Babysit** (`Babysitter`). `setBabysit(number, on)` toggles it per PR (async; unknown PR → error); switching on resets `fix_attempts` to 0, looks the current gh user up again, and immediately evaluates the PR's current state. On each poll update of a babysat PR:
+**Babysit** (`Babysitter`). `setBabysit(number, on)` toggles it per PR (async; unknown PR → error); switching on resets `fix_attempts` to 0, looks the current gh user up again, and immediately evaluates the PR's current state. Each poll update of a babysat PR walks the babysit cycle of the PR lifecycle chart under "Combined-PR creation and bounded conflict resolution": retirement, disabled babysitting, ready-to-merge, observe-only, a new trigger, the attempt budget and an existing live worker, in that order.
 
-```mermaid
-flowchart TD
-  U[Next PR poll update or switch-on] --> S{PR still open and babysit on?}
-  S -- merged or closed --> END([Cancel live fix; tracking retired])
-  S -- babysit disabled --> OFF([No further babysit launches])
-  S -- yes --> R{Ready to merge?<br/>CI pass + APPROVED + MERGEABLE}
-  R -- yes --> READY([Cancel live fix; babysit off<br/>Human merges on GitHub])
-  R -- no --> H{Healthy update?<br/>CI pass; no conflict or changes requested}
-  H -- yes --> RESET[Reset fix_attempts to 0]
-  H -- no --> O{Author is current gh user?}
-  RESET --> O
-  O -- no or unknown user --> OBS[Observe-only status; no agent]
-  O -- yes --> T{New trigger since previous state?<br/>On switch-on: current failing conditions}
-  T -- no --> WAIT[Wait for next PR update]
-  T -- yes --> A{fix_attempts >= 3?}
-  A -- yes --> GIVEUP([Babysit off: gave up<br/>Human attention required])
-  A -- no --> L{PR task live?<br/>queued / running / needs_input}
-  L -- yes --> LIVE[Status: fix in progress<br/>Do not launch another worker]
-  L -- no --> P{PR task pr_open with worktree?}
-  P -- yes --> RES[Resume task with babysit prompt]
-  P -- no --> NEW[Start babysit task for this PR]
-  RES --> INC[fix_attempts += 1<br/>Record fix-attempt status]
-  NEW --> INC
-  INC --> WAIT
-  LIVE --> WAIT
-  OBS --> WAIT
-  WAIT --> U
-```
-
-The back edges wait for an external poll update; they are not immediate retries. A completed/failed worker does not itself launch the next attempt, and unchanged failing conditions are not a new trigger. Waiting, observe-only and fix-in-progress are nonterminal. Ready-to-merge, exhausted attempts, disabled babysitting and PR retirement end this babysitting cycle; only a healthy update or explicit switch-on resets the attempt budget. Disabling babysitting prevents further launches but does not itself cancel a live worker.
+The cycle's back edges wait for an external poll update; they are not immediate retries. A completed/failed worker does not itself launch the next attempt, and unchanged failing conditions are not a new trigger. Waiting, observe-only and fix-in-progress are nonterminal. Ready-to-merge, exhausted attempts, disabled babysitting and PR retirement end this babysitting cycle; only a healthy update (CI pass, no conflict, no changes requested) or explicit switch-on resets the attempt budget. Disabling babysitting prevents further launches but does not itself cancel a live worker.
 
 - **Triggers** compare with the previous state (on switch-on: CI failing, changes requested or conflict as they are now): `ci` turns `fail`; `review` turns `CHANGES_REQUESTED`; `reviewCount` grows; `mergeable` turns `CONFLICTING`.
 - **Failed attempts.** `fix_attempts` counts launches since the PR was last healthy (`ci` pass, no conflict, no changes requested); a healthy update resets it to 0, so only consecutive unsuccessful fixes use up the budget of 3.
@@ -507,66 +478,111 @@ The back edges wait for an external poll update; they are not immediate retries.
 
 To avoid many small PRs, reviewed tasks can be *staged* and several opened as one combined PR.
 
-```mermaid
-stateDiagram-v2
-    review --> staged: Stage
-    staged --> review: Unstage
-    staged --> pr_open: Open combined PR (bundle)
-    pr_open --> done: bundle PR merged
-    pr_open --> review: bundle PR closed
-```
+Staging moves a task `review` → `staged` (Unstage moves it back); opening a combined PR moves its tasks to `pr_open`; a merged bundle PR makes them `done` and a closed one returns them to `review`. The PR lifecycle chart under "Combined-PR creation and bounded conflict resolution" shows all of these transitions.
 
 - **Stage** (`review` → `staged`, new `TaskState`) records `stagedAt`; **Unstage** returns the task to `review` and clears it. Staged tasks keep their worktree and branch, are not attention items, and can still be discarded.
 - **UI.** New change tasks show an unchecked **Open PR automatically** option (`manualReview: true` by default, independent of suggestion heuristics). The overview has a **Staged** section per project, all **unchecked** by default, including tasks staged while the section is open. Smart grouping is advisory and visual: suggested groups show their rationale and individual task checkboxes, with **Select group** / **Deselect group** shortcuts. Humans can combine any selected tasks across groups into one **Open combined PR**, targeting the configured base branch. Grouping and regrouping never select tasks or publish PRs automatically. Stale suggestions fall back to the full staged list until refreshed; removed tasks lose their selection, and newly staged tasks remain unchecked.
 - **Open combined PR** (`POST /api/bundles`), with the selected tasks taken in staging order:
   1. The base: `<b>` = `git rev-parse --abbrev-ref <baseRef>` in the main checkout. When that names a branch and the repo has a remote (`origin`, else the first one), `git fetch <remote> <b>` and start from `<remote>/<b>`; otherwise start from the local `baseRef`.
   2. A fresh worktree (`worktreeTemplate` with `{task}` = `bundle-<id>`) on a new branch `techtree/bundle-<id>` from that start.
-  3. For each task, every non-merge commit in `$(git merge-base <baseRef> <branch>)..<branch>`, oldest first, is cherry-picked; commits that change nothing are skipped (and commits that become empty are dropped, `--empty=drop`).
-  4. On cherry-pick failure: abort and remove the temporary bundle worktree/branch. A real unmerged-index conflict identifies the offending task and paths, automatically returns only that task to `review`, clears its staging timestamp and persists a reason in `Task.error`; its original branch/worktree are kept. Other tasks stay staged. The request fails with 409 and regrouping refreshes the remaining pool, but no modified publication is retried automatically. Non-conflict git failures leave every task staged and fail with 502.
-  5. `git push -u <remote> <bundle branch>`, then `gh pr create --head <bundle branch> --title <title> --body <body>` (plus `--base <b>` when the base is a branch), in the bundle worktree. The default title is the task's title for one task; for several, a cheap model writes one: `<piCommand> -p --no-session --no-tools [--model <titleModel or defaultModel>]` with the tasks' titles and nodes, asked for a single conventional PR title of at most 72 characters (first line of the reply, quotes and fences stripped, cut to 72), timeout 60 s; when that fails or replies nothing, `<first title> (+N more)`. The body lists each task (`- **<title>** (<node or root>): <findings' titles or "no findings"> — <subject of the task branch's last commit>`), followed by the repo's PR template when one exists (`.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, `docs/pull_request_template.md`, `PULL_REQUEST_TEMPLATE.md`, `pull_request_template.md`, any case), so the template's sections and trailing metadata come last. The PR number is read from the `…/pull/<n>` URL gh prints.
+  3. For each task, every non-merge commit in `$(git merge-base <baseRef> <head>)..<head>`, oldest first, is cherry-picked, where `<head>` is the task branch's commit pinned when the request arrived; commits that change nothing are skipped (and commits that become empty are dropped, `--empty=drop`). A replay with no net change against its start fails before pushing.
+  4. A genuine unmerged-index conflict first goes to the bounded resolver (below). When it gives up: abort and remove the temporary bundle worktree/branch, automatically return only the offending task to `review`, clear its staging timestamp and persist the conflict paths and give-up reason in `Task.error`; its original branch/worktree are kept. Other tasks stay staged. The request fails with 409 and regrouping refreshes the remaining pool, but no modified publication is retried automatically. Non-conflict git failures, changed source heads and shutdown leave every task staged and fail with 502.
+  5. `git push -u <remote> <bundle branch>`, then `gh pr create --head <bundle branch> --title <title> --body <body>` (plus `--base <b>` when the base is a branch), in the bundle worktree. The default title is the task's title for one task; for several, a cheap model writes one: `<piCommand> -p --no-session --no-tools [--model <titleModel or defaultModel>]` with the tasks' titles and nodes, asked for a single conventional PR title of at most 72 characters (first line of the reply, quotes and fences stripped, cut to 72), timeout 60 s; when that fails or replies nothing, `<first title> (+N more)`. The body lists each task (`- **<title>** (<node or root>): <findings' titles or "no findings"> — <subject of the task's pinned head>`), then the audit of an automatic conflict resolution when there was one, followed by the repo's PR template when one exists (`.github/pull_request_template.md`, `.github/PULL_REQUEST_TEMPLATE.md`, `docs/pull_request_template.md`, `PULL_REQUEST_TEMPLATE.md`, `pull_request_template.md`, any case), so the template's sections and trailing metadata come last. The PR number is read from the `…/pull/<n>` URL gh prints.
   6. The bundle is recorded in the `bundles` table: `Bundle { id, project, title, branch, worktree, taskIds, pr, url, createdAt }`. Every included task moves to `pr_open` with `pr` = the bundle's PR number and `bundle` = its id. Task worktrees and branches are kept.
 - **Follow-up.** The bundle PR is polled like task PRs (its tasks are `pr_open` with its number), but it is never linked to those tasks (`PrState.taskId` skips tasks with a `bundle`), and a bundled `pr_open` task cannot be resumed by chat or `resumeTask` (409): each task's worktree holds only its own change. Babysit on a bundle PR therefore starts a new babysit task that checks the combined PR out. A bundle PR belongs to its bundle's project. After every successful poll, each bundle whose PR is retired (seen merged or closed, see "PRs") while one of its tasks is still `pr_open` is settled by `gh pr view <n> --json state`: `MERGED` → its tasks become `done` and their findings get `resolved_at`; `CLOSED` → its tasks return to `review` (`pr` and `bundle` cleared); a failed lookup (or `OPEN`) changes nothing and is retried after the next poll. Single-task "Open PR" is unchanged.
 
 ### Combined-PR creation and bounded conflict resolution
 
-> **Design target, not an implementation diagram:** manual combined PRs and immediate conflict unstaging/regrouping exist today. The cheap resolver, pinned-source/net-change validation for manual bundles and durable manual-publication recovery in the expanded flow below are proposed requirements. Until the resolver exists, every genuine cherry-pick conflict takes the give-up/unstage path directly. Dashed edges highlight the new resolver path; this documentation change does not enable an agent.
+This is the single PR-lifecycle chart: staging, advisory grouping, replay of a confirmed selection with the bounded conflict resolver and its fallback, publication, and the babysit cycle until a terminal outcome. Manual combined PRs (`POST /api/bundles`) and confirmed stacked publications share the replay, resolver and fallback path; a stacked item replays onto its parent's head and targets the parent's branch.
 
 ```mermaid
 flowchart TD
-    POOL[Staged independent changes, unchecked] --> GROUP[Cheap read-only grouping<br/>Visual suggestions only]
+    REVIEW[Task in review<br/>independent branch and worktree] -->|Stage| POOL[Staged, unchecked]
+    POOL -->|Unstage| REVIEW
+    POOL -->|Debounce or Smart group| GROUP[Cheap read-only grouping<br/>visual suggestions only]
+    GROUP -->|Pool or parent changed| POOL
     GROUP --> SELECT[Human selects or adjusts changes<br/>Open combined PR]
     POOL -->|Manual selection without grouping| SELECT
-    SELECT --> RESERVE[Reserve selected tasks; validate membership and heads]
-    RESERVE --> BASE[Fetch latest base; create temporary bundle branch and worktree]
-    BASE --> PICK[Cherry-pick next selected commit<br/>Tasks in staging order; commits oldest first]
+    SELECT --> RESERVE[Reserve selected tasks; pin source heads<br/>One resolver attempt for this publication]
+    RESERVE --> BASE[Fetch latest base or verified parent<br/>temporary bundle branch and worktree]
+    BASE --> PICK[Cherry-pick next selected commit<br/>tasks in staging order, commits oldest first]
     PICK --> RESULT{Replay result?}
     RESULT -- applied or empty commit dropped --> MORE{More selected commits?}
     MORE -- yes --> PICK
-    MORE -- no --> NET{Publishable net change?}
-    NET -- yes --> TITLE[Cheap combined-title model or fallback title<br/>PR body lists selected tasks and resolution evidence]
-    NET -- no --> STOP([Stop without a PR; leave tasks staged])
-    RESULT -- non-conflict Git failure --> STOP
-    RESULT -- genuine unmerged-index conflict --> BUDGET{Simple conflict within scope?<br/>Cheap model configured; attempt budget unused}
-    BUDGET -. yes: proposed .-> RESOLVE[One cheap no-tools resolver call<br/>Resolved patch or give_up]
-    BUDGET -- no --> FALLBACK[Abort replay; remove temporary bundle only<br/>Unstage offending task with reason<br/>Preserve original worktree and branch]
-    RESOLVE -. give_up, timeout or invalid output .-> FALLBACK
-    RESOLVE -. resolved patch .-> VERIFY{Host checks scope, intent and resolution<br/>No markers or unmerged paths; focused checks pass?}
-    VERIFY -. no or uncertain .-> FALLBACK
-    VERIFY -. yes .-> CONTINUE[Host stages allowed paths and continues cherry-pick<br/>Same confirmed selection; no new tasks]
-    CONTINUE -. proposed .-> MORE
-    FALLBACK --> REGROUP[Regroup remaining staged pool with cheap model<br/>No automatic publication retry]
+    RESULT -- non-conflict Git failure --> STOP([Remove temporary bundle<br/>every task stays staged])
+    RESULT -- genuine unmerged-index conflict --> SCOPE{Additive conflict in scope?<br/>checks and cheap model configured<br/>attempt unused}
+    SCOPE -- yes --> RESOLVE[One cheap no-tools call<br/>hunk replacements or give_up]
+    SCOPE -- no --> FRESHFB{Still fresh?<br/>sources, parent, reservation<br/>server not stopping}
+    RESOLVE -- give_up, timeout or invalid output --> FRESHFB
+    RESOLVE -- hunk replacements --> VERIFY{Exact line provenance<br/>checks pass candidate<br/>and reject each single side<br/>tree untouched}
+    VERIFY -- no --> FRESHFB
+    VERIFY -- yes --> FRESHOK{Still fresh?}
+    FRESHOK -- no --> STOP
+    FRESHOK -- yes --> CONTINUE[Host stages allowlisted paths<br/>continues cherry-pick without hooks]
+    CONTINUE --> MORE
+    FRESHFB -- no --> STOP
+    FRESHFB -- yes --> FALLBACK[Abort replay; remove temporary bundle<br/>unstage offending task with paths and reason<br/>earlier stack items stay pr_open]
+    FALLBACK --> REVIEW
+    FALLBACK --> REGROUP[One-shot cheap regroup of remaining pool<br/>no automatic publication retry]
     REGROUP --> POOL
-    TITLE --> PUSH[Push fresh combined branch; open one PR against base]
+    MORE -- no --> NET{Net change; all remaining selected<br/>sources and parent fresh; not stopping?}
+    NET -- no --> STOP
+    NET -- yes --> PUSH[Push fresh branch; open PR against base or parent<br/>body: tasks, resolution audit, then template]
     PUSH --> REMOTE{Remote outcome known?}
-    REMOTE -- yes --> OPEN([Persist bundle and selected tasks as pr_open<br/>Human reviews and merges])
-    REMOTE -- no --> RECOVER([Keep recovery state; reconcile owned branch/PR<br/>Do not unstage or duplicate on ambiguity])
+    REMOTE -- no --> AMBIG([Smart: keep intent, adopt owned branch or PR on retry<br/>Manual: report error, tasks stay staged])
+    REMOTE -- yes --> OPEN[Bundle saved; tasks pr_open]
+    OPEN --> NEXT{More confirmed stack items?}
+    NEXT -- yes: next item replays on this PR's head --> BASE
+    NEXT -- no --> POLL{Next PR poll update}
+    POLL -- merged into base --> DONE([Tasks done; findings resolved])
+    POLL -- stacked child merged into parent branch --> PARENT{Parent PR outcome?}
+    PARENT -- parent still open --> WAIT
+    PARENT -- parent merged and done --> DONE
+    PARENT -- parent closed --> REVIEW
+    POLL -- closed --> REVIEW
+    POLL -- open, babysit off --> WAIT[Wait for next poll update]
+    POLL -- open, babysit on --> READY{Ready to merge?<br/>CI pass, APPROVED, MERGEABLE}
+    READY -- yes --> READYEND([Babysit cycle ends: babysit off<br/>human merges on GitHub])
+    READY -- no --> OWN{Author is current gh user?<br/>healthy update resets attempts}
+    OWN -- no or unknown --> OBS[Observe-only status; no agent]
+    OWN -- yes --> TRIG{New trigger since previous state?}
+    TRIG -- no --> WAIT
+    TRIG -- yes --> BUDGETFIX{fix_attempts >= 3?}
+    BUDGETFIX -- yes --> GAVEUP([Babysit cycle ends: babysit off<br/>gave up, human attention])
+    BUDGETFIX -- no --> LIVE{PR task worker live?<br/>queued, running or needs_input}
+    LIVE -- yes --> INPROGRESS[Status: fix in progress<br/>no new worker, attempts unchanged]
+    LIVE -- no --> FIX[Resume or start one babysit worker<br/>fix_attempts += 1]
+    INPROGRESS --> WAIT
+    FIX --> WAIT
+    OBS --> WAIT
+    WAIT --> POLL
+    READYEND -.->|PR still polled| POLL
+    GAVEUP -.->|PR still polled| POLL
 ```
 
-- **Cheap and decisive.** Use one explicitly configured cheap model (`groupModel`, else `titleModel`), never pi's default or an automatic escalation to a stronger model. Permit at most **one resolver invocation per human-confirmed publication attempt**, with a **60 s model timeout**, a **32 KiB input cap** and a **64 KiB output cap**. No repair prompts, recursive agent calls or self-directed retries. A second conflict, absent model or exhausted budget goes straight to the unstaging fallback. Giving up is a successful, valid resolver outcome, not an agent failure.
-- **Narrow evidence and authority.** The host supplies only the failing commit's intent/diff and the base/ours/theirs content needed for at most **three conflicted text files and 200 conflicting lines** in total. File paths and repository text are untrusted data. If complete relevant context exceeds the caps, decline rather than truncate important evidence or search the repository. Binary, rename/delete or modify/delete conflicts, dependency/lockfile conflicts, and fixes requiring a new design choice are outside this simple resolver's scope. The agent runs with `--no-tools`, cannot edit files or run shell commands, and returns strict JSON: `{"outcome":"resolved","patch":"<bounded patch>","reason":"<short explanation>"}` or `{"outcome":"give_up","reason":"<short explanation>"}`. No external worktree, branch, push or PR access.
-- **Host verification, not confidence alone.** The host applies a returned patch only to the allowlisted conflicted paths in the temporary bundle worktree; reject path traversal, symlink escapes, unrelated-file edits and changes to already-applied non-conflicting content. Verify it preserves both the selected task's intent and relevant base-side changes, has no conflict markers, and leaves no unmerged index entries after the host stages resolved paths. Run existing focused checks for the affected change with a **60 s validation budget**, not full CI or newly invented tests; check commands are host-selected, never supplied by the model. If suitable checks or convincing intent evidence are unavailable, give up. Invalid output, uncertain semantics, failing checks or an incomplete cherry-pick continuation take the same fallback. The host, not the agent, stages and continues the cherry-pick. A verified simple resolution may continue the original confirmed publication, but must not change the selected task set or silently discard a task's intent; the PR body records the resolution and check evidence.
-- **Fallback remains first-class.** Abort the temporary replay, unstage only the offending task (`staged` → `review`, the unstaged task pool), preserve its independent source branch/worktree, and persist the conflict paths and give-up reason. All other unpublished tasks remain staged, and previously opened PRs in a stacked publication stay open. Regrouping is advisory and preserves the existing cheap-model constraints; without a configured model it asks for Smart group instead. The user must select/confirm a new publication attempt. Never resurrect obsolete/deleted code, resolve ambiguity by dropping a side, delete a source task, or treat authentication/network/persistence failures as merge conflicts.
-- **Publication boundary.** Resolution is allowed only before pushing the current composition branch, under the existing task reservation and pinned-source/parent freshness checks. Never rewrite an existing published PR to resolve a composition conflict. Push/PR-create ambiguity remains a separate reconciliation problem, not a reason to send tasks back to review. Durable intent recovery for manual combined PRs is also a design requirement of this expanded flow; the current runtime journals only smart stacked publication intents.
+A merged stacked child waits for its parent's outcome (see "Settlement"); a closed PR returns its tasks to review rather than ending them; a babysat PR's live worker is cancelled at ready-to-merge and at retirement. Merged and closed PRs end the lifecycle; the babysit cycle's details are under "PRs".
+
+**Why this narrow resolver.** The user needs cheap resolution of the common case where two staged tasks add lines at the same spot (imports, list entries, tests, docs), not a general merge agent. The host therefore extracts the conflict hunks itself and the model only decides how the two sides' added lines interleave; replacements of host-issued hunk ids replace a free-form patch, so the model controls no paths, metadata or nonconflicting content. Anything else gives up, which is a valid outcome that costs at most one cheap call.
+
+- **Scope, decided before any model call.** A genuine conflict (nonempty unmerged index after a failed cherry-pick) is eligible only when all of these hold; otherwise the resolver gives up with that reason and makes no model call:
+  - `conflictChecks` (user config only, see "Configuration") is a non-empty list of non-empty argv arrays; `conflictValidators` (user config only) is a valid declaration pinned at the composition's start (below); a cheap model (`groupModel`, else `titleModel`; never `defaultModel` or pi's default) is configured; the publication's single attempt is unused; the platform has process groups (not Windows).
+  - At most **3** unmerged paths. Each has exactly index stages 1, 2 and 3 with one regular-file mode (`100644` or `100755`), and stage 1 is the commit's parent's blob at that path, stage 2 the bundle `HEAD`'s, stage 3 the commit's. This excludes rename/delete, modify/delete, add/add, rename detection, symlinks, submodules and mode changes.
+  - No blob contains a NUL byte or a line that starts like a conflict marker (`<<<<<<<`, `|||||||`, `=======`, `>>>>>>>`), and each is empty or ends with a newline. The path is not a lockfile or dependency manifest (`package-lock.json`, `npm-shrinkwrap.json`, `yarn.lock`, `pnpm-lock.yaml`, `bun.lockb`, `package.json`, `Cargo.lock`, `Cargo.toml`, `go.mod`, `go.sum`, `Gemfile`, `Gemfile.lock`, `poetry.lock`, `Pipfile.lock`, `pyproject.toml`, `uv.lock`, `composer.json`, `composer.lock`, `flake.lock`, `requirements*.txt`, any directory). No `filter`, `merge`, `working-tree-encoding` or `conflict-marker-size` attribute applies. The worktree path is a regular file whose real directory is inside the bundle worktree.
+  - Hunks come from `git merge-file -p --diff3` over the three stage blobs. Taking every hunk's ours side (respectively theirs side) of that output must give the same text as taking the ours (theirs) side of every marker region in the file Git left in the worktree, so the reconstruction matches the replay's nonconflicting content exactly.
+  - Every hunk is **purely additive**: its base lines occur in order inside its ours lines and inside its theirs lines, each at exactly one alignment (leftmost and rightmost match agree). A rewritten or deleted base line, or an ambiguous alignment, gives up.
+  - Every declared validator is unchanged since the composition's start: the index holds exactly the pinned entries (stage 0, same modes and blobs, no added or removed files under a declared directory), tracked files there match the index, each pinned file is a regular file reached through real directories (no symlink alias anywhere on its path), and there are no other files there. A conflict in a validator, or an earlier selected change or a nonconflicting part of this commit that edits, adds or deletes one, gives up, so validator edits are never resolved.
+  - As a supplementary guard, no check argument, read as a path relative to the bundle worktree, names a conflicted file or a directory containing one (`.` names everything). Neither this guard nor the declaration proves completeness; the operator attests it.
+  - At most **200** conflicting lines in total (base + ours + theirs over all hunks), and a prompt of at most **32 KiB**. Evidence is never truncated.
+- **One cheap call.** The prompt (on stdin) holds the task title, the commit subject and, for each hunk, its host id (`h1`, `h2`, …), path, up to 3 nonconflicting lines before and after it, and its base, ours and theirs lines, as JSON data that the prompt says are never instructions. `<piCommand> -p --no-session --no-tools --model <m>` runs in the repo root, timeout **60 s**, output cap **64 KiB**, in its own process group, which is killed and awaited on timeout, cap or shutdown. The reply is exactly one JSON object (a ```` ```json ```` fence is allowed): `{"outcome":"resolved","hunks":[{"id":"h1","lines":["…"]}],"reason":"…"}` or `{"outcome":"give_up","reason":"…"}`, with no other keys (also none besides `id` and `lines` in a hunk), a `reason` of at most 300 characters, every hunk id exactly once and lines without newline characters. No repair prompt, retry or escalation. A failed run, timeout or invalid reply is a give-up.
+- **Exact provenance.** A replacement is accepted only when its lines, as a multiset, equal the hunk's ours lines plus theirs lines minus base lines, and it contains the ours lines in order and the theirs lines in order. So every line comes from one side; nothing is dropped, invented or revived from deleted base text; the model only chooses the interleaving. This is a structural confinement, not proof the result is right: two adjacent additions can still conflict in meaning (two `return`s, duplicate keys, order-sensitive entries).
+- **Declared validators.** `conflictValidators` lists repo-relative literal paths of regular tracked files or directories (no globs, `.`/`..` segments, absolute paths, symlinks anywhere on the path or inside a directory, or submodules). Before any selected task is replayed, the host pins each path's entries (for a directory, its full file inventory) with modes and blobs from the composition's immutable start commit: the fetched base for a manual combined PR, the base or verified parent head for a stacked item. A missing or unsupported path makes the declaration unusable and every conflict gives up without a model call. The host enforces only that this declared closure stays immutable through the replay, the model call, the checks and continuation. The operator attests that the closure is complete: the test files, imported helpers, assertion code, discovery configuration and launcher scripts every configured check depends on. Installed runtimes and toolchains outside the repository are the existing trusted environment. Arbitrary imported dependencies cannot be inferred from argv; a check that discovers tests dynamically needs its whole discovery root declared as a directory, otherwise the operator must not configure it.
+- **Behavioral evidence.** The host writes and stages, in turn, three versions of the conflicted files: ours side only, theirs side only, and the candidate. For each it runs every check, as argv without a shell, in the bundle worktree, in its own process group (killed after each check so no descendant outlives it), with combined output capped at 64 KiB, all within one **60 s** budget. The candidate must make every check exit 0, and each single-side version must make at least one check exit nonzero; an always-passing check therefore cannot authorize a resolution. A timeout, cap, abort or start failure fails. Process-group cleanup starts as soon as the check (or the model's pi) exits, so a background descendant holding its output pipes cannot stall it. Checks are evidence, not proof: the user picks checks that exercise both tasks' intent. The resolver cannot write validator code (replacements contain only the tasks' own lines) and never resolves a conflict that touches the declared validators; how complete that declaration is remains the operator's attestation, and checks do run code the tasks wrote outside it.
+- **Composition stays as replayed.** Before the model call the host records the composition `HEAD`, its branch, the raw index entries (every stage) and the mode and content of every tracked file that differs from the index. After the model wait, whatever its outcome, that record must be unchanged; while a version is staged for the checks, each check must leave the record of that version unchanged; and before continuing, the index and tracked files must equal the first record except that each conflicted path holds exactly one stage-0 entry with its original mode and the resolution's content, matching the worktree, and the declared validators must still be intact. Any other change is operational drift: a plain error that removes the temporary bundle and leaves every unpublished task staged, never a give-up.
+- **Freshness wins.** After the model wait, after the checks, and before every fallback of a conflict the resolver looked at, the host requires that the server is not stopping, every selected task not yet published is still reserved and staged with its source branch at its pinned head, and a stacked parent still verifies (open, recorded branch, head and base, remote branch at that head); shutdown and the local checks are repeated after the parent check's wait. The same check runs after a failed cherry-pick continuation, after a conflict's replay is aborted and its temporary bundle removed (immediately before the unstaging fallback), and immediately before every push, manual or stacked, whether or not a conflict occurred (for a stacked item after its PR body is built and before its intent is journaled). Drift or shutdown is an ordinary error, even when the model also gave up: the temporary bundle is removed, every task stays staged and nothing is unstaged.
+- **Continuing.** The host writes the candidate, stages exactly the conflicted paths, checks that no unmerged entry remains, and runs `git -c core.editor=true -c core.hooksPath=/dev/null cherry-pick --continue`, so repository hooks never run on the resolved tree; a failed continuation falls back. The same confirmed selection continues; a second conflict anywhere in the same publication (any group or stack item) gives up. Every replay, manual or stacked, refuses a net-empty result before pushing.
+- **Audit.** The PR body records each resolution after the task list and before the repository template: `Automatic conflict resolution` with the model, task, commit, paths, the model's reason, the checks run and the note that checks are evidence, not proof. A stacked publication's intent stores that body.
+- **Fallback remains first-class.** Abort the temporary replay, unstage only the offending task (`staged` → `review`), preserve its independent source branch/worktree, and persist the conflict paths and give-up reason in `Task.error`. All other unpublished tasks remain staged, and previously opened PRs in a stacked publication stay open. Regrouping is advisory and preserves the existing cheap-model constraints; without a configured model it asks for Smart group instead. The user must select/confirm a new publication attempt. Never resurrect obsolete/deleted code, resolve ambiguity by dropping a side, delete a source task, or treat authentication/network/persistence failures as merge conflicts.
+- **Publication boundary.** Resolution happens only in the unpublished temporary composition worktree, before its push, under the publication's reservation; `Composer.close` aborts a running model call or check and waits for it before the database closes. Original task branches and existing published PRs are never rewritten. Push/PR-create ambiguity remains a separate reconciliation problem, not a reason to send tasks back to review. Only smart stacked publications journal an intent and recover it; durable intent recovery for manual combined PRs remains a design requirement that is not implemented.
 
 ### Smart PR composition
 
@@ -578,7 +594,7 @@ Independent task branches remain unchanged. Smart grouping provides visual sugge
 - **Published stacks.** Each task in a group becomes its own bundle/PR. The first targets the repository's resolved base branch (normally main); each later task targets the immediately preceding PR branch. Build each composition branch from its parent's current head and replay only that independent task's commits before pushing and opening its PR. This is the non-destructive equivalent of rebasing onto the parent; preserve original task branches/worktrees. Persist parent/base metadata in existing bundle JSON, show links and parent relationships, and reuse normal bundle polling/settlement.
 - **Append, never regroup published PRs.** Existing open same-project stack tips are grouping candidates. Before appending, verify remotely that the parent remains open with the expected branch/head/base; closed, merged, modified or foreign parents fail safely and require regrouping. Never force-push or automatically retarget an existing PR. Manual combined PRs stay independent unless explicitly supported as eligible parents.
 - **Freshness and concurrency.** Snapshot staged tasks, their commit heads, and eligible parent heads. A changed pool, edited branch, unstaged/discarded task or changed parent invalidates the proposal. Serialize composition so simultaneous manual and smart publishing cannot publish a task twice; staging during grouping queues at most one latest run. Pending/running planning must not strand state during shutdown/restart. Empty pools require no model call.
-- **Failure recovery.** Persist each successfully opened PR and transition its task immediately. If a later item conflicts, preserve already-opened parents; the current runtime automatically unstages only the offending task, surfaces the partial result and regroups the remaining pool. The proposed bounded resolver above may first resolve a simple conflict in the unpublished composition worktree; giving up follows the same unstaging fallback. Other failures leave unopened tasks staged. Fresh human confirmation is always required after fallback; recovery never publishes a revised selection. After an ambiguous push/PR-create failure, find and adopt the PR on the owned branch before retrying; never silently duplicate it. Keep recoverable pushed branches rather than deleting published state. No automatic merging, squashing or restacking.
+- **Failure recovery.** Persist each successfully opened PR and transition its task immediately. If a later item conflicts, preserve already-opened parents; the bounded resolver (see "Combined-PR creation and bounded conflict resolution") may first resolve a simple additive conflict in the unpublished composition worktree, with one attempt shared by every group and item of the publication; when it gives up, only the offending task is automatically unstaged, the partial result is surfaced and the remaining pool regrouped. Other failures leave unopened tasks staged. Fresh human confirmation is always required after fallback; recovery never publishes a revised selection. After an ambiguous push/PR-create failure, find and adopt the PR on the owned branch before retrying; never silently duplicate it. Keep recoverable pushed branches rather than deleting published state. No automatic merging, squashing or restacking.
   Recovery must match the confirmed source head and parent; changed work first reconciles the earlier owned branch without creating a PR. An existing open PR blocks changed work until the human closes or reconciles it; an unpublished or retired intent is cleared and requires another fresh confirmation. Manual combined publication refuses unresolved smart intents. Disabling automatic grouping cancels queued automatic reruns, but preserves an explicitly requested run. A replay with an unchanged resulting tree fails before pushing, even when commits cancel each other. Publication results remain visible after the staged pool empties, and settlement announces refreshed stack state.
   Grouping sends its prompt over Pi's native piped stdin (not a large argv argument) and stops the process if combined stdout/stderr exceeds 64 KiB.
   Each opened bundle, persisted task transition and intent removal commit together; task events follow the commit. If local persistence fails, the staged state and recovery intent remain intact, so the already-opened PR can be adopted rather than duplicated.
@@ -596,7 +612,7 @@ Contract details (`src/backend/compose.ts`, `src/runner/bundle.ts`):
 - **Publishing** (`POST /api/composition/publish` with `{ project?, proposalId, fingerprint }`; groups come only from the stored proposal, never the client). 409 unless the stored proposal has that id and fingerprint and is not stale. Groups are published in order, tasks in group order, each as its own bundle on `techtree/bundle-<id>`:
   1. The task's branch must still be at its proposal head, else the publication stops (stale).
   2. The start is the fetched base (`<remote>/<b>`, see "Open combined PR"; a remote is required) for a root group's first task, otherwise the parent bundle's head. A proposal parent is verified first: still an eligible tip, `gh pr view <n> --json state,headRefName,headRefOid,baseRefName` is `OPEN` with the recorded branch, head and base, and `git ls-remote <remote> refs/heads/<branch>` is the recorded head.
-  3. The task's commits `merge-base(baseRef, head)..head` (pinned head) are cherry-picked as in "Open combined PR". A conflict, or a replay that leaves no change, stops the publication; the bundle branch and worktree are removed.
+  3. The task's commits `merge-base(baseRef, head)..head` (pinned head) are cherry-picked as in "Open combined PR", including the bounded resolver. A conflict it gives up on, or a replay that leaves no change, stops the publication; the bundle branch and worktree are removed. After a resolution the task head and parent are verified again before the push.
   4. Intent `compose-intent/<taskId>` = `{ bundle: <Bundle without pr/url>, body }` is stored, then `git push -u <remote> <branch>` (never forced) and `gh pr create --head <branch> --base <base> --title <task title> --body <body>` (combined PR body plus `Stacked on #<parent PR>` for children). The intent and branch are preserved on ambiguous remote failures.
   5. `Bundle` gains `base` (the PR's base branch), `head` (pushed commit), `sourceHead` (pinned task head), `stack` (root bundle id) and, for children, `parent` (parent bundle id). The bundle is saved, its task moves to `pr_open`, the intent is deleted.
 - **Recovery.** When a task has an intent: `gh pr list --head <branch> --state all --json number,url,state,baseRefName,headRefOid`. An `OPEN` PR with the intent's base and head is adopted as the bundle (no new push or PR). A closed or merged one drops the intent and fails. With none, a remote branch at the intent's head gets `gh pr create` from it; no remote branch drops the intent and publishes afresh; any other head fails. A failed lookup fails and keeps the intent. Pushed branches are never deleted.
@@ -605,17 +621,6 @@ Contract details (`src/backend/compose.ts`, `src/runner/bundle.ts`):
 - **Settlement.** A retired bundle settles only tasks whose `bundle` is that bundle. A stacked child seen `MERGED` with `baseRefName` equal to its parent's branch landed in the parent, not the base: it waits while the parent is open, becomes `done` (findings resolved) once the parent's tasks are `done`, and returns to `review` once the parent was closed. A child merged into anything else settles normally.
 - **API and events.** `GET /api/composition?project=` → `ApiComposition { project, auto, model, status: "idle" | "queued" | "planning" | "publishing" | "failed", error?, proposal? (with stale), lastResult?, stacks }`, where `stacks` are the project's live smart bundles, oldest first. `POST /api/composition/plan` runs now (debounce skipped), `POST /api/composition/auto` `{ on }` sets the switch; both return `ApiComposition`. Every change emits `{ type: "composition", composition }`.
 - **UI.** The Staged section is shown when the project has staged tasks, live stacks or a publication result. It has **Smart group**, **Group automatically**, status/errors, visual suggested groups with rationale, task checkboxes and selection shortcuts. **Open combined PR (N)** publishes only the human's current selection; there is no whole-plan **Publish N PRs** action. Parent links are labelled as context, not publication targets. Results and existing stack PR links remain visible with an empty pool.
-
-```mermaid
-flowchart LR
-    Review[Independent task ready] -->|Stage| Pool[Staged, unchecked]
-    Pool -->|Debounce or Smart group| Plan[Read-only grouping proposal]
-    Plan -->|Pool or parent changed| Pool
-    Plan -->|Human selects or edits group| Selected[Selected independent changes]
-    Selected -->|Open combined PR| Combined[Combined-PR creation<br/>Cherry-pick and bounded-resolution flow above]
-    Combined -->|Resolver gives up: offending task only| Review
-    Combined -->|Other tasks stay staged; advisory regroup| Pool
-```
 
 ## Dismissed findings
 
@@ -627,7 +632,7 @@ Findings that are false positives or won't be fixed can be dismissed, per findin
 
 ## Configuration
 
-Layers, later winning: defaults, the user config (`$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`), then `.techtree.yaml` at the repo root. `weights` and `plugins` merge per key. `piCommand`, `piLoadsExtension`, `terminal` and `worktreeTemplate` choose what techtree executes and where it writes, so they are read from the user config only; a repo file setting them is ignored with a warning. Supported YAML subset: nested block mappings, block lists of scalars, flow lists (`[a, b]`), scalars and `#` comments.
+Layers, later winning: defaults, the user config (`$TECHTREE_CONFIG`, else `$XDG_CONFIG_HOME/techtree/config.yaml`, else `~/.config/techtree/config.yaml`), then `.techtree.yaml` at the repo root. `weights` and `plugins` merge per key. `piCommand`, `piLoadsExtension`, `terminal`, `worktreeTemplate`, `conflictChecks` and `conflictValidators` choose what techtree executes and where it writes, so they are read from the user config only; a repo file setting them is ignored with a warning. Supported YAML subset: nested block mappings, block lists of scalars or flow lists, flow lists (`[a, b]`), scalars and `#` comments. `conflictChecks` is one list for every repository using that user config; point `TECHTREE_CONFIG` at a per-repository file to use different checks per repository. It has no default: without it (or without `conflictValidators`) every conflict takes the unstaging fallback.
 
 ```yaml
 weights: { }          # metric key → composite weight (defaults in src/config.ts)
@@ -642,6 +647,9 @@ openBrowser: true     # /techtree opens the UI in the default browser
 defaultModel: ""      # provider/model prefilled in the start dialog; empty = last used, else pi's default
 titleModel: ""        # provider/model writing combined PR titles; empty = defaultModel, else pi's default. A cheap fast model is enough
 groupModel: ""        # provider/model for smart PR grouping; empty = titleModel. Automatic grouping needs one of them
+conflictChecks:       # user config only. Focused checks (argv, no shell, run in the composition worktree) that let the conflict resolver accept a resolution; unset = never resolve automatically
+  - [npm, test]       # example; block list of flow lists, arguments cannot contain commas
+conflictValidators: [test, scripts/check.sh] # user config only. Repo-relative files or closed directories the checks depend on, attested complete by you; unset = never resolve automatically
 pruneOnIdle: []       # paths inside a task worktree (e.g. [target]) deleted when its worker run ends (review, pr_open, done, failed), to bound disk use; relative, no "..". Resumes rebuild them
 refineModel: ""       # provider/model for "Refine with agent" (goals, rubrics); empty = defaultModel, else pi's default. Use a strong model: refined text steers every later task
 ignore: [target, node_modules, .git]

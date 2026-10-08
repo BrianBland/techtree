@@ -7,6 +7,7 @@ import { promisify } from "node:util";
 import { combinedTitle } from "../backend/refine.ts";
 import type { Db } from "../db.ts";
 import type { Bundle, Config, Task } from "../types.ts";
+import { GiveUp, pinValidators, resolveConflict, type ConflictSession, type Resolution, type ValidatorPin } from "./resolve.ts";
 
 export interface OpenBundleOptions {
   repoRoot: string;
@@ -14,18 +15,21 @@ export interface OpenBundleOptions {
   project: string;
   /** Staged tasks, in staging order. */
   tasks: Task[];
+  /** Each task's head pinned when the publication was requested; its commits are what gets replayed. */
+  heads: Record<string, string>;
+  session: ConflictSession;
   title?: string;
   /** Titles of a task's findings, for the PR body. */
   findingTitles(task: Task): string[];
 }
 
-/** A genuine unmerged-index conflict while replaying this task; temporary composition state is cleaned up. */
+/** A genuine unmerged-index conflict while replaying this task that the resolver gave up on; temporary composition state is cleaned up. */
 export class BundleConflict extends Error {
   readonly taskId: string;
   readonly paths: string[];
 
-  constructor(task: Task, paths: string[]) {
-    super(`cherry-pick conflict in task ${task.id} (${task.title}); paths: ${paths.map((path) => JSON.stringify(path)).join(", ")}`);
+  constructor(task: Task, paths: string[], giveUpReason: string) {
+    super(`cherry-pick conflict in task ${task.id} (${task.title}); paths: ${paths.map((path) => JSON.stringify(path)).join(", ")}; resolver gave up: ${giveUpReason}`);
     this.taskId = task.id;
     this.paths = paths;
   }
@@ -52,6 +56,7 @@ export interface StackedBundleOptions {
   findingTitles(task: Task): string[];
   /** Persist the intent; called right before the push. */
   journal(intent: PublishIntent): void;
+  session: ConflictSession;
 }
 
 const PR_TEMPLATES = [".github/pull_request_template.md", ".github/PULL_REQUEST_TEMPLATE.md", "docs/pull_request_template.md", "PULL_REQUEST_TEMPLATE.md", "pull_request_template.md"];
@@ -61,28 +66,33 @@ const PR_TEMPLATES = [".github/pull_request_template.md", ".github/PULL_REQUEST_
  * PR with gh. See docs/DESIGN.md "Staging and combined PRs".
  */
 export async function openBundle(opts: OpenBundleOptions): Promise<Bundle> {
-  const { repoRoot, config, tasks } = opts;
+  const { repoRoot, config, tasks, heads, session } = opts;
   const { id, branch, worktree } = bundlePlace(repoRoot, config);
   const remote = await upstreamRemote(repoRoot);
   const baseBranch = await run(repoRoot, "git", "rev-parse", "--abbrev-ref", config.baseRef).then((out) => out.trim(), () => "");
   const fromRemote = remote !== undefined && baseBranch !== "" && baseBranch !== "HEAD";
   if (fromRemote) await run(repoRoot, "git", "fetch", remote, baseBranch);
+  const start = (await run(repoRoot, "git", "rev-parse", fromRemote ? `${remote}/${baseBranch}` : config.baseRef)).trim();
+  const validators = await pinValidators(repoRoot, start, config.conflictValidators);
   mkdirSync(dirname(worktree), { recursive: true });
-  await run(repoRoot, "git", "worktree", "add", "-b", branch, worktree, fromRemote ? `${remote}/${baseBranch}` : config.baseRef);
+  await run(repoRoot, "git", "worktree", "add", "-b", branch, worktree, start);
+  const resolutions: Resolution[] = [];
   try {
-    for (const task of tasks) await cherryPick(repoRoot, worktree, config.baseRef, task, task.branch!);
+    for (const task of tasks) resolutions.push(...(await cherryPick(repoRoot, worktree, config, task, heads[task.id], session, validators)));
+    await requireChange(worktree, start, `the selected tasks' replay changes nothing on top of ${fromRemote ? `${remote}/${baseBranch}` : config.baseRef}`);
+    await session.refresh();
     if (!remote) throw new Error("the repository has no remote to push the combined branch to");
     await run(worktree, "git", "push", "-u", remote, branch);
   } catch (err) {
     await removeBundleWorktree(repoRoot, worktree, branch);
-    throw err;
+    throw await confirmFallback(err, session);
   }
   const title =
     opts.title ??
     (tasks.length === 1
       ? tasks[0].title
       : ((await combinedTitle(tasks.map((t) => `${t.title} (${t.node || "repo root"})`), config, repoRoot)) ?? `${tasks[0].title} (+${tasks.length - 1} more)`));
-  const body = await prBody(opts, tasks.map((task) => [task, task.branch!]), worktree);
+  const body = await prBody(opts, tasks.map((task) => [task, heads[task.id]]), worktree, resolutions);
   const created = await run(worktree, "gh", "pr", "create", "--head", branch, "--title", title, "--body", body, ...(fromRemote ? ["--base", baseBranch] : []));
   const url = /https:\/\/\S+\/pull\/\d+/.exec(created)?.[0];
   if (!url) throw new Error(`gh pr create printed no PR URL: ${created.trim()}`);
@@ -116,26 +126,25 @@ export async function openStackedBundle(opts: StackedBundleOptions): Promise<Bun
     base = await run(repoRoot, "git", "rev-parse", "--abbrev-ref", config.baseRef).then((out) => out.trim(), () => "");
     if (base === "" || base === "HEAD") throw new Error(`baseRef ${config.baseRef} names no branch to target`);
     await run(repoRoot, "git", "fetch", remote, base);
-    start = `${remote}/${base}`;
+    start = (await run(repoRoot, "git", "rev-parse", `${remote}/${base}`)).trim();
   }
+  const validators = await pinValidators(repoRoot, start, config.conflictValidators);
   const { id, branch, worktree } = bundlePlace(repoRoot, config);
   mkdirSync(dirname(worktree), { recursive: true });
   await run(repoRoot, "git", "worktree", "add", "-b", branch, worktree, start);
   let head: string;
+  let body: string;
   try {
-    await cherryPick(repoRoot, worktree, config.baseRef, task, opts.sourceHead);
+    const resolutions = await cherryPick(repoRoot, worktree, config, task, opts.sourceHead, opts.session, validators);
     head = (await run(worktree, "git", "rev-parse", "HEAD")).trim();
-    const unchanged = await run(worktree, "git", "diff", "--quiet", start, "HEAD").then(() => true, (err) => {
-      if (err.code === 1) return false;
-      throw err;
-    });
-    if (unchanged) throw new Error(`task ${task.id} (${task.title}) changes nothing on top of ${base}`);
+    await requireChange(worktree, start, `task ${task.id} (${task.title}) changes nothing on top of ${base}`);
+    const stacked = parent ? `Stacked on #${parent.pr}.\n\n` : "";
+    body = stacked + (await prBody(opts, [[task, opts.sourceHead]], worktree, resolutions));
+    await opts.session.refresh();
   } catch (err) {
     await removeBundleWorktree(repoRoot, worktree, branch);
-    throw err;
+    throw await confirmFallback(err, opts.session);
   }
-  const stacked = parent ? `Stacked on #${parent.pr}.\n\n` : "";
-  const body = stacked + (await prBody(opts, [[task, opts.sourceHead]], worktree));
   const bundle = {
     id,
     project: opts.project,
@@ -210,6 +219,12 @@ function bundlePlace(repoRoot: string, config: Config): { id: string; branch: st
   return { id, branch: `techtree/bundle-${id}`, worktree };
 }
 
+/** A conflict reaches the unstaging fallback only when the publication is still fresh after its cleanup; drift or shutdown wins. */
+async function confirmFallback(err: unknown, session: ConflictSession): Promise<unknown> {
+  if (err instanceof BundleConflict) await session.refresh();
+  return err;
+}
+
 async function removeBundleWorktree(repoRoot: string, worktree: string, branch: string): Promise<void> {
   await run(repoRoot, "git", "worktree", "remove", "--force", worktree).catch(() => {});
   await run(repoRoot, "git", "branch", "-D", branch).catch(() => {});
@@ -219,9 +234,22 @@ function errorText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-async function cherryPick(repoRoot: string, worktree: string, baseRef: string, task: Task, head: string): Promise<void> {
-  const base = (await run(repoRoot, "git", "merge-base", baseRef, head)).trim();
+async function requireChange(worktree: string, start: string, message: string): Promise<void> {
+  const unchanged = await run(worktree, "git", "diff", "--quiet", start, "HEAD").then(
+    () => true,
+    (err) => {
+      if (err.code === 1) return false;
+      throw err;
+    },
+  );
+  if (unchanged) throw new Error(message);
+}
+
+/** Replay `task`'s commits up to `head`, resolving what the bounded resolver can; returns the resolutions' audits. */
+async function cherryPick(repoRoot: string, worktree: string, config: Config, task: Task, head: string, session: ConflictSession, validators: ValidatorPin): Promise<Resolution[]> {
+  const base = (await run(repoRoot, "git", "merge-base", config.baseRef, head)).trim();
   const commits = (await run(repoRoot, "git", "rev-list", "--reverse", "--no-merges", `${base}..${head}`)).split("\n").filter(Boolean);
+  const resolutions: Resolution[] = [];
   for (const sha of commits) {
     const changesNothing = await run(repoRoot, "git", "diff-tree", "--quiet", `${sha}^`, sha).then(() => true, () => false);
     if (changesNothing) continue;
@@ -230,15 +258,23 @@ async function cherryPick(repoRoot: string, worktree: string, baseRef: string, t
     } catch (err) {
       // A failed command alone may be an identity, hook, disk or process error, not a conflict.
       const paths = await run(worktree, "git", "diff", "--name-only", "--diff-filter=U", "-z").then((out) => out.split("\0").filter(Boolean), () => []);
-      await run(worktree, "git", "cherry-pick", "--abort").catch(() => {});
-      if (paths.length) throw new BundleConflict(task, paths);
-      throw err;
+      if (!paths.length) {
+        await run(worktree, "git", "cherry-pick", "--abort").catch(() => {});
+        throw err;
+      }
+      try {
+        resolutions.push(await resolveConflict({ repoRoot, worktree, config, task, commit: sha, paths, session, validators }));
+      } catch (resolveError) {
+        await run(worktree, "git", "cherry-pick", "--abort").catch(() => {});
+        throw resolveError instanceof GiveUp ? new BundleConflict(task, paths, resolveError.message) : resolveError;
+      }
     }
   }
+  return resolutions;
 }
 
 /** `tasks` pairs each task with the commit whose subject the body quotes. */
-async function prBody(opts: Pick<OpenBundleOptions, "repoRoot" | "findingTitles">, tasks: [Task, string][], worktree: string): Promise<string> {
+async function prBody(opts: Pick<OpenBundleOptions, "repoRoot" | "findingTitles">, tasks: [Task, string][], worktree: string, resolutions: Resolution[]): Promise<string> {
   const lines = await Promise.all(
     tasks.map(async ([task, head]) => {
       const findings = opts.findingTitles(task);
@@ -247,7 +283,17 @@ async function prBody(opts: Pick<OpenBundleOptions, "repoRoot" | "findingTitles"
     }),
   );
   const template = prTemplate(worktree);
-  return [`Combined techtree changes:\n\n${lines.join("\n")}`, template].filter(Boolean).join("\n\n");
+  return [`Combined techtree changes:\n\n${lines.join("\n")}`, resolutionAudit(resolutions), template].filter(Boolean).join("\n\n");
+}
+
+function resolutionAudit(resolutions: Resolution[]): string | undefined {
+  if (!resolutions.length) return undefined;
+  const items = resolutions.map(
+    (r) =>
+      `- **${r.taskTitle}** (${r.taskId}), commit ${r.commit.slice(0, 12)}: ${r.paths.join(", ")} resolved by ${r.model}, keeping exactly both sides' lines — ${r.reason.replace(/\s+/g, " ")}. ` +
+      `Checks that passed on the result and failed on each side alone: ${r.checks.map((argv) => `\`${argv.join(" ")}\``).join(", ")}.`,
+  );
+  return ["Automatic conflict resolution (checks are evidence, not proof):", ...items].join("\n");
 }
 
 function prTemplate(worktree: string): string | undefined {
