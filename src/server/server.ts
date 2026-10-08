@@ -51,6 +51,7 @@ interface Route {
   method: "GET" | "POST" | "PATCH" | "DELETE";
   pattern: RegExp;
   handle: Handler;
+  status?: number;
 }
 
 /** Start the techtree HTTP/SSE server on 127.0.0.1 (see docs/DESIGN.md, "HTTP API" and "Security"). */
@@ -95,7 +96,7 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
       if (typeof result === "string") {
         res.writeHead(200, { "Content-Type": "text/plain; charset=utf-8" }).end(result);
       } else {
-        sendJson(res, 200, result);
+        sendJson(res, route.status ?? 200, result);
       }
       return;
     }
@@ -124,7 +125,15 @@ export async function startServer(options: ServerOptions): Promise<RunningServer
 
 function apiRoutes(backend: Backend): Route[] {
   const get = (pattern: RegExp, handle: Handler): Route => ({ method: "GET", pattern, handle });
-  const post = (pattern: RegExp, handle: Handler): Route => ({ method: "POST", pattern, handle });
+  const post = (pattern: RegExp, handle: Handler, status = 200): Route => ({ method: "POST", pattern, handle, status });
+  const bundle: Handler = async (req, url) => {
+    const { project, taskIds, title } = await readJson(req);
+    if (!stringList(taskIds) || !taskIds.length) throw new HttpError(400, "taskIds must be a non-empty list of strings");
+    if ((project !== undefined && typeof project !== "string") || (title !== undefined && typeof title !== "string"))
+      throw new HttpError(400, "project and title must be strings");
+    const input = { taskIds, ...(project && { project }), ...(title?.trim() && { title: title.trim() }) };
+    return url.pathname.endsWith("/start") ? backend.startBundle(input) : backend.createBundle(input);
+  };
   return [
     get(/^\/api\/projects$/, () => backend.listProjects()),
     post(/^\/api\/projects$/, async (req) => backend.createProject(projectInput(await readJson(req)))),
@@ -167,13 +176,8 @@ function apiRoutes(backend: Backend): Route[] {
     post(/^\/api\/tasks\/([^/]+)\/stage$/, (_req, _url, [id]) => backend.stage(id)),
     post(/^\/api\/tasks\/([^/]+)\/unstage$/, (_req, _url, [id]) => backend.unstage(id)),
     get(/^\/api\/bundles$/, (_req, url) => backend.listBundles(projectParam(url))),
-    post(/^\/api\/bundles$/, async (req) => {
-      const { project, taskIds, title } = await readJson(req);
-      if (!stringList(taskIds) || !taskIds.length) throw new HttpError(400, "taskIds must be a non-empty list of strings");
-      if ((project !== undefined && typeof project !== "string") || (title !== undefined && typeof title !== "string"))
-        throw new HttpError(400, "project and title must be strings");
-      return backend.createBundle({ taskIds, ...(project && { project }), ...(title?.trim() && { title: title.trim() }) });
-    }),
+    post(/^\/api\/bundles$/, bundle),
+    post(/^\/api\/bundles\/start$/, bundle, 202),
     get(/^\/api\/composition$/, (_req, url) => backend.getComposition(projectParam(url))),
     post(/^\/api\/composition\/plan$/, (_req, url) => backend.planComposition(projectParam(url))),
     post(/^\/api\/composition\/auto$/, async (req, url) => {

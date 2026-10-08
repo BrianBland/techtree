@@ -370,39 +370,58 @@ export class RepoBackend implements Backend {
     return listBundles(this.opts.db, this.project(projectId).id);
   }
 
-  async createBundle({ project: projectId, taskIds, title }: BundleInput): Promise<Bundle> {
+  async createBundle(input: BundleInput): Promise<Bundle> {
+    const selected = this.prepareBundle(input);
+    return this.composer.reserve(selected.tasks.map((t) => t.id), () => this.publishBundle(selected));
+  }
+
+  async startBundle(input: BundleInput): Promise<ApiComposition> {
+    const selected = this.prepareBundle(input);
+    return this.composer.queueBundle(selected.project, selected.tasks, () => this.publishBundle(selected, false));
+  }
+
+  private prepareBundle({ project: projectId, taskIds, title }: BundleInput): { project: string; tasks: Task[]; heads: Record<string,string>; title?: string } {
     const project = this.project(projectId);
     if (!taskIds.length) throw new HttpError(400, "taskIds must not be empty");
+    if (new Set(taskIds).size !== taskIds.length) throw new HttpError(400, "taskIds must be unique");
     const tasks = taskIds.map((id) => this.task(id));
     const wrong = tasks.find((t) => t.state !== "staged" || t.project !== project.id);
     if (wrong) throw new HttpError(409, `task ${wrong.id} is ${wrong.state} in ${wrong.project}, not staged in ${project.id}`);
-    tasks.sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? ""));
+    // Equal timestamps use the same stable task order as the staged overview, not request order.
+    const order = new Map(this.runner().list().map((task, index) => [task.id, index]));
+    tasks.sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? "") || order.get(a.id)! - order.get(b.id)!);
+    const pending = taskIds.find((id) => this.composer.hasIntent(id));
+    if (pending) throw new HttpError(409, `task ${pending} has an unresolved smart publication; recover it with Smart group before opening a combined PR`);
+    const heads = Object.fromEntries(tasks.map((t) => [t.id, git(this.opts.repoRoot, "rev-parse", t.branch!).trim()]));
+    return { project: project.id, tasks, heads, ...(title && { title }) };
+  }
+
+  private async publishBundle({ project, tasks, heads, title }: ReturnType<RepoBackend["prepareBundle"]>, notifyPool = true): Promise<Bundle> {
     const { repoRoot, config, db } = this.opts;
-    const heads = Object.fromEntries(tasks.map((t) => [t.id, git(repoRoot, "rev-parse", t.branch!).trim()]));
-    return this.composer.reserve(taskIds, async () => {
-      const pending = taskIds.find((id) => this.composer.hasIntent(id));
-      if (pending) throw new HttpError(409, `task ${pending} has an unresolved smart publication; recover it with Smart group before opening a combined PR`);
-      let bundle: Bundle;
-      try {
-        const session = this.composer.conflictSession(project.id, heads, { spent: false });
-        bundle = await openBundle({ repoRoot, config, project: project.id, tasks, heads, session, ...(title && { title }), findingTitles: this.findingTitles(project.id) });
-      } catch (err) {
-        if (err instanceof BundleConflict) {
-          let message: string;
-          try {
-            message = this.composer.recoverConflict(project.id, err);
-            this.composer.poolChanged(project.id, true);
-          } catch (recoveryError) {
-            message = `${err.message}; automatic unstaging failed: ${errorText(recoveryError)}`;
-          }
-          throw new HttpError(409, message);
+    const taskIds = tasks.map((t) => t.id);
+    const session = this.composer.conflictSession(project, heads, { spent: false });
+    await session.refresh();
+    const pending = taskIds.find((id) => this.composer.hasIntent(id));
+    if (pending) throw new HttpError(409, `task ${pending} has an unresolved smart publication; recover it with Smart group before opening a combined PR`);
+    let bundle: Bundle;
+    try {
+      bundle = await openBundle({ repoRoot, config, project, tasks, heads, session, ...(title && { title }), findingTitles: this.findingTitles(project) });
+    } catch (err) {
+      if (err instanceof BundleConflict) {
+        let message: string;
+        try {
+          message = this.composer.recoverConflict(project, err);
+          if (notifyPool) this.composer.poolChanged(project, true);
+        } catch (recoveryError) {
+          message = `${err.message}; automatic unstaging failed: ${errorText(recoveryError)}`;
         }
-        throw new HttpError(502, errorText(err));
+        throw new HttpError(409, message);
       }
-      this.runner().bundled(bundle.taskIds, bundle.id, bundle.pr, () => saveBundle(db, bundle));
-      this.composer.poolChanged(project.id);
-      return bundle;
-    });
+      throw new HttpError(502, errorText(err));
+    }
+    this.runner().bundled(bundle.taskIds, bundle.id, bundle.pr, () => saveBundle(db, bundle));
+    if (notifyPool) this.composer.poolChanged(project);
+    return bundle;
   }
 
   async dismiss(findingIds: string[], reason?: string, projectId?: string): Promise<void> {
@@ -486,7 +505,7 @@ export class RepoBackend implements Backend {
     return {
       attentionTasks: this.tasks(scope).filter((t) => t.state === "needs_input" || t.state === "review"),
       stagedTasks: this.tasks(scope)
-        .filter((t) => t.state === "staged")
+        .filter((t) => t.state === "staged" && !this.composer.isQueuedForBundle(t.id, t.project))
         .sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? "")),
       activeTasks: this.tasks(scope).filter((t) => t.state === "queued" || t.state === "running"),
       flaggedPrs: this.prs(scope).filter((p) => p.ci === "fail" || p.stuck || p.stale),

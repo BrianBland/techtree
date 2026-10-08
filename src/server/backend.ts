@@ -102,6 +102,8 @@ export interface Backend {
   unstage(taskId: string): Promise<Task>;
   /** Open one combined PR from staged tasks. */
   createBundle(input: BundleInput): Promise<Bundle>;
+  /** Accept a background combined-PR opening; progress/outcomes are in composition state. */
+  startBundle(input: BundleInput): Promise<ApiComposition>;
   listBundles(project?: string): Promise<Bundle[]>;
   /** Smart PR composition (DESIGN "Smart PR composition"): status, run now, automatic switch, publish the stored proposal. */
   getComposition(project?: string): Promise<ApiComposition>;
