@@ -278,7 +278,7 @@ export interface Config {
   piCommand: string[]; // argv prefix used to spawn pi children, e.g. ["pi"]
   piLoadsExtension?: boolean; // pi already loads techtree's extension (installed in its extensions dir): don't pass `-e`
   defaultModel?: string; // start-dialog prefill, "provider/id"
-  titleModel?: string; // combined PR titles, "provider/id"; unset = defaultModel
+  titleModel?: string; // combined/stacked PR titles and descriptions, "provider/id"; unset = defaultModel
   groupModel?: string; // smart PR grouping, "provider/id"; unset = titleModel
   refineModel?: string; // "Refine with agent" model, "provider/id"; unset = defaultModel
   pruneOnIdle?: string[]; // worktree-relative paths deleted when a worker run ends

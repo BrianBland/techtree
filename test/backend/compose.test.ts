@@ -723,6 +723,27 @@ async function appended(ctx: Ctx, lines = ["alpha", "beta"], options: string | s
   return tasks;
 }
 
+test("stacked metadata is journaled and reused on recovery rather than regenerated", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t, { files: TEMPLATE });
+  const [task] = await staged(ctx, ["Simplify README examples"], "append line:alpha");
+  const file = join(ctx.tmp, "metadata"); withEnv(t, "FAKE_PR_COPY", file);
+  const title = "docs: clarify README examples";
+  writeFileSync(file, JSON.stringify({ title, summary: "Document the alpha example.", changes: [{ id: "c1", text: "Add the alpha README example." }] }));
+  ctx.replyWith([{ tasks: [task.title] }]);
+  ctx.setGh({ failCreateEarly: 1 });
+  const result = await ctx.publish(await ctx.plan());
+  assert.ok(result.lastResult!.error);
+  const intent = dbCache(openDb(ctx.cache)).get<{ bundle: Bundle; body: string }>("compose-intent", task.id)!;
+  assert.equal(intent.bundle.title, title);
+  assert.match(intent.body, /^## Summary\n\nDocument the alpha example\./);
+  assert.ok(intent.body.endsWith("Trailing: metadata"));
+  writeFileSync(file, "invalid response if metadata is rerun");
+  await ctx.publish(await ctx.plan());
+  assert.equal((await ctx.bundleOf(task.id)).title, title);
+  assert.equal(ctx.gh().prs[0].body, intent.body);
+  assert.equal(readFileSync(`${file}.log`, "utf8").trim().split("\n").length, 1, "recovery uses the journaled copy");
+});
+
 test("manual publication resolves a simple additive conflict with one cheap call and records the audit before the template", { timeout: 60_000 }, async (t) => {
   const ctx = await boot(t, resolving({ files: TEMPLATE }));
   const [a, b] = await appended(ctx);
