@@ -56,3 +56,29 @@ test("loadConfig layers user config under the repo file, and only the user confi
   assert.equal(cfg.weights.test_ratio, 7);
   assert.equal(cfg.weights.loc, 1);
 });
+
+test("conflictChecks are argv lists read from the user config only", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "techtree-config-"));
+  const userFile = join(dir, "user.yaml");
+  const repo = join(dir, "repo");
+  writeFileSync(userFile, "conflictChecks:\n  - [npm, test]\n  - [node, --test, test/a.test.ts]\n");
+  mkdirSync(repo, { recursive: true });
+  writeFileSync(join(repo, ".techtree.yaml"), "conflictChecks:\n  - [sh, -c, evil]\n");
+  const old = process.env.TECHTREE_CONFIG;
+  process.env.TECHTREE_CONFIG = userFile;
+  t.after(() => (old === undefined ? delete process.env.TECHTREE_CONFIG : (process.env.TECHTREE_CONFIG = old)));
+  assert.deepEqual(loadConfig(repo).conflictChecks, [["npm", "test"], ["node", "--test", "test/a.test.ts"]]);
+});
+
+test("conflictValidators are read from the user config only", (t) => {
+  const dir = mkdtempSync(join(tmpdir(), "techtree-config-"));
+  const userFile = join(dir, "user.yaml");
+  const repo = join(dir, "repo");
+  writeFileSync(userFile, "conflictValidators: [test, scripts/check.sh]\n");
+  mkdirSync(repo, { recursive: true });
+  writeFileSync(join(repo, ".techtree.yaml"), "conflictValidators: [nothing]\n");
+  const old = process.env.TECHTREE_CONFIG;
+  process.env.TECHTREE_CONFIG = userFile;
+  t.after(() => (old === undefined ? delete process.env.TECHTREE_CONFIG : (process.env.TECHTREE_CONFIG = old)));
+  assert.deepEqual(loadConfig(repo).conflictValidators, ["test", "scripts/check.sh"]);
+});

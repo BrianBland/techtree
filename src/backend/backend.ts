@@ -378,14 +378,26 @@ export class RepoBackend implements Backend {
     if (wrong) throw new HttpError(409, `task ${wrong.id} is ${wrong.state} in ${wrong.project}, not staged in ${project.id}`);
     tasks.sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? ""));
     const { repoRoot, config, db } = this.opts;
+    const heads = Object.fromEntries(tasks.map((t) => [t.id, git(repoRoot, "rev-parse", t.branch!).trim()]));
     return this.composer.reserve(taskIds, async () => {
       const pending = taskIds.find((id) => this.composer.hasIntent(id));
       if (pending) throw new HttpError(409, `task ${pending} has an unresolved smart publication; recover it with Smart group before opening a combined PR`);
       let bundle: Bundle;
       try {
-        bundle = await openBundle({ repoRoot, config, project: project.id, tasks, ...(title && { title }), findingTitles: this.findingTitles(project.id) });
+        const session = this.composer.conflictSession(project.id, heads, { spent: false });
+        bundle = await openBundle({ repoRoot, config, project: project.id, tasks, heads, session, ...(title && { title }), findingTitles: this.findingTitles(project.id) });
       } catch (err) {
-        throw new HttpError(err instanceof BundleConflict ? 409 : 502, errorText(err));
+        if (err instanceof BundleConflict) {
+          let message: string;
+          try {
+            message = this.composer.recoverConflict(project.id, err);
+            this.composer.poolChanged(project.id, true);
+          } catch (recoveryError) {
+            message = `${err.message}; automatic unstaging failed: ${errorText(recoveryError)}`;
+          }
+          throw new HttpError(409, message);
+        }
+        throw new HttpError(502, errorText(err));
       }
       this.runner().bundled(bundle.taskIds, bundle.id, bundle.pr, () => saveBundle(db, bundle));
       this.composer.poolChanged(project.id);

@@ -3,6 +3,7 @@ import { createHash } from "node:crypto";
 import { existsSync, readFileSync, statSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
+import { reapGroup, signalGroup } from "../process-group.ts";
 import type { ApiOverview, CollectCtx, Effort, Finding, MetricDef, MetricPlugin, MetricValues, NodeId, Severity } from "../types.ts";
 
 /** review_debt points per finding; fixing a finding removes its weight. */
@@ -193,11 +194,15 @@ function prompt(batch: SourceFile[], rubric?: string): string {
   return `/skill:techtree-scan ${rubric ? `${rubricPreamble(rubric)}\n\n` : ""}Review these files:\n\n${batch.map((f) => `=== ${f.path} ===\n${numbered(f.text)}`).join("\n\n")}`;
 }
 
-/** Run `<piCommand> -p --no-session <args>` in `cwd` and resolve its stdout; a nonzero exit, timeout or abort rejects. */
-export function runPiPrint(piCommand: string[], cwd: string, args: string[], timeout: number, signal?: AbortSignal, options: { input?: string; maxOutputBytes?: number } = {}): Promise<string> {
+/**
+ * Run `<piCommand> -p --no-session <args>` in `cwd` and resolve its stdout; a nonzero exit, timeout or abort rejects.
+ * With `processGroup`, pi runs in its own process group, which is signalled as a whole and reaped before settling.
+ */
+export function runPiPrint(piCommand: string[], cwd: string, args: string[], timeout: number, signal?: AbortSignal, options: { input?: string; maxOutputBytes?: number; processGroup?: boolean } = {}): Promise<string> {
   const [cmd, ...prefix] = piCommand;
   return new Promise((resolve, reject) => {
-    const child = spawn(cmd, [...prefix, "-p", "--no-session", ...args], { cwd, stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"] });
+    const child = spawn(cmd, [...prefix, "-p", "--no-session", ...args], { cwd, stdio: [options.input === undefined ? "ignore" : "pipe", "pipe", "pipe"], detached: options.processGroup });
+    const kill = (sig: NodeJS.Signals) => (options.processGroup && child.pid ? signalGroup(child.pid, sig) : child.kill(sig));
     let stdout = "";
     let stderr = "";
     let outputBytes = 0;
@@ -216,8 +221,8 @@ export function runPiPrint(piCommand: string[], cwd: string, args: string[], tim
     const stop = (reason: unknown) => {
       if (stopReason !== undefined) return;
       stopReason = reason;
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), KILL_GRACE_MS);
+      kill("SIGTERM");
+      killTimer = setTimeout(() => kill("SIGKILL"), KILL_GRACE_MS);
     };
     const timer = setTimeout(() => stop(new Error(`pi timed out after ${timeout}ms`)), timeout);
     const onAbort = () => stop(signal!.reason);
@@ -234,9 +239,14 @@ export function runPiPrint(piCommand: string[], cwd: string, args: string[], tim
       cleanup();
       reject(err);
     });
-    child.on("close", (code, killedBy) => {
+    // Descendants holding the output pipes would otherwise keep "close" from ever firing.
+    child.on("exit", () => {
+      if (options.processGroup && child.pid) signalGroup(child.pid, "SIGKILL");
+    });
+    child.on("close", async (code, killedBy) => {
       cleanup();
-      if (stopReason !== undefined) reject(stopReason);
+      if (options.processGroup && !(await reapGroup(child.pid!))) reject(new Error("pi left processes running after it exited"));
+      else if (stopReason !== undefined) reject(stopReason);
       else if (code === 0) resolve(stdout);
       else reject(new Error(`pi exited with ${killedBy ?? code}: ${stderr.trim().slice(-500)}`));
     });

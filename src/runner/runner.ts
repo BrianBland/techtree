@@ -210,16 +210,24 @@ export class TaskRunner {
     if (task.state !== "review" || (task.kind ?? "change") !== "change") throw new Error(`task ${taskId} is a ${task.kind ?? "change"} task in ${task.state}, not a change task in review`);
     task.state = "staged";
     task.stagedAt = new Date().toISOString();
+    task.error = undefined;
     this.save(task);
     return task;
   }
 
-  unstage(taskId: string): Task {
+  unstage(taskId: string, reason?: string): Task {
     const task = this.require(taskId);
     if (task.state !== "staged") throw new Error(`task ${taskId} is ${task.state}, not staged`);
+    const before = { ...task };
     task.state = "review";
     task.stagedAt = undefined;
-    this.save(task);
+    if (reason) task.error = reason;
+    try {
+      this.save(task);
+    } catch (err) {
+      Object.assign(task, before);
+      throw err;
+    }
     return task;
   }
 

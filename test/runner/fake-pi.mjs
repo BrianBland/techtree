@@ -1,8 +1,8 @@
 // Stand-in for `pi --mode rpc`: speaks the JSONL protocol and plays a scenario named by
 // `scenario:<name>` in the first prompt. The scenario is kept in a fake session file so a
 // respawn with the same --session-dir/--session-id resumes it, as real pi sessions do.
-import { execFileSync } from "node:child_process";
-import { appendFileSync, existsSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { execFileSync, spawn } from "node:child_process";
+import { appendFileSync, existsSync, readFileSync, renameSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { techtreeReportTool } from "../../src/runner/report-tool.ts";
 
@@ -11,7 +11,8 @@ if (process.argv.includes("-p")) {
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
   const prompt = input || process.argv.at(-1);
-  if (prompt.includes("<staged-tasks>")) await group(prompt);
+  if (prompt.includes("<conflict-hunks>")) await resolve(prompt);
+  else if (prompt.includes("<staged-tasks>")) await group(prompt);
   else console.log("feat: fake combined title");
   process.exit(0);
 }
@@ -41,6 +42,35 @@ async function group(prompt) {
       .replace(/"title:([^"]*)"/g, (_, t) => JSON.stringify(tasks.find((x) => x.title === t)?.id ?? `missing ${t}`))
       .replace(/"tip:([^"]*)"/g, (_, t) => JSON.stringify(tips.find((x) => x.title === t)?.id ?? `missing ${t}`)),
   );
+}
+/**
+ * Conflict resolution: log the argv and prompt to `$FAKE_RESOLVE.log`, write the pid to `$FAKE_RESOLVE.pid`, wait while
+ * `$FAKE_RESOLVE.hold` exists, then reply as `$FAKE_RESOLVE` says (default `union`: ours lines, then theirs lines).
+ */
+async function resolve(prompt) {
+  const file = process.env.FAKE_RESOLVE;
+  appendFileSync(`${file}.log`, JSON.stringify([...process.argv.slice(2), prompt]) + "\n");
+  writeFileSync(`${file}.pid`, String(process.pid));
+  while (existsSync(`${file}.hold`)) await new Promise((resolve) => setTimeout(resolve, 10));
+  const mode = existsSync(file) ? readFileSync(file, "utf8").trim() : "union";
+  const hunks = JSON.parse(/<conflict-hunks>\n([\s\S]*?)\n<\/conflict-hunks>/.exec(prompt)[1]);
+  const resolved = (pick) => console.log(JSON.stringify({ outcome: "resolved", hunks: hunks.map((h) => ({ id: h.id, lines: pick(h) })), reason: "keeps both additions" }));
+  const replies = {
+    union: () => resolved((h) => [...h.ours, ...h.theirs]),
+    drop: () => resolved((h) => h.ours),
+    invent: () => resolved((h) => [...h.ours, ...h.theirs, "invented();"]),
+    give_up: () => console.log(JSON.stringify({ outcome: "give_up", reason: "the additions disagree" })),
+    invalid: () => console.log("I merged it for you."),
+    huge: () => new Promise((resolve) => process.stdout.write("x".repeat(200_000), resolve)),
+    fail: () => process.exit(1),
+    // A child the wrapper started that would outlive it without process-group cleanup.
+    orphan: async () => {
+      const child = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], { stdio: "ignore" });
+      writeFileSync(`${file}.child`, String(child.pid));
+      await new Promise(() => {});
+    },
+  };
+  await replies[mode]();
 }
 if (process.argv.includes("--list-models")) {
   process.stdout.write("provider  model  context  max-out  thinking  images\nfake      alpha  200K     64K      yes       yes\nfake      beta   1M       128K     no        no\n");
@@ -204,6 +234,29 @@ const scenarios = {
     await report({ plan: ["rewrite"] });
     writeFileSync("README.md", `${message}\n`);
     execFileSync("git", ["commit", "-qam", "rewrite readme"]);
+    await report({ done: 0 });
+    settle();
+  },
+  // Appends `line:<text>` (or `lines:<n>` numbered copies padded to `width:<n>`) to each of `files:<a,b>` (default README.md).
+  async append(message, settle) {
+    const opt = (name, fallback) => new RegExp(`${name}:(\\S+)`).exec(message)?.[1] ?? fallback;
+    const line = opt("line", "added");
+    const count = Number(opt("lines", "1"));
+    const width = Number(opt("width", "0"));
+    const text = Array.from({ length: count }, (_, i) => (count > 1 ? `${line}-${i}` : line).padEnd(width, ".") + "\n").join("");
+    await report({ plan: ["append"] });
+    for (const path of opt("files", "README.md").split(",")) appendFileSync(path, text);
+    execFileSync("git", ["add", "-A"]);
+    execFileSync("git", ["commit", "-qm", `append ${line}`]);
+    await report({ done: 0 });
+    settle();
+  },
+  // Renames `file:<path>` to `to:<path>`.
+  async move(message, settle) {
+    await report({ plan: ["move"] });
+    renameSync(/file:(\S+)/.exec(message)[1], /to:(\S+)/.exec(message)[1]);
+    execFileSync("git", ["add", "-A"]);
+    execFileSync("git", ["commit", "-qm", "move"]);
     await report({ done: 0 });
     settle();
   },

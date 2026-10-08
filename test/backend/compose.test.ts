@@ -1,7 +1,7 @@
 import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
-import { chmodSync, existsSync, mkdirSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { chmodSync, existsSync, mkdirSync, readdirSync, readFileSync, renameSync, symlinkSync, unlinkSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { RepoBackend } from "../../src/backend/backend.ts";
 import { parseGroups } from "../../src/backend/compose.ts";
@@ -54,6 +54,10 @@ if (a[0] === "pr" && a[1] === "create") {
   if (s.failList) process.exit(1);
   console.log(JSON.stringify(s.prs.filter((p) => p.headRefName === opt("--head")).map((p) => pick(p, opt("--json")))));
 } else if (a[0] === "pr" && a[1] === "view") {
+  if (fs.existsSync(STATE + ".view-hold")) {
+    fs.writeFileSync(STATE + ".view-waiting", "");
+    while (fs.existsSync(STATE + ".view-hold")) execFileSync("sleep", ["0.05"]);
+  }
   const pr = s.prs.find((p) => p.number === Number(a[2]));
   if (!pr) process.exit(1);
   console.log(JSON.stringify(pick(pr, opt("--json"))));
@@ -63,8 +67,8 @@ if (a[0] === "pr" && a[1] === "create") {
   chmodSync(join(bin, "gh"), 0o755);
 }
 
-async function boot(t: TestContext, { titleModel = "fake/cheap" as string | null } = {}) {
-  const { tmp, repo, cache } = fixture(t);
+async function boot(t: TestContext, { titleModel = "fake/cheap" as string | null, conflictChecks = undefined as string[][] | undefined, conflictValidators = undefined as string[] | undefined, files = {} as Record<string, string> } = {}) {
+  const { tmp, repo, cache } = fixture(t, files);
   const origin = join(tmp, "origin.git");
   git(tmp, "clone", "-q", "--bare", repo, origin);
   git(repo, "remote", "add", "origin", origin);
@@ -75,8 +79,10 @@ async function boot(t: TestContext, { titleModel = "fake/cheap" as string | null
   withEnv(t, "PATH", `${bin}:${process.env.PATH}`);
   const groupsFile = join(tmp, "groups.json");
   withEnv(t, "FAKE_GROUPS", groupsFile);
+  const resolveFile = join(tmp, "resolve");
+  withEnv(t, "FAKE_RESOLVE", resolveFile);
   mkdirSync(cache, { recursive: true });
-  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand: [process.execPath, FAKE_PI], ...(titleModel && { titleModel }) });
+  const config = mergeConfig({ minLoc: 1, worktreeTemplate: `${tmp}/wt/{task}`, piCommand: [process.execPath, FAKE_PI], ...(titleModel && { titleModel }), ...(conflictChecks && { conflictChecks }), ...(conflictValidators && { conflictValidators }) });
   const start = (debounceMs: number) => new RepoBackend({ db: openDb(cache), repoRoot: repo, cacheDir: cache, config, log: () => {}, groupDebounceMs: debounceMs });
   const backend = start(50);
   const server = await startServer({ backend, staticDir: tmp, token: "tok" });
@@ -109,7 +115,9 @@ async function boot(t: TestContext, { titleModel = "fake/cheap" as string | null
   const ghCreates = () => (existsSync(`${ghState}.log`) ? readFileSync(`${ghState}.log`, "utf8") : "").split("\n").filter((l) => l.startsWith('["pr","create"')).length;
   const task = async (id: string) => (await backend.getState()).tasks.find((x) => x.id === id)!;
   const bundleOf = async (taskId: string) => (await backend.listBundles()).find((b) => b.taskIds.includes(taskId))!;
-  return { backend, repo, origin, cache, tmp, start, reviewed, replyWith, settled, plan, publish, groupCalls, gh, setGh, ghCreates, task, bundleOf };
+  const resolveCalls = (): string[][] => (existsSync(`${resolveFile}.log`) ? readFileSync(`${resolveFile}.log`, "utf8").trim().split("\n").map((l) => JSON.parse(l)) : []);
+  const bundleWorktree = () => { const name = existsSync(join(tmp, "wt")) && readdirSync(join(tmp, "wt")).find((n) => n.startsWith("bundle-")); return name ? join(tmp, "wt", name) : undefined; };
+  return { resolveFile, resolveCalls, bundleWorktree, ghState, backend, repo, origin, cache, tmp, start, reviewed, replyWith, settled, plan, publish, groupCalls, gh, setGh, ghCreates, task, bundleOf };
 }
 
 type Ctx = Awaited<ReturnType<typeof boot>>;
@@ -324,19 +332,132 @@ test("a stale or foreign proposal is refused: changed head, unstaged task, other
   assert.deepEqual(gh().prs, []);
 });
 
-test("a conflict keeps the opened parent, leaves the rest staged and reports the partial result", { timeout: 60_000 }, async (t) => {
+test("a conflict unstages only the offending task, preserves its source and opened parent, and regroups without publishing", { timeout: 60_000 }, async (t) => {
   const ctx = await boot(t);
   const { backend, repo, replyWith, plan, publish, task, bundleOf } = ctx;
   const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
   const [c] = await staged(ctx, ["Tree colors"]);
   replyWith([{ tasks: ["Readme A", "Readme B"] }, { tasks: ["Tree colors"] }]);
-  const result = await publish(await plan());
+  const proposal = await plan();
+  const sourceHead = git(repo, "rev-parse", b.branch!);
+  replyWith([{ tasks: ["Tree colors"] }]);
+  const result = await publish(proposal);
   const bA = await bundleOf(a.id);
   assert.deepEqual(result.lastResult?.bundleIds, [bA.id]);
   assert.match(result.lastResult!.error!, new RegExp(b.id));
   assert.equal(result.proposal, undefined, "retrying needs a new confirmation");
-  assert.deepEqual([(await task(a.id)).state, (await task(b.id)).state, (await task(c.id)).state], ["pr_open", "staged", "staged"]);
+  assert.deepEqual([(await task(a.id)).state, (await task(b.id)).state, (await task(c.id)).state], ["pr_open", "review", "staged"]);
+  const unstaged = await task(b.id);
+  assert.equal(unstaged.stagedAt, undefined);
+  assert.match(unstaged.error!, /automatically unstaged/i);
+  assert.match(unstaged.error!, /README.md/);
+  assert.equal(git(repo, "rev-parse", b.branch!), sourceHead);
+  assert.ok(existsSync(b.worktree!));
+  const regrouped = await ctx.settled();
+  assert.equal(regrouped.auto, false, "one-shot recovery does not change the setting");
+  assert.deepEqual(regrouped.proposal?.groups.map((g) => g.taskIds), [[c.id]], regrouped.error);
+  assert.equal(regrouped.proposal!.stale, false);
+  assert.equal(ctx.ghCreates(), 1, "recovery does not publish the new proposal");
+  const saved = openDb(ctx.cache);
+  assert.match(JSON.parse((saved.prepare("SELECT data FROM tasks WHERE id = ?").get(b.id) as { data: string }).data).error, /automatically unstaged/i);
+  saved.close();
+  await backend.stage(b.id);
+  assert.equal((await task(b.id)).error, undefined, "restaging clears the recovery notice");
   assert.equal(git(repo, "branch", "--list", "techtree/bundle-*").replace(/^[*+ ]+/, ""), bA.branch, "the failed composition branch is removed");
+});
+
+test("a root conflict unstages its task and clears an empty pool without a model call", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a] = await staged(ctx, ["Obsolete readme"], "readme");
+  ctx.replyWith([{ tasks: ["Obsolete readme"] }]);
+  const proposal = await ctx.plan();
+  writeFileSync(join(ctx.repo, "README.md"), "upstream changed this file\n");
+  git(ctx.repo, "add", "README.md");
+  git(ctx.repo, "commit", "-qm", "Upstream change");
+  git(ctx.repo, "push", "-q", "origin", "main");
+  // The remote moved after grouping; preserve the local fingerprint so replay sees the actual conflict.
+  git(ctx.repo, "reset", "--hard", "HEAD^");
+  const result = await ctx.publish(proposal);
+  assert.deepEqual(result.lastResult?.bundleIds, []);
+  assert.match(result.lastResult!.error!, /automatically unstaged/i);
+  assert.equal((await ctx.task(a.id)).state, "review");
+  const recovered = await ctx.settled();
+  assert.equal(recovered.proposal, undefined);
+  assert.equal(ctx.groupCalls().length, 1);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("a non-conflict cherry-pick failure leaves the task staged and does not regroup", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a] = await staged(ctx, ["Retry validation"]);
+  ctx.replyWith([{ tasks: ["Retry validation"] }]);
+  const proposal = await ctx.plan();
+  const realGit = git(ctx.repo, "--exec-path");
+  writeFileSync(join(ctx.tmp, "bin", "git"), `#!/bin/sh\nif [ "$1" = "cherry-pick" ] && [ "$2" != "--abort" ]; then echo 'injected git failure' >&2; exit 1; fi\nexec ${JSON.stringify(join(realGit, "git"))} "$@"\n`);
+  chmodSync(join(ctx.tmp, "bin", "git"), 0o755);
+  const result = await ctx.publish(proposal);
+  assert.match(result.lastResult!.error!, /injected git failure/);
+  assert.doesNotMatch(result.lastResult!.error!, /conflict|automatically unstaged/i);
+  assert.equal((await ctx.task(a.id)).state, "staged");
+  assert.equal(ctx.groupCalls().length, 1);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("manual combined publication also regroups the remaining pool after automatically unstaging its conflicting task", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
+  const [c] = await staged(ctx, ["Tree colors"]);
+  ctx.replyWith([{ tasks: ["Readme A", "Readme B"] }, { tasks: ["Tree colors"] }]);
+  await ctx.plan();
+  ctx.replyWith([{ tasks: ["Readme A"] }, { tasks: ["Tree colors"] }]);
+  await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (err) => status(err) === 409 && /automatically unstaged/.test((err as Error).message));
+  const regrouped = await ctx.settled();
+  assert.equal(regrouped.auto, false);
+  assert.deepEqual(regrouped.proposal?.groups.map((group) => group.taskIds), [[a.id], [c.id]], regrouped.error);
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state, (await ctx.task(c.id)).state], ["staged", "review", "staged"]);
+  assert.equal(ctx.groupCalls().length, 2);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("failed conflict recovery persistence restores staged state and releases publication status", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
+  ctx.replyWith([{ tasks: ["Readme A", "Readme B"] }]);
+  const proposal = await ctx.plan();
+  const before = { ...(await ctx.task(b.id)) };
+  const db = openDb(ctx.cache);
+  t.after(() => db.close());
+  db.exec("CREATE TRIGGER fail_unstage BEFORE UPDATE ON tasks WHEN OLD.state = 'staged' AND NEW.state = 'review' BEGIN SELECT RAISE(ABORT, 'injected unstage persistence failure'); END");
+  const result = await ctx.publish(proposal);
+  assert.equal(result.status, "idle");
+  assert.match(result.lastResult!.error!, /automatic unstaging failed.*injected unstage persistence failure/);
+  assert.deepEqual(await ctx.task(b.id), before);
+  assert.equal((db.prepare("SELECT state FROM tasks WHERE id = ?").get(b.id) as { state: string }).state, "staged");
+  assert.equal((await ctx.task(a.id)).state, "pr_open");
+  assert.equal(ctx.groupCalls().length, 1, "no regroup claims to have excluded an unpersisted task");
+  db.exec("DROP TRIGGER fail_unstage");
+  await ctx.backend.unstage(b.id);
+  assert.equal((await ctx.task(b.id)).state, "review");
+});
+
+test("manual conflict recovery persistence failure remains a diagnostic 409 and leaves tasks staged", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Readme A", "Readme B"], "readme");
+  const before = { ...(await ctx.task(b.id)) };
+  const db = openDb(ctx.cache);
+  t.after(() => db.close());
+  db.exec("CREATE TRIGGER fail_unstage BEFORE UPDATE ON tasks WHEN OLD.state = 'staged' AND NEW.state = 'review' BEGIN SELECT RAISE(ABORT, 'injected unstage persistence failure'); END");
+  await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (err) => {
+    assert.equal(status(err), 409);
+    assert.match((err as Error).message, new RegExp(b.id));
+    assert.match((err as Error).message, /README.md/);
+    assert.match((err as Error).message, /automatic unstaging failed.*injected unstage persistence failure/);
+    return true;
+  });
+  assert.deepEqual(await ctx.task(b.id), before);
+  assert.equal((await ctx.task(a.id)).state, "staged");
+  assert.equal(ctx.ghCreates(), 0);
+  assert.equal(ctx.groupCalls().length, 0);
 });
 
 test("an ambiguous PR create is adopted from its owned branch on retry, without a duplicate PR", { timeout: 60_000 }, async (t) => {
@@ -583,4 +704,363 @@ test("an opened PR survives a failed local publication transaction and is adopte
   assert.equal((await ctx.publish(await ctx.plan())).lastResult?.error, undefined);
   assert.equal(ctx.ghCreates(), 1);
   assert.equal((await ctx.backend.listBundles()).length, 1);
+});
+
+/** A committed, declared validator that passes only when README.md has both tasks' lines. */
+const VALIDATOR = { "check/both.cjs": "const s = require('fs').readFileSync('README.md', 'utf8');\nprocess.exit(s.includes('alpha') && s.includes('beta') ? 0 : 1);\n" };
+const BOTH_LINES = [process.execPath, "check/both.cjs"];
+type BootOptions = NonNullable<Parameters<typeof boot>[1]>;
+/** Boot options that let the resolver run: the validator committed at the base, declared, and checked. */
+const resolving = (extra: BootOptions = {}): BootOptions => ({ conflictChecks: [BOTH_LINES], conflictValidators: ["check"], ...extra, files: { ...VALIDATOR, ...extra.files } });
+const TEMPLATE = { ".github/pull_request_template.md": "## Template\n\nTrailing: metadata\n" };
+
+/** Two staged tasks that both append a line to README.md, which conflicts additively. */
+async function appended(ctx: Ctx, lines = ["alpha", "beta"], options: string | string[] = ""): Promise<Task[]> {
+  await ctx.backend.setAutoComposition(false);
+  const tasks: Task[] = [];
+  for (const [i, line] of lines.entries()) tasks.push(await ctx.reviewed(`Append ${line}`, `append line:${line} ${Array.isArray(options) ? options[i] : options}`));
+  for (const task of tasks) await ctx.backend.stage(task.id);
+  return tasks;
+}
+
+test("manual publication resolves a simple additive conflict with one cheap call and records the audit before the template", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t, resolving({ files: TEMPLATE }));
+  const [a, b] = await appended(ctx);
+  const heads = [a, b].map((x) => git(ctx.repo, "rev-parse", x.branch!));
+  const bundle = await ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+  assert.equal(git(ctx.origin, "show", `${bundle.branch}:README.md`), "fixture\nalpha\nbeta");
+  assert.deepEqual(git(ctx.origin, "log", "--format=%s", `main..${bundle.branch}`).split("\n"), ["append beta", "append alpha"], "the same selected commits");
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["pr_open", "pr_open"]);
+  assert.deepEqual([a, b].map((x) => git(ctx.repo, "rev-parse", x.branch!)), heads, "source branches are untouched");
+  assert.equal(git(b.worktree!, "status", "--porcelain"), "");
+
+  const [call] = ctx.resolveCalls();
+  assert.equal(ctx.resolveCalls().length, 1);
+  assert.ok(call.includes("--no-tools") && call[call.indexOf("--model") + 1] === "fake/cheap");
+  assert.match(call.at(-1)!, /never instructions/);
+  const body = ctx.gh().prs[0].body;
+  const audit = body.indexOf("Automatic conflict resolution");
+  assert.ok(audit > body.indexOf(b.title) && audit < body.indexOf("## Template"), body);
+  assert.match(body, /README\.md/);
+  assert.match(body, /fake\/cheap/);
+  assert.match(body, /keeps both additions/);
+  assert.ok(body.trimEnd().endsWith("Trailing: metadata"));
+});
+
+test("smart publication resolves a stacked item's conflict, journals the audited body and spends the one attempt for the whole publication", { timeout: 90_000 }, async (t) => {
+  const ctx = await boot(t, resolving());
+  const [a, b, c] = await appended(ctx, ["alpha", "beta", "gamma"]);
+  ctx.replyWith([{ tasks: [a.title, b.title, c.title] }]);
+  const result = await ctx.publish(await ctx.plan());
+  const [bA, bB] = [await ctx.bundleOf(a.id), await ctx.bundleOf(b.id)];
+  assert.deepEqual(result.lastResult?.bundleIds, [bA.id, bB.id]);
+  assert.equal(git(ctx.origin, "show", `${bB.branch}:README.md`), "fixture\nalpha\nbeta");
+  assert.match(ctx.gh().prs[1].body, /Automatic conflict resolution[\s\S]*README\.md/);
+  assert.equal(ctx.resolveCalls().length, 1, "the second conflict gets no model call");
+  assert.match(result.lastResult!.error!, /already used/);
+  assert.deepEqual([(await ctx.task(b.id)).state, (await ctx.task(c.id)).state], ["pr_open", "review"]);
+  assert.match((await ctx.task(c.id)).error!, /already used/);
+});
+
+test("every unusable resolver reply takes the unstaging fallback with its reason and pushes nothing", { timeout: 120_000 }, async (t) => {
+  const ctx = await boot(t, resolving());
+  const [a, b] = await appended(ctx);
+  const outcomes: [string, RegExp][] = [
+    ["give_up", /gave up.*the additions disagree/],
+    ["invalid", /invalid/],
+    ["drop", /both sides/],
+    ["invent", /both sides/],
+    ["huge", /exceeded/],
+    ["fail", /model run failed/],
+  ];
+  for (const [mode, reason] of outcomes) {
+    writeFileSync(ctx.resolveFile, mode);
+    await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (e) => status(e) === 409 && reason.test((e as Error).message));
+    const unstaged = await ctx.task(b.id);
+    assert.equal(unstaged.state, "review", mode);
+    assert.match(unstaged.error!, reason);
+    assert.match(unstaged.error!, /README\.md/);
+    assert.equal((await ctx.task(a.id)).state, "staged");
+    await ctx.backend.stage(b.id);
+  }
+  assert.equal(ctx.resolveCalls().length, outcomes.length, "one call per confirmed publication, no retries");
+  assert.equal(ctx.ghCreates(), 0);
+  assert.equal(git(ctx.origin, "branch", "--list", "techtree/bundle-*"), "");
+  assert.equal(git(ctx.repo, "branch", "--list", "techtree/bundle-*"), "");
+});
+
+test("checks must pass the resolution and reject each side alone", { timeout: 120_000 }, async (t) => {
+  const node = (code: string) => [process.execPath, "-e", code];
+  const cases: [string[][], RegExp][] = [
+    [[node("process.exit(1)")], /failed on the resolution/],
+    [[node("")], /cannot tell/],
+  ];
+  for (const [conflictChecks, reason] of cases) {
+    const ctx = await boot(t, resolving({ conflictChecks }));
+    const [a, b] = await appended(ctx);
+    await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (e) => status(e) === 409 && reason.test((e as Error).message));
+    assert.equal((await ctx.task(b.id)).state, "review");
+    assert.equal(ctx.ghCreates(), 0);
+  }
+});
+
+test("a check that changes the composition or a declared validator is operational drift: every task stays staged", { timeout: 120_000 }, async (t) => {
+  const node = (code: string) => [process.execPath, "-e", code];
+  for (const tamper of ["require('fs').appendFileSync('README.md', 'tampered\\n')", "require('fs').appendFileSync('check/both.cjs', '// weakened\\n')", "require('fs').writeFileSync('check/extra.cjs', '')", "const fs = require('fs'); fs.renameSync('check', 'real'); fs.symlinkSync('real', 'check')"]) {
+    const ctx = await boot(t, resolving({ conflictChecks: [node(tamper), BOTH_LINES] }));
+    const [a, b] = await appended(ctx);
+    await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id, b.id] }), (e) => status(e) === 502 && /drift/.test((e as Error).message) || assert.fail((e as Error).message));
+    assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["staged", "staged"], tamper);
+    assert.equal(ctx.ghCreates(), 0);
+  }
+});
+
+test("conflicts outside the additive text scope, or without checks or a cheap model, give up before any model call", { timeout: 180_000 }, async (t) => {
+  const cases: { why: RegExp; scenario?: string; options?: string | string[]; boot?: BootOptions; symlink?: [string, string] }[] = [
+    { why: /conflictChecks/, boot: {} },
+    { why: /conflictValidators/, boot: { conflictChecks: [BOTH_LINES], files: VALIDATOR } },
+    { why: /conflictValidators.*missing\.cjs/, boot: resolving({ conflictValidators: ["missing.cjs"] }) },
+    { why: /conflictValidators/, boot: resolving({ conflictValidators: ["../check"] }) },
+    { why: /conflictValidators/, boot: resolving({ conflictValidators: ["check/*.cjs"] }) },
+    { why: /conflictValidators.*link\.cjs/, boot: resolving({ conflictValidators: ["link.cjs"] }), symlink: ["check/both.cjs", "link.cjs"] },
+    { why: /conflictValidators.*linkdir/, boot: resolving({ conflictValidators: ["linkdir/both.cjs"] }), symlink: ["check", "linkdir"] },
+    { why: /declared validator/, options: "files:validator.cjs", boot: resolving({ conflictChecks: [[process.execPath, "runner.cjs"]], conflictValidators: ["runner.cjs", "validator.cjs"], files: { "runner.cjs": "require('./validator.cjs');\n", "validator.cjs": "'use strict';\n" } }) },
+    { why: /declared validator/, options: ["files:README.md,check/both.cjs", ""] },
+    { why: /declared validator/, options: ["files:README.md,check/new.cjs", ""] },
+    { why: /cheap model/, boot: resolving({ titleModel: null }) },
+    { why: /name a conflicted file/, boot: resolving({ conflictChecks: [[process.execPath, "--check", "./README.md"]] }) },
+    { why: /additive/, scenario: "readme" },
+    { why: /lockfile or dependency manifest/, options: "files:Cargo.lock", boot: resolving({ files: { "Cargo.lock": "# lock\n" } }) },
+    { why: /binary|NUL/, options: "files:data.bin", boot: resolving({ files: { "data.bin": "a\0b\n" } }) },
+    { why: /stages/, options: "files:NEW.md" },
+    { why: /stages/, scenario: "move" },
+    { why: /more than 3 files/, options: "files:a.txt,b.txt,c.txt,d.txt", boot: resolving({ files: { "a.txt": "a\n", "b.txt": "b\n", "c.txt": "c\n", "d.txt": "d\n" } }) },
+    { why: /200 conflicting lines/, options: "lines:150" },
+    { why: /32 KiB/, options: "lines:40 width:500" },
+  ];
+  for (const c of cases) {
+    const ctx = await boot(t, c.boot ?? resolving());
+    if (c.symlink) {
+      symlinkSync(c.symlink[0], join(ctx.repo, c.symlink[1]));
+      git(ctx.repo, "add", c.symlink[1]);
+      git(ctx.repo, "commit", "-qm", "link");
+      git(ctx.repo, "push", "-q", "origin", "main");
+    }
+    let tasks: Task[];
+    if (c.scenario === "readme") tasks = await staged(ctx, ["Readme A", "Readme B"], "readme");
+    else if (c.scenario === "move") {
+      await ctx.backend.setAutoComposition(false);
+      tasks = [await ctx.reviewed("Move A", "move file:README.md to:A.md"), await ctx.reviewed("Move B", "move file:README.md to:B.md")];
+      for (const x of tasks) await ctx.backend.stage(x.id);
+    }
+    else tasks = await appended(ctx, ["alpha", "beta"], c.options ?? "");
+    await assert.rejects(ctx.backend.createBundle({ taskIds: tasks.map((x) => x.id) }), (e) => status(e) === 409 && c.why.test((e as Error).message) || assert.fail(`${c.why}: ${(e as Error).message}`));
+    assert.equal(ctx.resolveCalls().length, 0, String(c.why));
+    assert.equal((await ctx.task(tasks[1].id)).state, "review");
+  }
+});
+
+test("source drift while the resolver runs is a plain failure that keeps every task staged, even when the model gives up", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t, resolving());
+  const [a, b] = await appended(ctx);
+  writeFileSync(ctx.resolveFile, "give_up");
+  writeFileSync(`${ctx.resolveFile}.hold`, "");
+  const publishing = ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+  await until(() => ctx.resolveCalls().length === 1, "the resolver call");
+  writeFileSync(join(a.worktree!, "late.txt"), "late\n");
+  git(a.worktree!, "add", "-A");
+  git(a.worktree!, "commit", "-qm", "late change");
+  unlinkSync(`${ctx.resolveFile}.hold`);
+  await assert.rejects(publishing, (e) => status(e) === 502 && /changed/.test((e as Error).message) && !/unstaged/.test((e as Error).message));
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["staged", "staged"]);
+  assert.equal((await ctx.task(b.id)).error, undefined);
+  assert.equal(ctx.ghCreates(), 0);
+  assert.equal(git(ctx.repo, "branch", "--list", "techtree/bundle-*"), "");
+});
+
+test("shutdown during a resolver call kills the model's process group and leaves the tasks staged", { timeout: 60_000, skip: process.platform === "win32" }, async (t) => {
+  const ctx = await boot(t, resolving());
+  const [a, b] = await appended(ctx);
+  writeFileSync(ctx.resolveFile, "orphan");
+  const publishing = ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+  const child = await until(() => (existsSync(`${ctx.resolveFile}.child`) ? Number(readFileSync(`${ctx.resolveFile}.child`, "utf8")) : undefined), "the model's child");
+  await ctx.backend.close();
+  await assert.rejects(publishing, (e) => status(e) === 502 && /stopped/.test((e as Error).message));
+  for (const pid of [child, Number(readFileSync(`${ctx.resolveFile}.pid`, "utf8"))]) assert.throws(() => process.kill(pid, 0), "no resolver process survives shutdown");
+  const db = openDb(ctx.cache);
+  t.after(() => db.close());
+  const states = (db.prepare("SELECT data FROM tasks").all() as { data: string }[]).map((r) => JSON.parse(r.data).state);
+  assert.deepEqual(states, ["staged", "staged"]);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("a manual replay with no net change is refused before push or PR creation", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a] = await staged(ctx, ["Retry validation"]);
+  git(a.worktree!, "revert", "--no-edit", "HEAD");
+  await assert.rejects(ctx.backend.createBundle({ taskIds: [a.id] }), (e) => status(e) === 502 && /changes nothing/.test((e as Error).message));
+  assert.equal(ctx.ghCreates(), 0);
+  assert.equal(git(ctx.origin, "branch", "--list", "techtree/bundle-*"), "");
+  assert.equal((await ctx.task(a.id)).state, "staged");
+});
+
+test("a stack parent that changes while the resolver runs fails the item plainly and keeps it staged", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t, resolving());
+  const [a, b] = await appended(ctx);
+  ctx.replyWith([{ tasks: [a.title, b.title] }]);
+  const proposal = await ctx.plan();
+  writeFileSync(`${ctx.resolveFile}.hold`, "");
+  const publishing = ctx.publish(proposal);
+  await until(() => ctx.resolveCalls().length === 1, "the resolver call");
+  ctx.setGh({ prs: ctx.gh().prs.map((p) => ({ ...p, headRefOid: "0".repeat(40) })) });
+  unlinkSync(`${ctx.resolveFile}.hold`);
+  const result = await publishing;
+  assert.match(result.lastResult!.error!, /parent PR #\d+ changed/);
+  assert.doesNotMatch(result.lastResult!.error!, /unstaged/);
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["pr_open", "staged"]);
+  assert.equal(ctx.ghCreates(), 1);
+});
+
+/** Hold the fake model's reply until `during` has run, then let it answer `reply`. */
+async function whileResolving(ctx: Ctx, reply: string, during: () => void | Promise<void>): Promise<void> {
+  writeFileSync(ctx.resolveFile, reply);
+  writeFileSync(`${ctx.resolveFile}.hold`, "");
+  await until(() => ctx.resolveCalls().length === 1, "the resolver call");
+  await during();
+  unlinkSync(`${ctx.resolveFile}.hold`);
+}
+
+test("changes to the composition worktree while the model runs are operational drift on success and give-up alike", { timeout: 120_000 }, async (t) => {
+  const changes: [string, (wt: string) => void][] = [
+    ["union", (wt) => { writeFileSync(join(wt, "src/util/mod.rs"), "fn changed() {}\n"); git(wt, "add", "src/util/mod.rs"); }],
+    ["give_up", (wt) => writeFileSync(join(wt, "README.md"), "rewritten while waiting\n")],
+  ];
+  for (const [reply, change] of changes) {
+    const ctx = await boot(t, resolving());
+    const [a, b] = await appended(ctx);
+    const publishing = ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+    await whileResolving(ctx, reply, () => change(ctx.bundleWorktree()!));
+    await assert.rejects(publishing, (e) => status(e) === 502 && /drift/.test((e as Error).message) || assert.fail((e as Error).message));
+    assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["staged", "staged"], reply);
+    assert.equal(ctx.ghCreates(), 0);
+    assert.equal(git(ctx.repo, "branch", "--list", "techtree/bundle-*"), "");
+  }
+});
+
+test("a conflict-free manual publication still refuses a source branch that moved after the request", { timeout: 60_000 }, async (t) => {
+  const ctx = await boot(t);
+  const [a, b] = await staged(ctx, ["Retry validation", "Tree colors"]);
+  const realGit = join(git(ctx.repo, "--exec-path"), "git");
+  const hold = join(ctx.tmp, "fetch.hold");
+  writeFileSync(join(ctx.tmp, "bin", "git"), `#!/bin/sh\nif [ "$1" = "fetch" ] && [ -f ${JSON.stringify(hold)} ]; then touch ${JSON.stringify(`${hold}.waiting`)}; while [ -f ${JSON.stringify(hold)} ]; do sleep 0.05; done; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+  chmodSync(join(ctx.tmp, "bin", "git"), 0o755);
+  writeFileSync(hold, "");
+  const publishing = ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+  await until(() => existsSync(`${hold}.waiting`), "the held fetch");
+  writeFileSync(join(a.worktree!, "late.txt"), "late\n");
+  git(a.worktree!, "add", "-A");
+  git(a.worktree!, "commit", "-qm", "late source change");
+  unlinkSync(hold);
+  await assert.rejects(publishing, (e) => status(e) === 502 && /changed/.test((e as Error).message));
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["staged", "staged"]);
+  assert.equal(ctx.ghCreates(), 0);
+});
+
+test("drift in another selected task overrides a stacked item's give-up and keeps the unpublished tasks staged", { timeout: 90_000 }, async (t) => {
+  const ctx = await boot(t, resolving());
+  const [a, b] = await appended(ctx);
+  const [c] = await staged(ctx, ["Tree colors"]);
+  ctx.replyWith([{ tasks: [a.title, b.title] }, { tasks: [c.title] }]);
+  const proposal = await ctx.plan();
+  const publishing = ctx.publish(proposal);
+  await whileResolving(ctx, "give_up", () => {
+    writeFileSync(join(c.worktree!, "late.txt"), "late\n");
+    git(c.worktree!, "add", "-A");
+    git(c.worktree!, "commit", "-qm", "late sibling change");
+  });
+  const result = await publishing;
+  assert.match(result.lastResult!.error!, /changed/);
+  assert.doesNotMatch(result.lastResult!.error!, /unstaged/);
+  assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state, (await ctx.task(c.id)).state], ["pr_open", "staged", "staged"]);
+});
+
+test("shutdown or source drift during the parent check after a give-up still keeps the stacked item staged", { timeout: 120_000 }, async (t) => {
+  for (const event of ["shutdown", "drift"]) {
+    const ctx = await boot(t, resolving());
+    const [a, b] = await appended(ctx);
+    ctx.replyWith([{ tasks: [a.title, b.title] }]);
+    const proposal = await ctx.plan();
+    const publishing = ctx.publish(proposal);
+    const viewHold = `${ctx.ghState}.view-hold`;
+    await whileResolving(ctx, "give_up", () => writeFileSync(viewHold, ""));
+    await until(() => existsSync(`${ctx.ghState}.view-waiting`), "the held parent check");
+    let closing: Promise<void> | undefined;
+    if (event === "shutdown") closing = ctx.backend.close();
+    else {
+      writeFileSync(join(b.worktree!, "late.txt"), "late\n");
+      git(b.worktree!, "add", "-A");
+      git(b.worktree!, "commit", "-qm", "late change");
+    }
+    unlinkSync(viewHold);
+    const result = await publishing;
+    await closing;
+    assert.match(result.lastResult!.error!, event === "shutdown" ? /stopped/ : /changed/);
+    assert.doesNotMatch(result.lastResult!.error!, /unstaged/);
+    const db = openDb(ctx.cache);
+    const states = Object.fromEntries((db.prepare("SELECT id, data FROM tasks").all() as { id: string; data: string }[]).map((r) => [r.id, JSON.parse(r.data).state]));
+    db.close();
+    assert.deepEqual([states[a.id], states[b.id]], ["pr_open", "staged"], event);
+  }
+});
+
+test("shutdown or source drift while a conflict's temporary bundle is cleaned up overrides the unstaging fallback", { timeout: 120_000 }, async (t) => {
+  for (const event of ["drift", "shutdown"]) {
+    const ctx = await boot(t, resolving());
+    const [a, b] = await appended(ctx);
+    writeFileSync(ctx.resolveFile, "give_up");
+    const realGit = join(git(ctx.repo, "--exec-path"), "git");
+    const hold = join(ctx.tmp, "cleanup.hold");
+    writeFileSync(join(ctx.tmp, "bin", "git"), `#!/bin/sh\nif [ "$1 $2" = "worktree remove" ] && [ -f ${JSON.stringify(hold)} ]; then touch ${JSON.stringify(`${hold}.waiting`)}; while [ -f ${JSON.stringify(hold)} ]; do sleep 0.05; done; fi\nexec ${JSON.stringify(realGit)} "$@"\n`);
+    chmodSync(join(ctx.tmp, "bin", "git"), 0o755);
+    writeFileSync(hold, "");
+    const publishing = ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+    publishing.catch(() => {});
+    await until(() => existsSync(`${hold}.waiting`), "the held cleanup");
+    let closing: Promise<void> | undefined;
+    if (event === "shutdown") closing = ctx.backend.close();
+    else {
+      writeFileSync(join(a.worktree!, "late.txt"), "late\n");
+      git(a.worktree!, "add", "-A");
+      git(a.worktree!, "commit", "-qm", "late change");
+    }
+    unlinkSync(hold);
+    await assert.rejects(publishing, (e) => (event === "shutdown" ? /stopped/ : /changed/).test((e as Error).message) && !/unstaged/.test((e as Error).message) || assert.fail((e as Error).message));
+    await closing;
+    const db = openDb(ctx.cache);
+    const states = Object.fromEntries((db.prepare("SELECT id, data FROM tasks").all() as { id: string; data: string }[]).map((r) => [r.id, JSON.parse(r.data).state]));
+    db.close();
+    assert.deepEqual([states[a.id], states[b.id]], ["staged", "staged"], event);
+  }
+});
+
+test("a declared validator changed while the model runs is operational drift before any outcome or check, so a new validator never executes", { timeout: 120_000 }, async (t) => {
+  const node = (code: string) => [process.execPath, "-e", code];
+  const discover = node("for (const f of require('fs').readdirSync('check').sort()) require(require('path').resolve('check', f))");
+  const cases: [string, (wt: string, marker: string) => void][] = [
+    ["give_up", (wt, marker) => writeFileSync(join(wt, "check/a-new.cjs"), `require('fs').writeFileSync(${JSON.stringify(marker)}, '');\n`)],
+    ["union", (wt, marker) => writeFileSync(join(wt, "check/a-new.cjs"), `require('fs').writeFileSync(${JSON.stringify(marker)}, '');\n`)],
+    ["union", (wt) => { renameSync(join(wt, "check"), join(wt, "real")); symlinkSync("real", join(wt, "check")); }],
+  ];
+  for (const [reply, change] of cases) {
+    const ctx = await boot(t, resolving({ conflictChecks: [discover] }));
+    const marker = join(ctx.tmp, "new-validator-ran");
+    const [a, b] = await appended(ctx);
+    const publishing = ctx.backend.createBundle({ taskIds: [a.id, b.id] });
+    publishing.catch(() => {});
+    await whileResolving(ctx, reply, () => change(ctx.bundleWorktree()!, marker));
+    await assert.rejects(publishing, (e) => status(e) === 502 && /drift/.test((e as Error).message) || assert.fail(`${reply}: ${(e as Error).message}`));
+    assert.deepEqual([(await ctx.task(a.id)).state, (await ctx.task(b.id)).state], ["staged", "staged"], reply);
+    assert.equal(existsSync(marker), false, "the inserted validator never runs");
+    assert.equal(ctx.ghCreates(), 0);
+  }
 });

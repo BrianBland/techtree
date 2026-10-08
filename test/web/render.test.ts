@@ -862,13 +862,18 @@ test("the start dialog leaves Open PR automatically unchecked (manual review) un
   }
 });
 
-test("staged tasks start unchecked; Smart group shows the proposal and Publish confirms exactly that proposal", UI_TIMEOUT, async (t) => {
+test("smart groups are visual, remain unchecked and let the human adjust a selection for one combined PR", UI_TIMEOUT, async (t) => {
   const { tmp } = fixture(t);
   const groups = join(tmp, "groups.json");
   withEnv(t, "FAKE_GROUPS", groups);
   const published: unknown[] = [];
+  const combined: unknown[] = [];
   const ui = await bootUi(t, (real) => ({
     ...delegate(real),
+    createBundle: async (input) => {
+      combined.push(input);
+      return { id: "combined", project: "quality", title: "Selected changes", branch: "combined", worktree: "", taskIds: input.taskIds, pr: 77, url: "https://example.com/pull/77", createdAt: new Date().toISOString() };
+    },
     publishComposition: async (input) => {
       published.push(input);
       return real.getComposition(input.project);
@@ -887,19 +892,54 @@ test("staged tasks start unchecked; Smart group shows the proposal and Publish c
   const b = await reviewed("Retry tests");
   await backend.stage(b.id);
   await app.waitFor(() => checkboxes().length === 2, "the task staged while the section is open");
-  assert.deepEqual(checkboxes().map(isChecked), [false, false]);
+  const c = await reviewed("Tree colors");
+  await backend.stage(c.id);
+  await app.waitFor(() => checkboxes().length === 3, "another unchecked task");
+  assert.deepEqual(checkboxes().map(isChecked), [false, false, false]);
   assert.match(section().textContent, /Open combined PR \(0\)/);
   assert.match(section().textContent, /groupModel|titleModel/, "automatic grouping says it needs a cheap model");
 
-  writeFileSync(groups, JSON.stringify({ groups: [{ tasks: ["title:Retry validation", "title:Retry tests"], parent: null, rationale: "both about retries" }] }));
+  writeFileSync(groups, JSON.stringify({ groups: [
+    { tasks: ["title:Retry validation", "title:Retry tests"], parent: null, rationale: "both about retries" },
+    { tasks: ["title:Tree colors"], parent: null, rationale: "visual changes" },
+  ] }));
   const button = (text: string) => section().querySelectorAll((n) => n.localName === "button" && n.textContent === text)[0];
   button("Smart group").dispatch("click");
-  await app.waitFor(() => section().textContent.includes("both about retries") && button("Publish 2 PRs (runs CI)") !== undefined, "the proposal");
+  await app.waitFor(() => section().textContent.includes("both about retries") && section().querySelectorAll((n) => n.getAttribute("class") === "suggested-group").length === 2, "visual groups");
   assert.equal(published.length, 0, "grouping never publishes");
-  button("Publish 2 PRs (runs CI)").dispatch("click");
-  await app.waitFor(() => published.length === 1, "publish request");
-  const { proposal } = await backend.getComposition();
-  assert.deepEqual(published[0], { project: "quality", proposalId: proposal!.id, fingerprint: proposal!.fingerprint });
+  assert.deepEqual(checkboxes().map(isChecked), [false, false, false]);
+  assert.ok(!section().textContent.includes("Publish 3 PRs"), "no whole-plan publication action");
+  const group = () => section().querySelectorAll((n) => n.getAttribute("class") === "suggested-group")[0];
+  group().querySelectorAll((n) => n.localName === "button" && n.textContent === "Select group")[0].dispatch("click");
+  await app.waitFor(() => button("Open combined PR (2)") !== undefined, "group selected");
+  group().querySelectorAll((n) => n.localName === "button" && n.textContent === "Deselect group")[0].dispatch("click");
+  await app.waitFor(() => button("Open combined PR (0)") !== undefined, "group deselected");
+  group().querySelectorAll((n) => n.localName === "button" && n.textContent === "Select group")[0].dispatch("click");
+  await app.waitFor(() => button("Open combined PR (2)") !== undefined, "group selected again");
+  const boxes = checkboxes();
+  boxes[1].checked = false;
+  boxes[1].dispatch("change");
+  boxes[2].checked = true;
+  boxes[2].dispatch("change");
+  await app.waitFor(() => isChecked(checkboxes()[0]) && !isChecked(checkboxes()[1]) && isChecked(checkboxes()[2]), "manual selection across groups");
+  button("Open combined PR (2)").dispatch("click");
+  await app.waitFor(() => combined.length === 1 && button("Open combined PR (0)") !== undefined, "one combined request and selection reset");
+  assert.deepEqual(combined[0], { project: "quality", taskIds: [a.id, c.id] });
+  assert.equal(published.length, 0);
+  // A stale proposal must not hide new staged tasks or allow stale group shortcuts.
+  const d = await reviewed("Newly staged");
+  await backend.stage(d.id);
+  await app.waitFor(() => checkboxes().length === 4 && section().textContent.includes("group again"), "stale proposal falls back to full pool");
+  assert.deepEqual(checkboxes().map(isChecked), [false, false, false, false]);
+  const selectA = checkboxes()[0];
+  selectA.checked = true;
+  selectA.dispatch("change");
+  await app.waitFor(() => button("Open combined PR (1)") !== undefined, "manual flat-list selection");
+  await backend.unstage(a.id);
+  await app.waitFor(() => checkboxes().length === 3, "unstaged task removed");
+  await backend.stage(a.id);
+  await app.waitFor(() => checkboxes().length === 4, "restaged task restored unchecked");
+  assert.deepEqual(checkboxes().map(isChecked), [false, false, false, false]);
 
   const auto = section().querySelectorAll((n) => n.localName === "label" && n.textContent.includes("Group automatically"))[0].querySelectorAll((n) => n.localName === "input")[0] as Toggle;
   assert.equal(isChecked(auto), true);

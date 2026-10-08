@@ -218,6 +218,8 @@ main { flex: 1; display: flex; min-height: 0; }
 .state.staged { color: var(--good); font-weight: 700; }
 .summary { margin: 6px 0; padding: 6px 8px; border-left: 3px solid var(--gold); background: rgba(255, 255, 255, 0.04); white-space: pre-wrap; }
 .staged-bundle input[type="text"] { width: 100%; box-sizing: border-box; margin: 4px 0; }
+.suggested-groups { display: grid; gap: 8px; margin: 8px 0; }
+.suggested-group { border: 1px solid var(--line); border-left: 3px solid var(--accent); padding: 8px; }
 .checklist { list-style: none; padding: 0; margin: 6px 0; font-size: 12px; }
 .checklist .done { color: var(--muted); }
 .log, .diff {

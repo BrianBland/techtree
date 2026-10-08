@@ -213,32 +213,49 @@ function useComposition(project: string, onError: (message: string) => void): [A
 }
 
 /**
- * A project's staged tasks, unchecked, with "Open combined PR"; smart grouping with its proposal and "Publish N PRs";
+ * A project's unchecked staged tasks, visual smart-group suggestions and manual combined publication;
  * and the open stacks (DESIGN "Staging and combined PRs", "Smart PR composition").
  */
 function StagedSection({ title, project, tasks, nodeName, onError }: { title: string; project: string; tasks: Task[]; nodeName(id: NodeId): string; onError(message: string): void }) {
-  const [checked, setChecked] = useState<Set<string>>(new Set());
+  const [selection, setSelection] = useState<Set<string>>(new Set());
   const [prTitle, setPrTitle] = useState("");
   const [opening, setOpening] = useState(false);
   const [composition, setComposition] = useComposition(project, onError);
+  // Staging generations make an unstaged/re-staged task unchecked without synchronizing props into state.
+  const selectionKey = (task: Task) => `${task.id}:${task.stagedAt ?? ""}`;
+  const checked = new Set(tasks.filter((task) => selection.has(selectionKey(task))).map((task) => task.id));
+  const proposedIds = composition?.proposal?.groups.flatMap((group) => group.taskIds) ?? [];
+  const showGroups = !!composition?.proposal && !composition.proposal.stale && proposedIds.length === tasks.length && tasks.every((task) => proposedIds.includes(task.id));
   if (!tasks.length && !composition?.stacks.length && !composition?.lastResult) return null;
   const taskIds = tasks.filter((t) => checked.has(t.id)).map((t) => t.id);
-  const toggle = (id: string) =>
-    setChecked((ids) => {
+  const toggle = (id: string) => {
+    const task = tasks.find((task) => task.id === id);
+    if (!task) return;
+    const key = selectionKey(task);
+    setSelection((ids) => {
       const next = new Set(ids);
-      if (!next.delete(id)) next.add(id);
+      if (!next.delete(key)) next.add(key);
+      return next;
+    });
+  };
+  const toggleGroup = (groupIds: string[]) =>
+    setSelection((ids) => {
+      const next = new Set(ids);
+      const keys = tasks.filter((task) => groupIds.includes(task.id)).map(selectionKey);
+      const remove = keys.every((key) => ids.has(key));
+      for (const key of keys) if (remove) next.delete(key); else next.add(key);
       return next;
     });
   const open = () => {
     setOpening(true);
     post<Bundle>("/api/bundles", { project, taskIds, title: prTitle })
-      .then(() => setPrTitle(""), (e: Error) => onError(e.message))
+      .then(() => { setPrTitle(""); setSelection(new Set()); }, (e: Error) => onError(e.message))
       .finally(() => setOpening(false));
   };
   return (
     <section class="staged-bundle">
       <h3>{title}</h3>
-      {composition && tasks.length > 0 && <SmartGroup composition={composition} tasks={tasks} onChange={setComposition} onError={onError} />}
+      {composition && tasks.length > 0 && <SmartGroup composition={composition} tasks={tasks} showGroups={showGroups} checked={checked} toggle={toggle} toggleGroup={toggleGroup} nodeName={nodeName} onChange={setComposition} onError={onError} />}
       {composition?.lastResult && (
         <p class={`small${composition.lastResult.error ? " error" : ""}`}>
           Opened {composition.lastResult.bundleIds.length} PRs{composition.lastResult.error ? `; stopped: ${composition.lastResult.error}` : "."}
@@ -246,18 +263,9 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
       )}
       {tasks.length > 0 && (
         <>
-          <ul class="list">
-            {tasks.map((task) => (
-              <li key={task.id}>
-                <label>
-                  <input type="checkbox" checked={checked.has(task.id)} onChange={() => toggle(task.id)} /> {task.title}
-                  <span class="muted small"> · {nodeName(task.node)}</span>
-                </label>
-              </li>
-            ))}
-          </ul>
+          {!showGroups && <StagedTasks tasks={tasks} checked={checked} toggle={toggle} nodeName={nodeName} />}
           <input type="text" placeholder="PR title (default: from the tasks)" value={prTitle} onInput={(e) => setPrTitle((e.currentTarget as HTMLInputElement).value)} />
-          <button disabled={!taskIds.length || opening} onClick={open}>
+          <button class="primary" disabled={!taskIds.length || opening || composition?.status === "publishing"} onClick={open}>
             {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
           </button>
         </>
@@ -267,25 +275,38 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
   );
 }
 
-function SmartGroup({ composition, tasks, onChange, onError }: { composition: ApiComposition; tasks: Task[]; onChange(c: ApiComposition): void; onError(message: string): void }) {
+function StagedTasks({ tasks, checked, toggle, nodeName }: { tasks: Task[]; checked: Set<string>; toggle(id: string): void; nodeName(id: NodeId): string }) {
+  return (
+    <ul class="list">
+      {tasks.map((task) => (
+        <li key={task.id}>
+          <label>
+            <input type="checkbox" checked={checked.has(task.id)} onChange={() => toggle(task.id)} /> {task.title}
+            <span class="muted small"> · {nodeName(task.node)}</span>
+          </label>
+        </li>
+      ))}
+    </ul>
+  );
+}
+
+function SmartGroup({ composition, tasks, showGroups, checked, toggle, toggleGroup, nodeName, onChange, onError }: { composition: ApiComposition; tasks: Task[]; showGroups: boolean; checked: Set<string>; toggle(id: string): void; toggleGroup(ids: string[]): void; nodeName(id: NodeId): string; onChange(c: ApiComposition): void; onError(message: string): void }) {
   const { project, proposal, status } = composition;
   const query = `?project=${encodeURIComponent(project)}`;
   const call = (path: string, body: object = {}) => post<ApiComposition>(path, body).then(onChange, (e: Error) => onError(e.message));
   const busy = status === "planning" || status === "publishing";
-  const titleOf = (id: string) => tasks.find((t) => t.id === id)?.title ?? id;
   const parentPr = (id: string) => composition.stacks.find((b) => b.id === id)?.pr;
-  const count = proposal?.groups.reduce((n, g) => n + g.taskIds.length, 0) ?? 0;
   const note =
     status === "planning" ? "Grouping…"
     : status === "queued" ? "Grouping shortly…"
     : status === "publishing" ? "Publishing…"
+    : proposal && !showGroups ? "The staged tasks changed since these suggestions; group again."
     : composition.auto && !composition.model ? "Automatic grouping needs groupModel or titleModel in the config; Smart group uses pi's default model."
-    : proposal?.stale ? "The staged tasks changed since this proposal; group again."
     : "";
   return (
     <div class="smart-group">
       <div class="actions">
-        <button class="primary" disabled={busy} onClick={() => call(`/api/composition/plan${query}`)}>
+        <button disabled={busy} onClick={() => call(`/api/composition/plan${query}`)}>
           Smart group
         </button>
         <label class="small">
@@ -294,25 +315,23 @@ function SmartGroup({ composition, tasks, onChange, onError }: { composition: Ap
       </div>
       {note && <p class="muted small">{note}</p>}
       {composition.error && <p class="error small">{composition.error}</p>}
-      {proposal && (
-        <>
-          <ol class="list">
-            {proposal.groups.map((group) => (
-              <li key={group.taskIds.join()}>
-                {group.taskIds.map(titleOf).join(" → ")}
-                <span class="muted small"> → {group.parent ? `#${parentPr(group.parent) ?? group.parent}` : "base branch"}</span>
-                <div class="muted small">{group.rationale}</div>
-              </li>
-            ))}
-          </ol>
-          <button
-            class="primary"
-            disabled={busy || proposal.stale}
-            onClick={() => call("/api/composition/publish", { project, proposalId: proposal.id, fingerprint: proposal.fingerprint })}
-          >
-            {`Publish ${count} PRs (runs CI)`}
-          </button>
-        </>
+      {proposal && showGroups && (
+        <div class="suggested-groups">
+          <p class="muted small">Suggested groups only. Select or adjust changes, then open one combined PR against the base branch.</p>
+          {proposal.groups.map((group, index) => (
+            <div class="suggested-group" key={group.taskIds.join()}>
+              <div class="actions">
+                <strong>Group {index + 1}</strong>
+                <button onClick={() => toggleGroup(group.taskIds)}>
+                  {group.taskIds.every((id) => checked.has(id)) ? "Deselect group" : "Select group"}
+                </button>
+              </div>
+              <div class="muted small">{group.rationale}</div>
+              {group.parent && <p class="muted small">Related to existing stack #{parentPr(group.parent) ?? group.parent}; combined PR still targets the base branch.</p>}
+              <StagedTasks tasks={group.taskIds.flatMap((id) => tasks.filter((task) => task.id === id))} checked={checked} toggle={toggle} nodeName={nodeName} />
+            </div>
+          ))}
+        </div>
       )}
     </div>
   );
