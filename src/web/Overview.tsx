@@ -220,13 +220,24 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [prTitle, setPrTitle] = useState("");
   const [opening, setOpening] = useState(false);
+  const [openedPr, setOpenedPr] = useState<Bundle | null>(null);
+  const [publicationError, setPublicationError] = useState("");
   const [composition, setComposition] = useComposition(project, onError);
   // Staging generations make an unstaged/re-staged task unchecked without synchronizing props into state.
   const selectionKey = (task: Task) => `${task.id}:${task.stagedAt ?? ""}`;
   const checked = new Set(tasks.filter((task) => selection.has(selectionKey(task))).map((task) => task.id));
   const proposedIds = composition?.proposal?.groups.flatMap((group) => group.taskIds) ?? [];
   const showGroups = !!composition?.proposal && !composition.proposal.stale && proposedIds.length === tasks.length && tasks.every((task) => proposedIds.includes(task.id));
-  if (!tasks.length && !composition?.stacks.length && !composition?.lastResult) return null;
+  const badges = new Map<string, { number: number; rationale: string }>();
+  let groupNumber = 0;
+  const orderedTasks = showGroups ? composition!.proposal!.groups.flatMap((group) => {
+    const badge = group.taskIds.length > 1 ? { number: ++groupNumber, rationale: group.rationale } : undefined;
+    return group.taskIds.map((id) => {
+      if (badge) badges.set(id, badge);
+      return tasks.find((task) => task.id === id)!;
+    });
+  }) : tasks;
+  if (!tasks.length && !composition?.stacks.length && !composition?.lastResult && !openedPr && !publicationError) return null;
   const taskIds = tasks.filter((t) => checked.has(t.id)).map((t) => t.id);
   const toggle = (id: string) => {
     const task = tasks.find((task) => task.id === id);
@@ -238,36 +249,35 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
       return next;
     });
   };
-  const toggleGroup = (groupIds: string[]) =>
-    setSelection((ids) => {
-      const next = new Set(ids);
-      const keys = tasks.filter((task) => groupIds.includes(task.id)).map(selectionKey);
-      const remove = keys.every((key) => ids.has(key));
-      for (const key of keys) if (remove) next.delete(key); else next.add(key);
-      return next;
-    });
   const open = () => {
     setOpening(true);
+    setPublicationError("");
     post<Bundle>("/api/bundles", { project, taskIds, title: prTitle })
-      .then(() => { setPrTitle(""); setSelection(new Set()); }, (e: Error) => onError(e.message))
+      .then((bundle) => { setOpenedPr(bundle); setPrTitle(""); setSelection(new Set()); }, (e: Error) => { setPublicationError(e.message); onError(e.message); })
       .finally(() => setOpening(false));
   };
   return (
     <section class="staged-bundle">
       <h3>{title}</h3>
-      {composition && tasks.length > 0 && <SmartGroup composition={composition} tasks={tasks} showGroups={showGroups} checked={checked} toggle={toggle} toggleGroup={toggleGroup} nodeName={nodeName} onChange={setComposition} onError={onError} />}
-      {composition?.lastResult && (
+      {composition && tasks.length > 0 && <SmartGroup composition={composition} showGroups={showGroups} onChange={setComposition} onError={onError} />}
+      {openedPr && <p class="small">Opened PR <a href={openedPr.url} target="_blank" rel="noreferrer">#{openedPr.pr}</a>.</p>}
+      {publicationError && <p class="publication-error" role="alert">{publicationError}</p>}
+      {!openedPr && composition?.lastResult && (
         <p class={`small${composition.lastResult.error ? " error" : ""}`}>
           Opened {composition.lastResult.bundleIds.length} PRs{composition.lastResult.error ? `; stopped: ${composition.lastResult.error}` : "."}
         </p>
       )}
       {tasks.length > 0 && (
         <>
-          {!showGroups && <StagedTasks tasks={tasks} checked={checked} toggle={toggle} nodeName={nodeName} />}
+          <p class="muted small">Select any changes—even across badges—to open one PR. Badges are AI suggestions only.</p>
           <input type="text" placeholder="PR title (default: from the tasks)" value={prTitle} onInput={(e) => setPrTitle((e.currentTarget as HTMLInputElement).value)} />
-          <button class="primary" disabled={!taskIds.length || opening || composition?.status === "publishing"} onClick={open}>
-            {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
-          </button>
+          <div class="actions">
+            <button class="primary" disabled={!taskIds.length || opening || composition?.status === "publishing"} onClick={open}>
+              {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
+            </button>
+            <button class="link" disabled={!taskIds.length || opening} onClick={() => setSelection(new Set())}>Clear selection</button>
+          </div>
+          <StagedTasks tasks={orderedTasks} badges={badges} checked={checked} toggle={toggle} nodeName={nodeName} />
         </>
       )}
       {composition && composition.stacks.length > 0 && <Stacks stacks={composition.stacks} />}
@@ -275,27 +285,31 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
   );
 }
 
-function StagedTasks({ tasks, checked, toggle, nodeName }: { tasks: Task[]; checked: Set<string>; toggle(id: string): void; nodeName(id: NodeId): string }) {
+function StagedTasks({ tasks, badges, checked, toggle, nodeName }: { tasks: Task[]; badges: Map<string, { number: number; rationale: string }>; checked: Set<string>; toggle(id: string): void; nodeName(id: NodeId): string }) {
   return (
-    <ul class="list">
-      {tasks.map((task) => (
+    <ul class="list staged-tasks">
+      {tasks.map((task) => {
+        const badge = badges.get(task.id);
+        return (
         <li key={task.id}>
           <label>
-            <input type="checkbox" checked={checked.has(task.id)} onChange={() => toggle(task.id)} /> {task.title}
+            <input type="checkbox" checked={checked.has(task.id)} onChange={() => toggle(task.id)} />{" "}
+            {badge && <span class="group-badge" title={badge.rationale} style={{ color: `hsl(${badge.number * 137.508 % 360} 65% 75%)` }}>Group {badge.number}</span>}
+            {task.title}
             <span class="muted small"> · {nodeName(task.node)}</span>
           </label>
         </li>
-      ))}
+        );
+      })}
     </ul>
   );
 }
 
-function SmartGroup({ composition, tasks, showGroups, checked, toggle, toggleGroup, nodeName, onChange, onError }: { composition: ApiComposition; tasks: Task[]; showGroups: boolean; checked: Set<string>; toggle(id: string): void; toggleGroup(ids: string[]): void; nodeName(id: NodeId): string; onChange(c: ApiComposition): void; onError(message: string): void }) {
+function SmartGroup({ composition, showGroups, onChange, onError }: { composition: ApiComposition; showGroups: boolean; onChange(c: ApiComposition): void; onError(message: string): void }) {
   const { project, proposal, status } = composition;
   const query = `?project=${encodeURIComponent(project)}`;
   const call = (path: string, body: object = {}) => post<ApiComposition>(path, body).then(onChange, (e: Error) => onError(e.message));
   const busy = status === "planning" || status === "publishing";
-  const parentPr = (id: string) => composition.stacks.find((b) => b.id === id)?.pr;
   const note =
     status === "planning" ? "Grouping…"
     : status === "queued" ? "Grouping shortly…"
@@ -315,24 +329,6 @@ function SmartGroup({ composition, tasks, showGroups, checked, toggle, toggleGro
       </div>
       {note && <p class="muted small">{note}</p>}
       {composition.error && <p class="error small">{composition.error}</p>}
-      {proposal && showGroups && (
-        <div class="suggested-groups">
-          <p class="muted small">Suggested groups only. Select or adjust changes, then open one combined PR against the base branch.</p>
-          {proposal.groups.map((group, index) => (
-            <div class="suggested-group" key={group.taskIds.join()}>
-              <div class="actions">
-                <strong>Group {index + 1}</strong>
-                <button onClick={() => toggleGroup(group.taskIds)}>
-                  {group.taskIds.every((id) => checked.has(id)) ? "Deselect group" : "Select group"}
-                </button>
-              </div>
-              <div class="muted small">{group.rationale}</div>
-              {group.parent && <p class="muted small">Related to existing stack #{parentPr(group.parent) ?? group.parent}; combined PR still targets the base branch.</p>}
-              <StagedTasks tasks={group.taskIds.flatMap((id) => tasks.filter((task) => task.id === id))} checked={checked} toggle={toggle} nodeName={nodeName} />
-            </div>
-          ))}
-        </div>
-      )}
     </div>
   );
 }
