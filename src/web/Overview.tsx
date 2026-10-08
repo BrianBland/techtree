@@ -158,6 +158,9 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
         <div class="meter">
           <div style={{ width: pct(coverage.scannedLoc, coverage.totalLoc) }} />
         </div>
+        {!all && (
+          <button onClick={() => post(`/api/scan?project=${encodeURIComponent(view)}`, { node: "" }).catch((e: Error) => onError(e.message))}>Scan repo</button>
+        )}
       </section>
       )}
     </aside>
