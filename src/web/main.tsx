@@ -363,9 +363,9 @@ function groupValue(grouped: Suggestion[], setGrouped: (fn: (g: Suggestion[]) =>
   };
 }
 
-/** The project named by the page's `?project=` parameter ("all" for every project), or Quality. */
+/** The project named by the page's `?project=` parameter ("all" for every project), or all projects. */
 function initialView(): string {
-  return new URLSearchParams(globalThis.location?.search).get("project") || QUALITY;
+  return new URLSearchParams(globalThis.location?.search).get("project") || ALL_PROJECTS;
 }
 
 /** The node named by the page's `?focus=` parameter, or the root. */
