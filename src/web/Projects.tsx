@@ -49,12 +49,12 @@ export function ProjectSwitcher({ projects, view, onSwitch, onChanged, onError }
   return (
     <>
       <select class="project-switcher" value={view} onChange={choose} title="Project" style={current ? { borderLeft: `6px solid ${projectColor(projects, current.id)}` } : undefined}>
+        <option value={ALL_PROJECTS}>All projects</option>
         {projects.map((p) => (
           <option key={p.id} value={p.id}>
             {p.name}
           </option>
         ))}
-        <option value={ALL_PROJECTS}>All projects</option>
         <option value={NEW_PROJECT}>New project…</option>
       </select>
       <button class="link" title="Project settings" disabled={!current} onClick={openSettings}>
