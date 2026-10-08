@@ -29,7 +29,7 @@ export async function refineText(
     ...context,
     `Text to refine:\n${input.text}`,
   ].join("\n\n");
-  const out = await runPiPrint(config.piCommand, repoRoot, ["--tools", "read,grep,find,ls", ...(model ? ["--model", model] : []), prompt], TIMEOUT_MS);
+  const out = await runPiPrint(config.piCommand, repoRoot, ["--tools", "read,grep,find,ls", ...(model ? ["--model", model] : [])], TIMEOUT_MS, undefined, { input: prompt });
   const text = out.trim().replace(/^```[a-z]*\n([\s\S]*?)\n```$/, "$1").trim();
   if (!text) throw new Error("the agent returned no text");
   return text;
@@ -41,7 +41,7 @@ export async function combinedTitle(changes: string[], config: Config, cwd: stri
   const prompt =
     "Write one pull request title (conventional style, imperative, at most 72 characters) that covers all of these changes. Reply with the title only.\n\n" +
     changes.map((c) => `- ${c}`).join("\n");
-  const out = await runPiPrint(config.piCommand, cwd, ["--no-tools", ...(model ? ["--model", model] : []), prompt], 60_000).catch(() => "");
+  const out = await runPiPrint(config.piCommand, cwd, ["--no-tools", ...(model ? ["--model", model] : [])], 60_000, undefined, { input: prompt }).catch(() => "");
   const title = out.trim().replace(/^```[a-z]*\n?|```$/g, "").trim().split("\n")[0].replace(/^["'`]|["'`]$/g, "").trim();
   return title ? title.slice(0, 72) : undefined;
 }

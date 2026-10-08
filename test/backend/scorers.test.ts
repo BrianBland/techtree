@@ -47,7 +47,8 @@ test("scorers: a rubric scan puts the rubric in the prompt and stores its findin
   writeFileSync(
     fakeScan,
     `import { appendFileSync } from "node:fs";
-const prompt = process.argv.at(-1);
+let prompt = "";
+for await (const chunk of process.stdin) prompt += chunk;
 appendFileSync(${JSON.stringify(promptLog)}, prompt + "\\n");
 const file = /=== (.+) ===/.exec(prompt)[1];
 process.stdout.write(JSON.stringify([{ title: "Allocates in loop", detail: "Hoist it.", file, severity: "high", effort: "small" }]));

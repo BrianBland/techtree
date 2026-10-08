@@ -10,7 +10,7 @@ test("refineText runs pi read-only with refineModel and returns its reply withou
   const dir = mkdtempSync(join(tmpdir(), "techtree-refine-"));
   t.after(() => rmSync(dir, { recursive: true, force: true }));
   const fake = join(dir, "pi.mjs");
-  writeFileSync(fake, "const a = process.argv.slice(2); console.log('```\\n' + JSON.stringify({ tools: a[a.indexOf('--tools') + 1], model: a[a.indexOf('--model') + 1], goal: a.at(-1).includes('Project goal: be fast') }) + '\\n```');");
+  writeFileSync(fake, "const a = process.argv.slice(2); let p = ''; for await (const c of process.stdin) p += c; console.log('```\\n' + JSON.stringify({ tools: a[a.indexOf('--tools') + 1], model: a[a.indexOf('--model') + 1], goal: p.includes('Project goal: be fast') }) + '\\n```');");
   const config = mergeConfig({ piCommand: [process.execPath, fake], refineModel: "p/strong", defaultModel: "p/default" });
   const reply = JSON.parse(await refineText({ kind: "rubric", text: "find slow code", name: "Perf", goal: "be fast" }, config, dir));
   assert.deepEqual(reply, { tools: "read,grep,find,ls", model: "p/strong", goal: true });

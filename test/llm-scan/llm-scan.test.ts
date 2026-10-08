@@ -56,7 +56,7 @@ const isAlive = (pid: number) => {
 
 /**
  * Temp repo with `src/a.ts` (3 lines), `src/b.ts` (2 lines), `lib/c.ts` (4 lines) and a fake pi
- * that logs its argv and pid, then prints `stdout` (exit `code`, after `delayMs`).
+ * that logs its argv followed by its stdin (the prompt) and its pid, then prints `stdout` (exit `code`, after `delayMs`).
  */
 function fixture(fake: FakePi, plugin: Record<string, unknown> = {}): Fixture {
   const root = mkdtempSync(join(tmpdir(), "techtree-llm-scan-"));
@@ -72,8 +72,8 @@ function fixture(fake: FakePi, plugin: Record<string, unknown> = {}): Fixture {
   const splitAt = fake.splitAt ?? 0;
   writeFileSync(
     script,
-    `import { appendFileSync, writeFileSync } from "node:fs";
-appendFileSync(${JSON.stringify(log)}, JSON.stringify(process.argv.slice(2)) + "\\n");
+    `import { appendFileSync, readFileSync, writeFileSync } from "node:fs";
+appendFileSync(${JSON.stringify(log)}, JSON.stringify([...process.argv.slice(2), readFileSync(0, "utf8")]) + "\\n");
 writeFileSync(${JSON.stringify(pidFile)}, String(process.pid));
 if (${JSON.stringify(fake.onTerm)} === "ignore") process.on("SIGTERM", () => {});
 if (${JSON.stringify(fake.onTerm)} === "succeed") process.on("SIGTERM", () => process.stdout.write("[]", () => process.exit(0)));

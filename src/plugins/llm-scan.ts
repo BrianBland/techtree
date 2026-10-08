@@ -107,7 +107,7 @@ export async function scanNode(node: NodeId, ctx: CollectCtx, opts: ScanOptions 
     if (items) progress.cached++;
     else {
       try {
-        items = parseFindings(await runPiPrint(ctx.config.piCommand, ctx.repoRoot, ["--tools", "read,grep,find,ls", "--skill", skillDir, prompt(batch, rubric)], o.timeoutMs, signal), batch);
+        items = parseFindings(await runPiPrint(ctx.config.piCommand, ctx.repoRoot, ["--tools", "read,grep,find,ls", "--skill", skillDir], o.timeoutMs, signal, { input: prompt(batch, rubric) }), batch);
         ctx.cache.set(kind, key, items);
       } catch (err) {
         if (signal?.aborted) throw signal.reason;
@@ -196,6 +196,7 @@ function prompt(batch: SourceFile[], rubric?: string): string {
 
 /**
  * Run `<piCommand> -p --no-session <args>` in `cwd` and resolve its stdout; a nonzero exit, timeout or abort rejects.
+ * Prompts go in `input` (stdin), never `args`: a multi-KB argument can get pi killed at launch.
  * With `processGroup`, pi runs in its own process group, which is signalled as a whole and reaped before settling.
  */
 export function runPiPrint(piCommand: string[], cwd: string, args: string[], timeout: number, signal?: AbortSignal, options: { input?: string; maxOutputBytes?: number; processGroup?: boolean } = {}): Promise<string> {
