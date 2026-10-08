@@ -1,6 +1,6 @@
 import { useEffect, useState } from "preact/hooks";
 import { ALL_PROJECTS, isScannable, isScored } from "../core/projects.ts";
-import type { ApiComposition, ApiOverview, ApiState, Bundle, NodeId, Project, StartTaskRequest, Suggestion, Task, TaskKind } from "../types.ts";
+import type { ApiComposition, ApiOverview, ApiState, Bundle, BundleJob, NodeId, Project, StartTaskRequest, Suggestion, Task, TaskKind } from "../types.ts";
 import { get, onReconnect, onServerEvent, post } from "./api.ts";
 import { linkify } from "./linkify.ts";
 import { projectColor } from "./Projects.tsx";
@@ -27,13 +27,19 @@ export function Overview({ state, view, projects, version, eventTick, onSelect, 
 
   useEffect(() => {
     let live = true;
-    get<ApiOverview>(`/api/overview?project=${encodeURIComponent(view)}`).then(
-      (overview) => live && setFetched({ view, overview }),
-      (e: Error) => onError(e.message),
-    );
-    return () => {
-      live = false;
+    let request = 0;
+    const load = () => {
+      const latest = ++request;
+      return get<ApiOverview>(`/api/overview?project=${encodeURIComponent(view)}`).then(
+        (overview) => live && latest === request && setFetched({ view, overview }),
+        (e: Error) => live && latest === request && onError(e.message),
+      );
     };
+    void load();
+    const stop = onServerEvent((event) => {
+      if (event.type === "composition" && (all || event.composition.project === view)) void load();
+    });
+    return () => { live = false; stop(); };
   }, [view, attentionKey(state), version, all && eventTick]);
 
   const [projectTask, setProjectTask] = useState<{ kind: TaskKind; title: string; project: string } | null>(null);
@@ -200,19 +206,32 @@ function ProjectTaskDialog({ kind, title, project, onClose, onError }: { kind: T
 /** A project's smart grouping state, kept current by `composition` events. */
 function useComposition(project: string, onError: (message: string) => void): [ApiComposition | null, (c: ApiComposition) => void] {
   const [composition, setComposition] = useState<ApiComposition | null>(null);
+  const update = (incoming: ApiComposition) => setComposition((current) => {
+    // An acceptance response or reconnect fetch can arrive after a newer job event.
+    const jobs = new Map((current?.bundleJobs ?? []).map((job) => [job.id, job]));
+    for (const job of incoming.bundleJobs ?? []) {
+      if ((jobs.get(job.id)?.revision ?? -1) <= job.revision) jobs.set(job.id, job);
+    }
+    let terminal = 0;
+    const bundleJobs = [...jobs.values()].sort((a, b) => b.createdAt.localeCompare(a.createdAt))
+      .filter((job) => job.status === "queued" || job.status === "running" || terminal++ < 20);
+    return { ...incoming, bundleJobs };
+  });
   useEffect(() => {
-    const load = () => get<ApiComposition>(`/api/composition?project=${encodeURIComponent(project)}`).then(setComposition, (e: Error) => onError(e.message));
+    let live = true;
+    const load = () => get<ApiComposition>(`/api/composition?project=${encodeURIComponent(project)}`).then((c) => live && update(c), (e: Error) => live && onError(e.message));
     void load();
     const stopEvents = onServerEvent((e) => {
-      if (e.type === "composition" && e.composition.project === project) setComposition(e.composition);
+      if (e.type === "composition" && e.composition.project === project) update(e.composition);
     });
     const stopReconnect = onReconnect(() => void load());
     return () => {
+      live = false;
       stopEvents();
       stopReconnect();
     };
   }, [project]);
-  return [composition, setComposition];
+  return [composition, update];
 }
 
 /**
@@ -223,27 +242,29 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
   const [selection, setSelection] = useState<Set<string>>(new Set());
   const [prTitle, setPrTitle] = useState("");
   const [opening, setOpening] = useState(false);
-  const [openedPr, setOpenedPr] = useState<Bundle | null>(null);
   const [publicationError, setPublicationError] = useState("");
   const [composition, setComposition] = useComposition(project, onError);
+  const jobs = composition?.bundleJobs ?? [];
+  const pending = new Set(jobs.filter((job) => job.status === "queued" || job.status === "running").flatMap((job) => job.taskIds));
+  const available = tasks.filter((task) => !pending.has(task.id));
   // Staging generations make an unstaged/re-staged task unchecked without synchronizing props into state.
   const selectionKey = (task: Task) => `${task.id}:${task.stagedAt ?? ""}`;
-  const checked = new Set(tasks.filter((task) => selection.has(selectionKey(task))).map((task) => task.id));
+  const checked = new Set(available.filter((task) => selection.has(selectionKey(task))).map((task) => task.id));
   const proposedIds = composition?.proposal?.groups.flatMap((group) => group.taskIds) ?? [];
-  const showGroups = !!composition?.proposal && !composition.proposal.stale && proposedIds.length === tasks.length && tasks.every((task) => proposedIds.includes(task.id));
+  const showGroups = !!composition?.proposal && !composition.proposal.stale && proposedIds.length === available.length && available.every((task) => proposedIds.includes(task.id));
   const badges = new Map<string, { number: number; rationale: string }>();
   let groupNumber = 0;
   const orderedTasks = showGroups ? composition!.proposal!.groups.flatMap((group) => {
     const badge = group.taskIds.length > 1 ? { number: ++groupNumber, rationale: group.rationale } : undefined;
     return group.taskIds.map((id) => {
       if (badge) badges.set(id, badge);
-      return tasks.find((task) => task.id === id)!;
+      return available.find((task) => task.id === id)!;
     });
-  }) : tasks;
-  if (!tasks.length && !composition?.stacks.length && !composition?.lastResult && !openedPr && !publicationError) return null;
-  const taskIds = tasks.filter((t) => checked.has(t.id)).map((t) => t.id);
+  }) : available;
+  if (!available.length && !composition?.stacks.length && !composition?.lastResult && !jobs.length && !publicationError) return null;
+  const taskIds = available.filter((t) => checked.has(t.id)).map((t) => t.id);
   const toggle = (id: string) => {
-    const task = tasks.find((task) => task.id === id);
+    const task = available.find((task) => task.id === id);
     if (!task) return;
     const key = selectionKey(task);
     setSelection((ids) => {
@@ -255,28 +276,32 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
   const open = () => {
     setOpening(true);
     setPublicationError("");
-    post<Bundle>("/api/bundles", { project, taskIds, title: prTitle })
-      .then((bundle) => { setOpenedPr(bundle); setPrTitle(""); setSelection(new Set()); }, (e: Error) => { setPublicationError(e.message); onError(e.message); })
+    const submitted = new Set(available.filter((task) => checked.has(task.id)).map(selectionKey));
+    post<ApiComposition>("/api/bundles/start", { project, taskIds, title: prTitle })
+      .then((accepted) => {
+        setComposition(accepted); setPrTitle("");
+        setSelection((ids) => new Set([...ids].filter((key) => !submitted.has(key))));
+      }, (e: Error) => { setPublicationError(e.message); onError(e.message); })
       .finally(() => setOpening(false));
   };
   return (
     <section class="staged-bundle">
       <h3>{title}</h3>
-      {composition && tasks.length > 0 && <SmartGroup composition={composition} showGroups={showGroups} onChange={setComposition} onError={onError} />}
-      {openedPr && <p class="small">Opened PR <a href={openedPr.url} target="_blank" rel="noreferrer">#{openedPr.pr}</a>.</p>}
+      {composition && available.length > 0 && <SmartGroup composition={composition} showGroups={showGroups} onChange={setComposition} onError={onError} />}
+      <PublicationJobs jobs={jobs} />
       {publicationError && <p class="publication-error" role="alert">{publicationError}</p>}
-      {!openedPr && composition?.lastResult && (
+      {composition?.lastResult && (
         <p class={`small${composition.lastResult.error ? " error" : ""}`}>
           Opened {composition.lastResult.bundleIds.length} PRs{composition.lastResult.error ? `; stopped: ${composition.lastResult.error}` : "."}
         </p>
       )}
-      {tasks.length > 0 && (
+      {available.length > 0 && (
         <>
           <p class="muted small">Select any changes—even across badges—to open one PR. Badges are AI suggestions only.</p>
           <input type="text" placeholder="PR title (default: from the tasks)" value={prTitle} onInput={(e) => setPrTitle((e.currentTarget as HTMLInputElement).value)} />
           <div class="actions">
             <button class="primary" disabled={!taskIds.length || opening || composition?.status === "publishing"} onClick={open}>
-              {opening ? "Opening…" : `Open combined PR (${taskIds.length})`}
+              {opening ? "Submitting…" : `Open combined PR (${taskIds.length})`}
             </button>
             <button class="link" disabled={!taskIds.length || opening} onClick={() => setSelection(new Set())}>Clear selection</button>
           </div>
@@ -286,6 +311,19 @@ function StagedSection({ title, project, tasks, nodeName, onError }: { title: st
       {composition && composition.stacks.length > 0 && <Stacks stacks={composition.stacks} />}
     </section>
   );
+}
+
+function PublicationJobs({ jobs }: { jobs: BundleJob[] }) {
+  if (!jobs.length) return null;
+  return <section class="publication-jobs" aria-label="PR opening activity">
+    <h4>PR opening activity</h4>
+    <ul class="list small">{jobs.map((job) => <li key={job.id}>
+      <strong>{job.status === "queued" ? "Queued" : job.status === "running" ? "Opening PR in background" : job.status === "opened" ? "Opened PR" : job.status === "interrupted" ? "Opening interrupted" : "Opening failed"}</strong>
+      {job.bundle && <> <a href={job.bundle.url} target="_blank" rel="noreferrer">#{job.bundle.pr}</a></>}
+      <div>{job.taskTitles.join(" · ")}</div>
+      {job.error && <p class="error" role="alert">{job.error}</p>}
+    </li>)}</ul>
+  </section>;
 }
 
 function StagedTasks({ tasks, badges, checked, toggle, nodeName }: { tasks: Task[]; badges: Map<string, { number: number; rationale: string }>; checked: Set<string>; toggle(id: string): void; nodeName(id: NodeId): string }) {

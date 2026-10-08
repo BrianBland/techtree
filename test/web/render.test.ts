@@ -141,6 +141,7 @@ function delegate(real: Backend): Backend {
     stage: (id) => real.stage(id),
     unstage: (id) => real.unstage(id),
     createBundle: (input) => real.createBundle(input),
+    startBundle: (input) => real.startBundle(input),
     listBundles: (project) => real.listBundles(project),
     getComposition: (project) => real.getComposition(project),
     planComposition: (project) => real.planComposition(project),
@@ -871,10 +872,11 @@ test("smart grouping upgrades one staged list with advisory badges and freely pu
   let failPublish = false;
   const ui = await bootUi(t, (real) => ({
     ...delegate(real),
-    createBundle: async (input) => {
+    startBundle: async (input) => {
       combined.push(input);
       if (failPublish) throw new HttpError(409, "selected change needs conflict review");
-      return { id: "combined", project: "quality", title: "Selected changes", branch: "combined", worktree: "", taskIds: input.taskIds, pr: 77, url: "https://example.com/pull/77", createdAt: new Date().toISOString() };
+      const bundle: Bundle = { id: "combined", project: "quality", title: "Selected changes", branch: "combined", worktree: "", taskIds: input.taskIds, pr: 77, url: "https://example.com/pull/77", createdAt: new Date().toISOString() };
+      return { ...(await real.getComposition(input.project)), bundleJobs: [{ id: "combined", project: "quality", taskIds: input.taskIds, taskTitles: ["Selected changes"], status: "opened", revision: 1, createdAt: bundle.createdAt, updatedAt: bundle.createdAt, bundle }] };
     },
     publishComposition: async (input) => {
       published.push(input);
@@ -977,6 +979,73 @@ test("smart grouping upgrades one staged list with advisory badges and freely pu
   auto.checked = false;
   auto.dispatch("change");
   await until(async () => (await backend.getComposition()).auto === false, "automatic grouping off");
+});
+
+test("background publication hides accepted selections and surfaces revisioned outcomes without blocking another selection", UI_TIMEOUT, async (t) => {
+  let jobs: NonNullable<ApiComposition["bundleJobs"]> = [];
+  const listeners = new Set<(event: ServerEvent) => void>();
+  let realBackend: Backend;
+  let holdOverview = false;
+  let releaseOverview: (() => void) | undefined;
+  const composition = async () => ({ ...(await realBackend.getComposition()), bundleJobs: jobs });
+  const emit = async () => { const c = await composition(); for (const listener of listeners) listener({ type: "composition", composition: c }); };
+  const { app, backend } = await bootUi(t, (real) => {
+    realBackend = real;
+    return { ...delegate(real),
+      getComposition: composition,
+      getOverview: async (project) => {
+        const overview = await real.getOverview(project);
+        const pending = new Set(jobs.filter((job) => job.status === "queued" || job.status === "running").flatMap((job) => job.taskIds));
+        const result = { ...overview, stagedTasks: overview.stagedTasks.filter((task) => !pending.has(task.id)) };
+        if (holdOverview) {
+          holdOverview = false;
+          await new Promise<void>((resolve) => { releaseOverview = resolve; });
+        }
+        return result;
+      },
+      subscribe: (listener) => { listeners.add(listener); const stop = real.subscribe(listener); return () => { listeners.delete(listener); stop(); }; },
+      startBundle: async (input) => {
+        const now = new Date().toISOString();
+        jobs = [{ id: "background", project: "quality", taskIds: input.taskIds, taskTitles: ["Background first"], status: "queued", revision: 1, createdAt: now, updatedAt: now }];
+        const accepted = await composition();
+        jobs = jobs.map((job) => ({ ...job, status: "running", revision: 2 }));
+        await emit();
+        return accepted; // Deliberately older than the event delivered before the response.
+      },
+    };
+  });
+  for (const title of ["Background first", "Background second"]) {
+    const task = await backend.startTask({ node: "", findingIds: [], title, prompt: "scenario:happy", manualReview: true });
+    await until(() => backend.getState().then((s) => s.tasks.find((x) => x.id === task.id && x.state === "review")), "review");
+    await backend.stage(task.id);
+  }
+  const rows = () => app.find((n) => n.localName === "li" && n.parentNode?.getAttribute("class") === "list staged-tasks");
+  await app.waitFor(() => rows().length === 2, "staged tasks");
+  const box = rows()[0].querySelectorAll((n) => n.localName === "input")[0] as Toggle;
+  box.checked = true; box.dispatch("change");
+  await app.waitFor(() => app.text().includes("Open combined PR (1)"), "checked task");
+  holdOverview = true;
+  app.find((n) => n.localName === "button" && n.textContent === "Open combined PR (1)")[0].dispatch("click");
+  await app.waitFor(() => rows().length === 1 && app.text().includes("Opening PR in background"), "accepted task hidden and running outcome survives late acceptance");
+  assert.match(rows()[0].textContent, /Background second/);
+  const next = rows()[0].querySelectorAll((n) => n.localName === "input")[0] as Toggle;
+  next.checked = true; next.dispatch("change");
+  await app.waitFor(() => app.find((n) => n.localName === "button" && n.textContent === "Open combined PR (1)")[0]?.getAttribute("disabled") === null, "another selection can be submitted");
+  jobs = jobs.map((job) => ({ ...job, status: "failed", revision: 3, error: "GitHub unavailable; staged changes restored" }));
+  await emit();
+  await app.waitFor(() => rows().length === 2 && app.text().includes("GitHub unavailable; staged changes restored"), "failed selection restored with outcome");
+  await app.waitFor(() => !!releaseOverview, "older overview request held");
+  releaseOverview!();
+  await new Promise((resolve) => setTimeout(resolve, 100));
+  assert.equal(rows().length, 2, "late pre-failure overview must not hide restored changes");
+  assert.equal(isChecked(rows()[0].querySelectorAll((n) => n.localName === "input")[0] as Toggle), false);
+  jobs = jobs.map((job) => ({ ...job, status: "opened", revision: 4, error: undefined, bundle: { id: "background", project: "quality", taskIds: job.taskIds, title: "Background first", branch: "bundle", worktree: "", pr: 88, url: "https://example.com/pull/88", createdAt: job.createdAt } }));
+  await emit();
+  await app.waitFor(() => app.find((n) => n.localName === "a" && n.getAttribute("href") === "https://example.com/pull/88").length > 0, "opened PR outcome link");
+  // Reconnect reads persisted outcomes, including when the staged pool becomes empty.
+  for (const task of (await backend.getState()).tasks.filter((task) => task.state === "staged")) await backend.unstage(task.id);
+  app.reconnect();
+  await app.waitFor(() => rows().length === 0 && app.text().includes("PR opening activity") && app.find((n) => n.localName === "a" && n.getAttribute("href") === "https://example.com/pull/88").length > 0, "outcome stays visible after reconnect with no staged tasks");
 });
 
 test("open stacks stay visible with root and child PR links when nothing is staged", UI_TIMEOUT, async (t) => {

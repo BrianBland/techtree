@@ -8,7 +8,7 @@ import { BundleConflict, listBundles, openStackedBundle, recoverIntent, saveBund
 import type { ConflictSession } from "../runner/resolve.ts";
 import type { TaskRunner } from "../runner/runner.ts";
 import { HttpError } from "../server/backend.ts";
-import type { ApiComposition, Bundle, Cache, CompositionGroup, CompositionProposal, Config, ServerEvent, Task } from "../types.ts";
+import type { ApiComposition, Bundle, BundleJob, Cache, CompositionGroup, CompositionProposal, Config, ServerEvent, Task } from "../types.ts";
 
 const MAX_TASKS = 20;
 const PROMPT_CHARS = 1000;
@@ -19,6 +19,7 @@ const RATIONALE_CHARS = 300;
 const TIMEOUT_MS = 120_000;
 const PROPOSALS = "compose";
 const INTENTS = "compose-intent";
+const JOBS = "bundle-jobs";
 
 export interface ComposerOptions {
   db: Db;
@@ -57,6 +58,7 @@ export class Composer {
   private readonly opts: ComposerOptions;
   private readonly states = new Map<string, ProjectState>();
   private readonly reserved = new Set<string>();
+  private readonly jobHistory = new Map<string, BundleJob[]>();
   private gate: Promise<unknown> = Promise.resolve();
   private readonly stopRuns = new AbortController();
   private closed = false;
@@ -97,6 +99,7 @@ export class Composer {
       ...(proposal && { proposal: { ...proposal, stale: proposal.fingerprint !== this.snapshot(project, stacks).fingerprint } }),
       ...(s.lastResult && { lastResult: s.lastResult }),
       stacks,
+      bundleJobs: this.bundleJobs(project),
     };
   }
 
@@ -129,6 +132,11 @@ export class Composer {
   /** On start: replan every project whose staged pool has a stale or missing proposal. A restart never publishes. */
   recover(projects: string[]): void {
     for (const project of projects) {
+      for (const job of this.bundleJobs(project)) {
+        if (job.status !== "queued" && job.status !== "running") continue;
+        const bundle = listBundles(this.opts.db, project).find((b) => b.taskIds.length === job.taskIds.length && job.taskIds.every((id) => b.taskIds.includes(id) && this.opts.runner().get(id)?.bundle === b.id));
+        this.saveJob({ ...job, revision: job.revision + 1, updatedAt: new Date().toISOString(), ...(bundle ? { status: "opened", bundle } : { status: "interrupted", error: "Server restarted while opening this PR. Unpublished tasks are staged again; check GitHub for an existing PR before retrying. No automatic retry was made." }) });
+      }
       const proposal = this.proposal(project);
       const snapshot = this.snapshot(project);
       if (snapshot.tasks.length && proposal?.fingerprint !== snapshot.fingerprint) this.poolChanged(project);
@@ -141,6 +149,68 @@ export class Composer {
 
   isReserved(taskId: string): boolean {
     return this.reserved.has(taskId);
+  }
+
+  bundleJobs(project: string): BundleJob[] {
+    let jobs = this.jobHistory.get(project);
+    if (!jobs) {
+      jobs = this.opts.cache.get<BundleJob[]>(JOBS, project) ?? [];
+      this.jobHistory.set(project, jobs);
+    }
+    return jobs;
+  }
+
+  isQueuedForBundle(taskId: string, project: string): boolean {
+    return this.bundleJobs(project).some((job) => (job.status === "queued" || job.status === "running") && job.taskIds.includes(taskId));
+  }
+
+  /** Accept quickly, then perform the publication behind the same repository gate as every other PR. */
+  queueBundle(project: string, tasks: Task[], publish: () => Promise<Bundle>): ApiComposition {
+    if (this.closed) throw new HttpError(409, "techtree server is stopping");
+    const taken = tasks.find((task) => this.reserved.has(task.id));
+    if (taken) throw new HttpError(409, `task ${taken.id} is being published`);
+    const now = new Date().toISOString();
+    let job: BundleJob = { id: randomBytes(8).toString("hex"), project, taskIds: tasks.map((t) => t.id), taskTitles: tasks.map((t) => t.title), status: "queued", revision: 1, createdAt: now, updatedAt: now };
+    this.saveJob(job, true);
+    const notify = () => {
+      try {
+        this.poolChanged(project, job.status === "failed" && job.taskIds.some((id) => this.opts.runner().get(id)?.state === "review"));
+      } catch (err) {
+        job = { ...job, revision: job.revision + 1, error: `${job.error ? `${job.error}; ` : ""}Could not refresh publication activity: ${errorText(err)}` };
+        this.saveJob(job);
+      }
+    };
+    const work = this.reserve(job.taskIds, async () => {
+      try {
+        job = { ...job, status: "running", revision: job.revision + 1, updatedAt: new Date().toISOString() };
+        this.saveJob(job, true);
+        this.announce(project);
+        const bundle = await publish();
+        job = { ...job, status: "opened", bundle, revision: job.revision + 1, updatedAt: new Date().toISOString() };
+      } catch (err) {
+        job = { ...job, status: "failed", error: errorText(err), revision: job.revision + 1, updatedAt: new Date().toISOString() };
+      }
+      this.saveJob(job);
+    });
+    void work.then(notify, (err) => {
+      job = { ...job, status: "failed", error: errorText(err), revision: job.revision + 1, updatedAt: new Date().toISOString() };
+      this.saveJob(job);
+      notify();
+    });
+    notify();
+    return this.status(project);
+  }
+
+  /** Status persistence failures after acceptance remain visible in memory; an accepted job never becomes unhandled work. */
+  private saveJob(job: BundleJob, required = false): void {
+    const jobs = [...this.bundleJobs(job.project).filter((j) => j.id !== job.id), job].sort((a,b) => b.createdAt.localeCompare(a.createdAt));
+    let completed = 0;
+    const kept = jobs.filter((j) => j.status === "queued" || j.status === "running" || completed++ < 20);
+    try { this.opts.cache.set(JOBS, job.project, kept); } catch (err) {
+      if (required) throw err;
+      job.error = `${job.error ? `${job.error}; ` : ""}Could not persist publication status: ${errorText(err)}`;
+    }
+    this.jobHistory.set(job.project, kept);
   }
 
   hasIntent(taskId: string): boolean {
@@ -378,7 +448,7 @@ export class Composer {
     const tasks = this.opts
       .runner()
       .list()
-      .filter((t) => t.project === project && t.state === "staged")
+      .filter((t) => t.project === project && t.state === "staged" && !this.isQueuedForBundle(t.id, project))
       .sort((a, b) => (a.stagedAt ?? "").localeCompare(b.stagedAt ?? ""));
     const heads = Object.fromEntries(tasks.map((t) => [t.id, revParse(this.opts.repoRoot, t.branch)]));
     const tips = stacks.filter((b) => !stacks.some((c) => c.parent === b.id));

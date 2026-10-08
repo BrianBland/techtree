@@ -156,6 +156,20 @@ export interface Bundle {
   parent?: string; // stacked smart bundles: id of the bundle whose branch this PR targets
 }
 
+/** Server-owned background combined-PR opening; task states remain staged until publication or conflict recovery. */
+export interface BundleJob {
+  id: string;
+  project: string;
+  taskIds: string[];
+  taskTitles: string[];
+  status: "queued" | "running" | "opened" | "failed" | "interrupted";
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+  bundle?: Bundle;
+  error?: string;
+}
+
 /** One proposed stack: its tasks in PR order, optionally appended to an open stack tip (DESIGN "Smart PR composition"). */
 export interface CompositionGroup {
   taskIds: string[];
@@ -182,6 +196,7 @@ export interface ApiComposition {
   proposal?: CompositionProposal & { stale: boolean };
   lastResult?: { bundleIds: string[]; error?: string };
   stacks: Bundle[]; // live smart bundles, oldest first
+  bundleJobs?: BundleJob[]; // all active jobs and the most recent 20 outcomes
 }
 
 // ---- Projects (DESIGN "Projects") ----
