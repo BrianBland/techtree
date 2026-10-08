@@ -4,7 +4,7 @@ import { existsSync, mkdirSync, readFileSync, readdirSync } from "node:fs";
 import { homedir } from "node:os";
 import { basename, dirname, join } from "node:path";
 import { promisify } from "node:util";
-import { combinedTitle } from "../backend/refine.ts";
+import { combinedPrText } from "../backend/refine.ts";
 import type { Db } from "../db.ts";
 import type { Bundle, Config, Task } from "../types.ts";
 import { GiveUp, pinValidators, resolveConflict, type ConflictSession, type Resolution, type ValidatorPin } from "./resolve.ts";
@@ -77,9 +77,12 @@ export async function openBundle(opts: OpenBundleOptions): Promise<Bundle> {
   mkdirSync(dirname(worktree), { recursive: true });
   await run(repoRoot, "git", "worktree", "add", "-b", branch, worktree, start);
   const resolutions: Resolution[] = [];
+  let title: string;
+  let body: string;
   try {
     for (const task of tasks) resolutions.push(...(await cherryPick(repoRoot, worktree, config, task, heads[task.id], session, validators)));
     await requireChange(worktree, start, `the selected tasks' replay changes nothing on top of ${fromRemote ? `${remote}/${baseBranch}` : config.baseRef}`);
+    ({ title, body } = await prMetadata(opts, tasks.map((task) => [task, heads[task.id]]), worktree, start, resolutions));
     await session.refresh();
     if (!remote) throw new Error("the repository has no remote to push the combined branch to");
     await run(worktree, "git", "push", "-u", remote, branch);
@@ -87,12 +90,6 @@ export async function openBundle(opts: OpenBundleOptions): Promise<Bundle> {
     await removeBundleWorktree(repoRoot, worktree, branch);
     throw await confirmFallback(err, session);
   }
-  const title =
-    opts.title ??
-    (tasks.length === 1
-      ? tasks[0].title
-      : ((await combinedTitle(tasks.map((t) => `${t.title} (${t.node || "repo root"})`), config, repoRoot)) ?? `${tasks[0].title} (+${tasks.length - 1} more)`));
-  const body = await prBody(opts, tasks.map((task) => [task, heads[task.id]]), worktree, resolutions);
   const created = await run(worktree, "gh", "pr", "create", "--head", branch, "--title", title, "--body", body, ...(fromRemote ? ["--base", baseBranch] : []));
   const url = /https:\/\/\S+\/pull\/\d+/.exec(created)?.[0];
   if (!url) throw new Error(`gh pr create printed no PR URL: ${created.trim()}`);
@@ -134,12 +131,15 @@ export async function openStackedBundle(opts: StackedBundleOptions): Promise<Bun
   await run(repoRoot, "git", "worktree", "add", "-b", branch, worktree, start);
   let head: string;
   let body: string;
+  let title: string;
   try {
     const resolutions = await cherryPick(repoRoot, worktree, config, task, opts.sourceHead, opts.session, validators);
     head = (await run(worktree, "git", "rev-parse", "HEAD")).trim();
     await requireChange(worktree, start, `task ${task.id} (${task.title}) changes nothing on top of ${base}`);
     const stacked = parent ? `Stacked on #${parent.pr}.\n\n` : "";
-    body = stacked + (await prBody(opts, [[task, opts.sourceHead]], worktree, resolutions));
+    const metadata = await prMetadata(opts, [[task, opts.sourceHead]], worktree, start, resolutions);
+    title = metadata.title;
+    body = stacked + metadata.body;
     await opts.session.refresh();
   } catch (err) {
     await removeBundleWorktree(repoRoot, worktree, branch);
@@ -148,7 +148,7 @@ export async function openStackedBundle(opts: StackedBundleOptions): Promise<Bun
   const bundle = {
     id,
     project: opts.project,
-    title: task.title,
+    title,
     branch,
     worktree,
     taskIds: [task.id],
@@ -161,7 +161,7 @@ export async function openStackedBundle(opts: StackedBundleOptions): Promise<Bun
   };
   opts.journal({ bundle, body });
   await run(worktree, "git", "push", "-u", remote, branch);
-  return { ...bundle, ...(await createPr(worktree, branch, base, task.title, body)) };
+  return { ...bundle, ...(await createPr(worktree, branch, base, title, body)) };
 }
 
 /**
@@ -273,17 +273,25 @@ async function cherryPick(repoRoot: string, worktree: string, config: Config, ta
   return resolutions;
 }
 
-/** `tasks` pairs each task with the commit whose subject the body quotes. */
-async function prBody(opts: Pick<OpenBundleOptions, "repoRoot" | "findingTitles">, tasks: [Task, string][], worktree: string, resolutions: Resolution[]): Promise<string> {
-  const lines = await Promise.all(
-    tasks.map(async ([task, head]) => {
-      const findings = opts.findingTitles(task);
-      const subject = (await run(opts.repoRoot, "git", "log", "-1", "--format=%s", head)).trim();
-      return `- **${task.title}** (${task.node || "repository root"}): ${findings.length ? findings.join("; ") : "no findings"} — ${subject}`;
-    }),
-  );
-  const template = prTemplate(worktree);
-  return [`Combined techtree changes:\n\n${lines.join("\n")}`, resolutionAudit(resolutions), template].filter(Boolean).join("\n\n");
+/** Describe the replay's actual changes, not the machinery that assembled them. */
+async function prMetadata(opts: Pick<OpenBundleOptions, "repoRoot" | "findingTitles" | "config" | "session"> & { title?: string }, tasks: [Task, string][], worktree: string, start: string, resolutions: Resolution[]): Promise<{ title: string; body: string }> {
+  const cut = (text: string, limit: number) => text.length > limit ? `${text.slice(0, limit)}\n[truncated]` : text;
+  const clean = (text: string) => text.replace(/[\u0000-\u001f\u007f]+/g, " ").replace(/\s+/g, " ").trim();
+  const changes = await Promise.all(tasks.map(async ([task, head], index) => {
+    const base = (await run(opts.repoRoot, "git", "merge-base", start, head)).trim();
+    const commits = await run(opts.repoRoot, "git", "log", "--no-merges", "--reverse", "--format=%s", `${base}..${head}`);
+    return { id: `c${index + 1}`, title: cut(task.title, 250), node: cut(task.node, 200), findings: opts.findingTitles(task).slice(0, 5).map((title) => cut(title, 200)), summary: cut(task.summary ?? "", 600), commits: cut(commits, 1000) };
+  }));
+  const stat = cut(await run(worktree, "git", "diff", "--no-ext-diff", "--no-textconv", "--stat", start, "HEAD"), 2000);
+  const diff = cut(await run(worktree, "git", "diff", "--no-ext-diff", "--no-textconv", "--unified=3", start, "HEAD"), 12_000);
+  const generated = await combinedPrText({ changes, stat, diff }, opts.config, worktree, opts.session.signal);
+  const fallback = tasks.map(([task]) => clean(task.title) || "Update repository code");
+  const fallbackTitle = [...new Set(fallback)].join("; ");
+  const title = opts.title ?? generated?.title ?? (fallbackTitle.length <= 72 ? fallbackTitle : `${fallbackTitle.slice(0, 69).trimEnd()}…`);
+  const bullets = generated?.changes ?? fallback;
+  const summary = ["## Summary", generated?.summary, bullets.map((text) => `- ${text}`).join("\n")].filter(Boolean).join("\n\n");
+  const body = [summary, resolutionAudit(resolutions), prTemplate(worktree)].filter(Boolean).join("\n\n");
+  return { title, body };
 }
 
 function resolutionAudit(resolutions: Resolution[]): string | undefined {

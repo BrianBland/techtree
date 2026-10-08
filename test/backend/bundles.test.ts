@@ -9,7 +9,7 @@ import { dbCache, openDb, suppressSqliteWarning } from "../../src/db.ts";
 import type { HttpError } from "../../src/server/backend.ts";
 import { startServer } from "../../src/server/server.ts";
 import type { Task } from "../../src/types.ts";
-import { FAKE_PI, TODO_FILE, fixture, until } from "./helpers.ts";
+import { FAKE_PI, TODO_FILE, fixture, until, withEnv } from "./helpers.ts";
 
 suppressSqliteWarning();
 
@@ -83,6 +83,9 @@ test("a combined PR, titled by the title model, cherry-picks the staged tasks' c
   assert.equal(args[args.indexOf("--title") + 1], "feat: fake combined title");
   const body = args[args.indexOf("--body") + 1];
   assert.ok(body.includes(a.title) && body.includes(b.title));
+  assert.match(body, /^## Summary\n/);
+  assert.ok(!/Combined techtree changes|no findings|techtree change/.test(body), body);
+  assert.ok(body.includes("Consolidate the selected changes."), "model summary, not a raw task/commit inventory");
 
   const tasks = (await backend.getState()).tasks;
   for (const id of [a.id, b.id]) {
@@ -92,6 +95,44 @@ test("a combined PR, titled by the title model, cherry-picks the staged tasks' c
     assert.equal(task.bundle, bundle.id);
   }
   assert.deepEqual((await backend.listBundles()).map((x) => x.id), [bundle.id]);
+});
+
+test("invalid metadata uses clean change bullets while preserving an explicit title and trailing repository template", { timeout: 30_000 }, async (t) => {
+  const { backend, repo, reviewed, ghLog, tmp, origin } = await boot(t);
+  mkdirSync(join(repo, ".github"));
+  const template = "## Testing\n\n- [ ] Run focused checks\n\nTrailing: metadata";
+  writeFileSync(join(repo, ".github/pull_request_template.md"), template);
+  git(repo, "add", ".github"); git(repo, "commit", "-qm", "Add PR template"); git(repo, "push", "-q", "origin", "main");
+  const file = join(tmp, "metadata"); writeFileSync(file, "invalid model response"); withEnv(t, "FAKE_PR_COPY", file);
+  const a = await reviewed("first scenario:happy"); const b = await reviewed("second scenario:happy");
+  await backend.stage(a.id); await backend.stage(b.id);
+  const bundle = await backend.createBundle({ taskIds: [a.id,b.id], title: "refactor: consolidate validation cases" });
+  assert.equal(bundle.title, "refactor: consolidate validation cases");
+  const args: string[] = JSON.parse(readFileSync(ghLog, "utf8"));
+  const body = args[args.indexOf("--body") + 1];
+  assert.ok(body.startsWith("## Summary\n\n- "));
+  assert.ok(body.includes(a.title) && body.includes(b.title));
+  assert.ok(!/Combined techtree changes|no findings|techtree change|\(\+\d+ more\)/.test(body), body);
+  assert.ok(body.endsWith(template), body);
+  assert.equal(git(origin, "rev-parse", bundle.branch).trim(), git(bundle.worktree, "rev-parse", "HEAD").trim());
+});
+
+test("source drift during metadata generation is rejected before push", { timeout: 30_000 }, async (t) => {
+  const { backend, reviewed, tmp, repo, origin } = await boot(t);
+  const file = join(tmp, "metadata"); withEnv(t, "FAKE_PR_COPY", file);
+  writeFileSync(`${file}.hold`, "hold");
+  const task = await reviewed("scenario:happy"); await backend.stage(task.id);
+  const opening = backend.createBundle({ taskIds: [task.id] }).then(() => "unexpected success", (error: Error) => error.message);
+  try {
+    await until(() => existsSync(`${file}.log`), "model metadata wait");
+    writeFileSync(join(task.worktree!, "late.txt"), "late source change");
+    git(task.worktree!, "add", "late.txt"); git(task.worktree!, "commit", "-qm", "Late source change");
+    rmSync(`${file}.hold`);
+    assert.match(await opening, /stale/);
+    assert.equal((await backend.getState()).tasks[0].state, "staged");
+    assert.equal(git(origin, "branch", "--list", "techtree/bundle-*").trim(), "");
+    assert.equal(git(repo, "branch", "--list", "techtree/bundle-*").trim(), "");
+  } finally { rmSync(`${file}.hold`, { force: true }); await opening; }
 });
 
 test("a combined PR conflict aborts cleanly and automatically unstages only the conflicting task", { timeout: 30_000 }, async (t) => {

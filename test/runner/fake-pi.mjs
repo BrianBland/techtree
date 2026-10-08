@@ -12,6 +12,20 @@ if (process.argv.includes("-p")) {
   for await (const chunk of process.stdin) input += chunk;
   const prompt = input;
   if (prompt.includes("<conflict-hunks>")) await resolve(prompt);
+  else if (prompt.includes("<pr-evidence>")) {
+    const file = process.env.FAKE_PR_COPY;
+    if (file) {
+      appendFileSync(`${file}.log`, JSON.stringify([...process.argv.slice(2), prompt]) + "\n");
+      while (existsSync(`${file}.hold`)) await new Promise((resolve) => setTimeout(resolve, 10));
+    }
+    const evidence = JSON.parse(/<pr-evidence>\n([\s\S]*?)\n<\/pr-evidence>/.exec(prompt)[1]);
+    const reply = file && existsSync(file) ? readFileSync(file, "utf8") : JSON.stringify({
+      title: evidence.changes.length === 1 ? evidence.changes[0].title : "feat: fake combined title",
+      summary: "Consolidate the selected changes.",
+      changes: evidence.changes.map((change) => ({ id: change.id, text: change.title })),
+    });
+    console.log(reply);
+  }
   else if (prompt.includes("<staged-tasks>")) await group(prompt);
   else console.log("feat: fake combined title");
   process.exit(0);
