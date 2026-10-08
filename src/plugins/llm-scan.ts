@@ -98,7 +98,7 @@ export async function scanNode(node: NodeId, ctx: CollectCtx, opts: ScanOptions 
   const signal = opts.signal ?? ctx.signal;
   const skillDir = findSkillDir();
   const skillText = readFileSync(join(skillDir, "SKILL.md"), "utf8");
-  const batches = chunk(selectFiles(ctx, node, o), o);
+  const batches = chunk(selectFiles(ctx, node, kind, o), o);
   const progress: ScanProgress = { done: 0, total: batches.length, cached: 0, failed: 0, findings: 0 };
 
   const scanBatch = async (batch: SourceFile[]) => {
@@ -150,16 +150,20 @@ function subtreeFiles(ctx: CollectCtx, node: NodeId): string[] {
   return n ? [...n.files, ...n.children.flatMap((c) => subtreeFiles(ctx, c))] : [];
 }
 
-function selectFiles(ctx: CollectCtx, node: NodeId, o: typeof DEFAULTS): SourceFile[] {
-  const files: SourceFile[] = [];
+/** Up to `maxFiles` scannable files, those not yet scanned at their current contents first, each group in path order. */
+function selectFiles(ctx: CollectCtx, node: NodeId, kind: string, o: typeof DEFAULTS): SourceFile[] {
+  const fresh: SourceFile[] = [];
+  const scanned: SourceFile[] = [];
   for (const path of subtreeFiles(ctx, node).sort()) {
-    if (files.length >= o.maxFiles) break;
+    if (fresh.length >= o.maxFiles) break;
     const abs = join(ctx.repoRoot, path);
     if (statSync(abs).size > o.batchBytes) continue;
     const text = readFileSync(abs, "utf8");
-    if (!text.includes("\0")) files.push({ path, text });
+    if (text.includes("\0")) continue;
+    const upToDate = ctx.cache.get<FileEntry>(kind, `file:${path}`)?.sha === sha256(text);
+    (upToDate ? scanned : fresh).push({ path, text });
   }
-  return files;
+  return [...fresh, ...scanned].slice(0, o.maxFiles);
 }
 
 function chunk(files: SourceFile[], o: typeof DEFAULTS): SourceFile[][] {

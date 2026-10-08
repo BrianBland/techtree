@@ -192,6 +192,21 @@ test("files are capped, batched, reported via progress, and counted in coverage"
   assert.deepEqual(scanCoverage(fx.ctx), { scannedNodes: 2, totalNodes: 3, scannedLoc: 7, totalLoc: 9 });
 });
 
+test("capped scans take files not yet scanned at their current contents first, so repeated scans advance coverage", async () => {
+  const fx = fixture({ stdout: "[]" }, { batchFiles: 1, maxFiles: 1 });
+  const scannedFile = () => /=== (.+) ===/.exec(fx.spawns().at(-1)!.at(-1)!)![1];
+  const order = [];
+  for (let i = 0; i < 3; i++) {
+    await scanNode("", fx.ctx);
+    order.push(scannedFile());
+  }
+  assert.deepEqual(order, ["lib/c.ts", A, B]);
+  assert.deepEqual(await scanNode("", fx.ctx), { done: 1, total: 1, cached: 1, failed: 0, findings: 0 });
+  writeFileSync(join(fx.root, B), "edited\n");
+  await scanNode("", fx.ctx);
+  assert.equal(scannedFile(), B);
+});
+
 test("at most `concurrency` pi children run at once", async () => {
   const fx = fixture({ stdout: "[]", delayMs: 200 }, { batchFiles: 1, concurrency: 2 });
   const started = Date.now();
