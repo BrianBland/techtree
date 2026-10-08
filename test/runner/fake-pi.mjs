@@ -10,7 +10,7 @@ const arg = (name) => process.argv[process.argv.indexOf(name) + 1];
 if (process.argv.includes("-p")) {
   let input = "";
   for await (const chunk of process.stdin) input += chunk;
-  const prompt = input || process.argv.at(-1);
+  const prompt = input;
   if (prompt.includes("<conflict-hunks>")) await resolve(prompt);
   else if (prompt.includes("<staged-tasks>")) await group(prompt);
   else console.log("feat: fake combined title");
